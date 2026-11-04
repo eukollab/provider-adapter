@@ -1,0 +1,11 @@
+__pycache__/
+*.egg-info/
+build/
+dist/
+.venv/
+node_modules/
+.env
+*.db
+.ekl/
+# A checkout of eukollab/ekp for the tests (see CONTRIBUTING.md)
+.ekp/

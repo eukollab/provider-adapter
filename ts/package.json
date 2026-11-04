@@ -1,0 +1,16 @@
+{
+  "name": "@eukollab/provider-adapter",
+  "version": "0.1.0",
+  "description": "EuKollab provider adapter for TypeScript: RFC 8785 canonical JSON and call fingerprints",
+  "type": "module",
+  "exports": "./fingerprint.mjs",
+  "engines": { "node": ">=20" },
+  "scripts": { "test": "node --test" },
+  "license": "Apache-2.0",
+  "author": "EuKreate, Inc. <support@eukollab.ai>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/eukollab/provider-adapter.git",
+    "directory": "ts"
+  }
+}

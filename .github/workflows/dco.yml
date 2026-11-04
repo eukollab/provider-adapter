@@ -1,0 +1,26 @@
+# Every commit of a pull request carries a Signed-off-by line (the Developer Certificate of Origin; see CONTRIBUTING.md).
+name: DCO
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  sign-off:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Every commit is signed off
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          missing=""
+          for commit in $(git rev-list "$BASE..$HEAD"); do
+            git show -s --format=%B "$commit" | grep -q '^Signed-off-by: ' || missing="$missing $commit"
+          done
+          if [ -n "$missing" ]; then
+            echo "These commits have no Signed-off-by line:$missing"
+            echo "Sign them off with: git rebase --signoff $BASE, then push again."
+            exit 1
+          fi

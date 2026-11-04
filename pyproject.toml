@@ -1,0 +1,46 @@
+[project]
+name = "ekl-provider-adapter"
+version = "0.4.0"
+description = "Provider adapter for EuKollab: put an existing MCP server on the network"
+readme = "README.md"
+requires-python = ">=3.13"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "EuKreate, Inc.", email = "support@eukollab.ai" }]
+dependencies = ["mcp==2.3.0", "jsonschema>=4.23", "pydantic>=2.9", "uvicorn>=0.32"]
+
+[project.urls]
+Homepage = "https://eukollab.ai"
+Documentation = "https://eukollab.ai/docs/guide/existing-server"
+Source = "https://github.com/eukollab/provider-adapter"
+Issues = "https://github.com/eukollab/provider-adapter/issues"
+
+[project.optional-dependencies]
+postgres = ["psycopg[binary]>=3.2"]
+# python-dotenv: projects written by `ekl new` load their .env with it, and their tests run against this package.
+dev = ["pytest>=8.3", "ruff>=0.8", "mypy>=1.13", "vulture>=2.13", "types-jsonschema", "psycopg[binary]>=3.2", "python-dotenv>=1.0"]
+
+[project.scripts]
+ekl-provider-connector = "ekl_provider_adapter.connector:main"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+ekl_provider_adapter = ["py.typed"]
+
+[tool.mypy]
+strict = true
+python_version = "3.13"
+plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.vulture]
+paths = ["src", "vulture_allowlist.py"]
+min_confidence = 80

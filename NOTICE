@@ -1,0 +1,7 @@
+EuKollab provider adapter
+Copyright © 2026 EuKreate, Inc.
+
+The provider adapter (src/), its TypeScript fingerprint module (ts/), the TypeScript client @eukollab/agent
+(agent-ts/) and the examples (examples/) are licensed under the Apache License, Version 2.0, in LICENSE.
+
+EuKollab is a trademark of EuKreate, Inc. The licence grants no trademark rights.

@@ -1,0 +1,205 @@
+{
+  "description": "Fingerprint vectors: SHA-256(salt || JCS(value)) with a 32-byte hex salt. Result vectors hash the result body: structuredContent when present, otherwise the content array; isError and _meta are excluded.",
+  "salt": "00000000000000000000000000000000ffffffffffffffffffffffffffffffff",
+  "values": [
+    {
+      "name": "empty object",
+      "value": {},
+      "jcs": "{}",
+      "fingerprint": "68e80ebd628c0498541c17a3b772f6e738332e44d970be2df0307b539f2e75a9"
+    },
+    {
+      "name": "empty array",
+      "value": [],
+      "jcs": "[]",
+      "fingerprint": "200cd990f80502612f18d7316738372874cb47d07ca041c3d051d1693f8d7b41"
+    },
+    {
+      "name": "null",
+      "value": null,
+      "jcs": "null",
+      "fingerprint": "0daa07503feb37eee8718333e783813101255d69c198c0f0f9093e8780b4758a"
+    },
+    {
+      "name": "literals",
+      "value": [
+        true,
+        false,
+        null
+      ],
+      "jcs": "[true,false,null]",
+      "fingerprint": "009fad25f58326bbcf2d36ab6e5f25701b21bc3a2c44be6e0ec112c782860b6a"
+    },
+    {
+      "name": "key order by UTF-16 code units",
+      "value": {
+        "€": 1,
+        "😀": 2,
+        "a": 3,
+        "ﬁ": 4,
+        "\r": 5,
+        "1": 6,
+        "ö": 7
+      },
+      "jcs": "{\"\\r\":5,\"1\":6,\"a\":3,\"ö\":7,\"€\":1,\"😀\":2,\"ﬁ\":4}",
+      "fingerprint": "b4ce43ccaf69b1bd249b7a1ea1ca550c7e9e917b1e3ac3305cad181748b56993"
+    },
+    {
+      "name": "integers",
+      "value": [
+        0,
+        1,
+        -1,
+        9007199254740991,
+        -9007199254740991
+      ],
+      "jcs": "[0,1,-1,9007199254740991,-9007199254740991]",
+      "fingerprint": "4860f2a6fec42b7f000a951e579ebf20ee8104dc60f04efa8d7f4552cb47e2db"
+    },
+    {
+      "name": "negative zero",
+      "value": [
+        -0.0
+      ],
+      "jcs": "[0]",
+      "fingerprint": "50a6426827092fb9d15726a88b5c55550beb7b1a118526456d52d6ed8dc3e803"
+    },
+    {
+      "name": "exponents",
+      "value": [
+        1e+21,
+        1e+20,
+        1e-07,
+        1e-06,
+        1e+30,
+        0.002,
+        1e-27
+      ],
+      "jcs": "[1e+21,100000000000000000000,1e-7,0.000001,1e+30,0.002,1e-27]",
+      "fingerprint": "7bb0522bb6aa256d9ecf891b07c55989f330578a262a8096f3cc5a4b94a9073b"
+    },
+    {
+      "name": "doubles at the edges",
+      "value": [
+        333333333.3333333,
+        4.5,
+        0.1,
+        5e-324,
+        1.7976931348623157e+308
+      ],
+      "jcs": "[333333333.3333333,4.5,0.1,5e-324,1.7976931348623157e+308]",
+      "fingerprint": "08bcb95126ef3862845853a82019ff588633f49d2f5ae9c5b09c864a3ececdb5"
+    },
+    {
+      "name": "string escapes",
+      "value": {
+        "s": "€$\u000f\nA'B\"\\/\u0000\u001f "
+      },
+      "jcs": "{\"s\":\"€$\\u000f\\nA'B\\\"\\\\/\\u0000\\u001f \"}",
+      "fingerprint": "4e84bd4bdaa3ba952c6035da15253bec9ed47b296dfd99f454d4e00abfb4c5e3"
+    },
+    {
+      "name": "non-ASCII strings",
+      "value": {
+        "name": "Zoë Ünal",
+        "city": "東京",
+        "emoji": "🏠"
+      },
+      "jcs": "{\"city\":\"東京\",\"emoji\":\"🏠\",\"name\":\"Zoë Ünal\"}",
+      "fingerprint": "ebb9c23a220340ceb178d048aaabdd307e8dbb9749f4c1828ec8654fa290dd26"
+    },
+    {
+      "name": "nested",
+      "value": {
+        "invoice": {
+          "lines": [
+            {
+              "qty": 10,
+              "amount": 25.0
+            },
+            {
+              "qty": 20,
+              "amount": 16
+            }
+          ],
+          "total": 41.0
+        }
+      },
+      "jcs": "{\"invoice\":{\"lines\":[{\"amount\":25,\"qty\":10},{\"amount\":16,\"qty\":20}],\"total\":41}}",
+      "fingerprint": "8dd546362ae3774b22a84e2b4434f0e23634f169f8d17b5a9b4ff8eba519f342"
+    },
+    {
+      "name": "arguments of a search",
+      "value": {
+        "area_ref": "loc:ca:dublin",
+        "min_beds": 3,
+        "limit": 2
+      },
+      "jcs": "{\"area_ref\":\"loc:ca:dublin\",\"limit\":2,\"min_beds\":3}",
+      "fingerprint": "ab44f9559b13515d50aea08e01c994d5da1ce0e8839ee884e91f6c6cb96fe1f9"
+    }
+  ],
+  "results": [
+    {
+      "name": "structuredContent is hashed, not content",
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\"listings\": [\"home-1\"]}"
+          }
+        ],
+        "structuredContent": {
+          "listings": [
+            "home-1"
+          ]
+        },
+        "isError": false,
+        "resultType": "complete"
+      },
+      "body_jcs": "{\"listings\":[\"home-1\"]}",
+      "fingerprint": "0cf2c5203e504f572518ef4a5cd2f9696ba3369dc65da770b2f61a62f1a801a4"
+    },
+    {
+      "name": "_meta and isError are excluded",
+      "result": {
+        "_meta": {
+          "ekl": {
+            "outcome": "succeeded",
+            "admission_id": "adm_1"
+          }
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "done"
+          }
+        ],
+        "structuredContent": {
+          "listings": [
+            "home-1"
+          ]
+        },
+        "isError": false,
+        "resultType": "complete"
+      },
+      "body_jcs": "{\"listings\":[\"home-1\"]}",
+      "fingerprint": "0cf2c5203e504f572518ef4a5cd2f9696ba3369dc65da770b2f61a62f1a801a4"
+    },
+    {
+      "name": "content array when there is no structuredContent",
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "hello"
+          }
+        ],
+        "isError": false,
+        "resultType": "complete"
+      },
+      "body_jcs": "[{\"text\":\"hello\",\"type\":\"text\"}]",
+      "fingerprint": "b757bb0d0656856a4b5c1fbe8ec568260c69d52cd33b6e8cfb22088e6e6ec90d"
+    }
+  ]
+}
