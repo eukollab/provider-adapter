@@ -699,6 +699,26 @@ async def calls_run_under_the_version_they_were_admitted_under(h: Harness) -> No
     assert ekl(refused)["code"] == "NOT_LISTED"
 
 
+@scenario("storage_free", "durable")
+async def arguments_must_fit_the_version_the_call_was_admitted_under(h: Harness) -> None:
+    """Before the tool runs, the arguments are checked against the input schema of the version the call was admitted
+    under: arguments that don't fit end the call without running the tool, without effect and without charge."""
+    changed = strip_local(_raw_agent(h))
+    area = {"type": "object", "properties": {"area": {"type": "string"}}, "required": ["area"]}
+    changed["capabilities"] = [
+        c | ({"input_schema": area} if c["tool"] == "lookup" else {}) for c in changed["capabilities"]
+    ]
+    h.network.set_configuration(changed)
+    await h.core.load_config()
+    refused = await h.call(Call("lookup", {"city": "dublin"}, "e1"))
+    await h.core.drain()
+    assert ekl(refused)["code"] == "INVALID_REQUEST" and h.toolbox.lookups == 0
+    (execution,) = [e for e in h.network.by_admission.values() if e.execution_id == "e1"]
+    assert execution.outcome == "failed_before_effect" and execution.funding == "released"
+    done = await h.call(Call("lookup", {"area": "dublin"}, "e2"))
+    assert ekl(done)["outcome"] == "succeeded" and h.toolbox.lookups == 1
+
+
 @scenario("storage_free")
 async def a_changed_agent_file_is_announced_and_applies_once_confirmed(h: Harness) -> None:
     """A changed agent.json is announced as a new version and listed at once, while calls keep the

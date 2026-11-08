@@ -88,10 +88,14 @@ def build_server(
 
     async def list_tools(ctx: Any, params: Any) -> types.ListToolsResult:
         del params
-        tools = listed_tools(core, await declared())
         # The endpoint challenge rides on tools/list, which every MCP revision has: the network sends
         # _meta.ekl.challenge and the proof comes back in the result's _meta, bound to this endpoint and credential.
         challenge = dict((ctx.meta or {}).get("ekl") or {}).get("challenge")
+        if challenge and core.local is None:
+            # The network is reviewing or checking a version announced from elsewhere (ekl agent sync): list what it
+            # holds now, not what the last idle check found.
+            await core.load_config()
+        tools = listed_tools(core, await declared())
         if challenge:
             try:
                 proof = core.answer_challenge(str(challenge))

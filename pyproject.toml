@@ -1,13 +1,13 @@
 [project]
 name = "ekl-provider-adapter"
-version = "0.4.0"
+version = "0.5.11"
 description = "Provider adapter for EuKollab: put an existing MCP server on the network"
 readme = "README.md"
 requires-python = ">=3.13"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "EuKreate, Inc.", email = "support@eukollab.ai" }]
-dependencies = ["mcp==2.3.0", "jsonschema>=4.23", "pydantic>=2.9", "uvicorn>=0.32"]
+dependencies = ["mcp>=2.2,<2.4", "jsonschema>=4.23", "pydantic>=2.9", "uvicorn>=0.32"]
 
 [project.urls]
 Homepage = "https://eukollab.ai"
@@ -24,7 +24,8 @@ dev = ["pytest>=8.3", "ruff>=0.8", "mypy>=1.13", "vulture>=2.13", "types-jsonsch
 ekl-provider-connector = "ekl_provider_adapter.connector:main"
 
 [build-system]
-requires = ["setuptools>=77"]
+# Pinned: another setuptools would write different bytes for the same sources.
+requires = ["setuptools==84.2.1"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]

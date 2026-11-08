@@ -156,6 +156,8 @@ class ConfigAnswer(_Message):
     version: int = 0
     config: dict[str, Any] | None = None
     active_version: int = 0
+    # The announced agent.json waiting for review, which an adapter deployed without its own file lists.
+    announced: dict[str, Any] | None = None
 
 
 class ProviderApiError(Exception):

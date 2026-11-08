@@ -27,6 +27,18 @@ class AgentNotEnabled(AgentError):
         )
 
 
+class NotConfirmed(AgentError):
+    """`run_once` for an agent its publisher has not confirmed yet: nothing was read. Confirm it, then run again."""
+
+    def __init__(self, handle: str, state: str):
+        super().__init__(
+            f"{handle} is {state or 'not active'}, so it can't act yet.",
+            code="NOT_CONFIRMED",
+            fix=f"Review and confirm it: ekl agent review {handle}, then ekl agent confirm {handle}.",
+            detail={"state": state},
+        )
+
+
 class CredentialInvalid(AgentError):
     """The agent-operation credential is unknown, revoked, or lacks the scope the action needs."""
 

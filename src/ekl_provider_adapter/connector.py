@@ -12,17 +12,31 @@ and serves the version its publisher confirmed. With EKL_AGENT_JSON, one publish
 environment variables alone. GET /healthz answers 200 for load balancers and container services.
 
 With EKL_AGENT_CREDENTIAL the connector also lets the agent take part: events go to EKL_CALLBACK_URL in
-the publisher's app, and the agent's actions are served on 127.0.0.1 (EKL_AGENT_API_PORT, default 8765) only.
+the publisher's app, or, without one, to the publisher's eukollab_callbacks.py, which the connector runs itself
+(start_callbacks), and the agent's actions are served on 127.0.0.1 (EKL_AGENT_API_PORT, default 8765) only.
 `POST /agent/service` there calls a declared service for an app in any language, from its stand-ins until the
 credential is set; `--use-only` runs only that loopback API and the callbacks, for an agent that offers nothing.
+With EKL_STRIPE_WEBHOOK_SECRET, runs paid on the publisher's own Stripe account are approved from its webhook at
+`<path>/stripe` (stripe_webhook); with EKL_STRIPE_KEY instead, from Stripe's Events API, which needs no public address
+(stripe_events).
+
+`--relay` (what `ekl agent run` starts) listens on nothing public: the network relays the agent's calls down a stream
+this process keeps open (relay), so the machine needs no public address.
 """
 
 import argparse
 import asyncio
+import base64
 import contextlib
+import gzip
 import logging
 import os
+import socket
+import subprocess
+import sys
+import tempfile
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 import httpx2
@@ -49,8 +63,14 @@ from ekl_provider_adapter.attach import (
 from ekl_provider_adapter.callbacks import bridge, bridge_runs, local_api
 from ekl_provider_adapter.config import DEFAULT_NETWORK_URL
 from ekl_provider_adapter.core import AdapterCore, Hooks, Settings
+from ekl_provider_adapter.relay import Relay, relay_address
 from ekl_provider_adapter.server import adapter_routes
 from ekl_provider_adapter.storage import Storage
+from ekl_provider_adapter.stripe_events import StripeEvents
+from ekl_provider_adapter.stripe_webhook import stripe_routes
+
+log = logging.getLogger(__name__)
+CALLBACKS_FILE = "eukollab_callbacks.py"
 
 
 class Upstream:
@@ -155,14 +175,18 @@ def connector_app(
         async with adapter_lifespan(app):
             await own.start()
             watching = asyncio.ensure_future(runs.watch()) if found_credential or runs_api else None
+            stripe_key = os.environ.get("EKL_STRIPE_KEY")
+            paying = asyncio.ensure_future(StripeEvents(runs, stripe_key).watch()) if stripe_key else None
             try:
                 yield
             finally:
-                if watching is not None:
-                    watching.cancel()
+                for task in (watching, paying):
+                    if task is not None:
+                        task.cancel()
                 await own.stop()
 
-    app = AdapterApp(routes=routes, lifespan=lifespan)
+    stripe = stripe_routes(core.path, runs, os.environ.get("EKL_STRIPE_WEBHOOK_SECRET"))
+    app = AdapterApp(routes=[*routes, *stripe], lifespan=lifespan)
     app.state.ekl_core = core
     app.agent = own
     app.runs = runs
@@ -192,6 +216,39 @@ def use_only_app(callback_url: str | None = None) -> Starlette:
     return app
 
 
+def _free_or(port: str) -> str:
+    """The port, unless something on this machine already listens on it (another agent's callbacks): then a free one."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        if probe.connect_ex(("127.0.0.1", int(port))) != 0:
+            return port
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return str(probe.getsockname()[1])
+
+
+def start_callbacks(agent_file: str | None) -> subprocess.Popen[bytes] | None:
+    """The publisher's eukollab_callbacks.py, run beside the connector on 127.0.0.1, so a deployed connector needs
+    no second service for its callbacks. It comes from EKL_CALLBACKS_PY (gzipped and base64-encoded, as
+    `ekl agent deploy` sends it) or is the file beside agent.json. It runs only when the agent takes part and
+    EKL_CALLBACK_URL names no other place, and its address then becomes EKL_CALLBACK_URL."""
+    if os.environ.get("EKL_CALLBACK_URL") or not os.environ.get("EKL_AGENT_CREDENTIAL"):
+        return None
+    sent = os.environ.get("EKL_CALLBACKS_PY")
+    if sent:
+        path = Path(tempfile.mkdtemp(prefix="ekl-callbacks-")) / CALLBACKS_FILE
+        path.write_bytes(gzip.decompress(base64.b64decode(sent)))
+    else:
+        beside = agent_file or os.environ.get("EKL_AGENT_FILE") or "agent.json"
+        path = Path(beside).resolve().parent / CALLBACKS_FILE
+        if not path.is_file():
+            return None
+    port = os.environ.get("EKL_CALLBACKS_PORT") or _free_or("8002")
+    os.environ["EKL_CALLBACK_URL"] = f"http://127.0.0.1:{port}/"
+    log.info("running the agent's callbacks (%s) on 127.0.0.1:%s", path.name, port)
+    # Loopback only, its default: the events it receives are signed, but nothing outside needs to reach it.
+    return subprocess.Popen([sys.executable, str(path), "--port", port], cwd=path.parent)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="EuKollab provider connector")
     parser.add_argument(
@@ -207,12 +264,29 @@ def main() -> None:
         action="store_true",
         help="an agent that offers nothing: serve only its local API and callbacks, on 127.0.0.1",
     )
+    parser.add_argument(
+        "--relay",
+        action="store_true",
+        help="no public address: the network relays the agent's calls to this process (ekl agent run)",
+    )
     options = parser.parse_args()
     # What the network says about the announced agent.json is logged here, where the publisher deploying it looks.
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     private_port = int(os.environ.get("EKL_AGENT_API_PORT", "8765"))
+    callbacks = start_callbacks(options.config)
+    try:
+        serve(options, private_port)
+    finally:
+        if callbacks is not None:
+            callbacks.terminate()
+
+
+def serve(options: argparse.Namespace, private_port: int) -> None:
     if options.use_only:
         uvicorn.run(use_only_app(), host="127.0.0.1", port=private_port, log_level="info")
+        return
+    if options.relay:
+        asyncio.run(serve_relayed(options, private_port))
         return
     app = connector_app(options.config, upstream_url=options.upstream)
     # The agent's actions are served beside the public endpoint, on the loopback interface only.
@@ -226,3 +300,26 @@ def main() -> None:
         await asyncio.gather(public.serve(), private.serve())
 
     asyncio.run(both())
+
+
+async def serve_relayed(options: argparse.Namespace, private_port: int) -> None:
+    """The connector in relay mode: the agent's relay address is its endpoint, and the app serves the calls the
+    network relays instead of listening for them. The loopback API runs as usual; stopping it stops the relay."""
+    # A terminal program: one line per relayed call says what happens; every request to the network would bury it.
+    logging.getLogger("httpx2").setLevel(logging.WARNING)
+    credential, network = settings_from_environment(local_file(options.config), None, None)
+    endpoint = await relay_address(network, credential)
+    os.environ["EKL_ADAPTER_ENDPOINT"] = endpoint
+    app = connector_app(options.config, upstream_url=options.upstream)
+    private = uvicorn.Server(
+        uvicorn.Config(local_api(app.agent, app.runs), host="127.0.0.1", port=private_port, log_level="info")
+    )
+    log.info("serving the agent's calls through the network's relay at %s", endpoint)
+    async with app.router.lifespan_context(app):
+        relaying = asyncio.ensure_future(Relay(app, network, credential, path=app.state.ekl_core.path).run())
+        try:
+            await private.serve()
+        finally:
+            relaying.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await relaying

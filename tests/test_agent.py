@@ -4,6 +4,7 @@
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +18,7 @@ from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from ekl_provider_adapter import attach
-from ekl_provider_adapter.agent import Agent, Choice, Need, ReviewDue, Untrusted
+from ekl_provider_adapter.agent import Agent, Choice, Need, ReviewDue, Untrusted, _log_to_terminal
 from ekl_provider_adapter.agent_journal import AgentJournal
 from ekl_provider_adapter.callbacks import SIGNATURE_HEADER, bridge, local_api, sign
 from ekl_provider_adapter.config import AgentFile
@@ -26,6 +27,7 @@ from ekl_provider_adapter.errors import (
     AgentNotEnabled,
     NoProvider,
     NotAllowed,
+    NotConfirmed,
     PaymentNeeded,
     ProviderNotFunded,
     RunNotApproved,
@@ -166,6 +168,49 @@ def test_post_a_need_choose_by_trial_and_call(tmp_path: Path) -> None:
     assert result.value == {"valid": True} and result.receipt_checked and result.charged == "0.05"
     assert fake.reports[0]["result"] == "useful" and fake.reports[0]["receipt"]
     assert fake.needs[0]["need_state"] == "resolved"
+
+
+def test_a_reply_to_a_need_posted_in_this_run_carries_the_need_s_words(tmp_path: Path) -> None:
+    # choose searches with the need's text: without it, the network finds nothing and the answer is lost.
+    fake = FakeNetwork()
+    fake.provider(
+        "@holidays",
+        "cap_is_holiday",
+        lambda a: {"holiday": a["day"] == "2026-11-26"},
+        summary="public holiday by country",
+    )
+    fake.provider("@translate", "cap_translate", lambda _: {"holiday": True}, summary="translate text")
+    agent = _agent(fake, tmp_path)
+    seen: list[Any] = []
+
+    @agent.on_start
+    def ask() -> None:
+        need = agent.post_need("Is a day a public holiday, by country", topics=["holidays"])
+        fake.answer(need.post_id, "Is it a holiday: free.", author="@holidays")
+
+    @agent.on_need_answered
+    def use_it(answer: Any) -> None:
+        seen.append(answer.need)
+        seen.append(agent.choose(answer.need, sample={"day": "2026-11-26"}, check=lambda out: out["holiday"] is True))
+
+    fake.run(agent)
+    need, choice = seen
+    assert str(need.text) == "Is a day a public holiday, by country" and need.topics == ["holidays"]
+    assert [t.candidate.handle for t in choice.trials] == ["@holidays"]
+
+
+def test_an_agreement_declares_the_data_class_the_agent_shares(tmp_path: Path) -> None:
+    # A new agent's rules share public and synthetic data only: a call must work under them without saying more.
+    fake = FakeNetwork()
+    fake.provider("@holidays", "cap_is_holiday", lambda _: {"holiday": False}, summary="public holiday by country")
+    agent = _agent(fake, tmp_path)
+    [holidays] = agent.find("public holiday")
+    assert agent.use(holidays).call({"day": "2026-11-12"}).value == {"holiday": False}
+    assert [a["data_class"] for a in fake.agreements.values()] == ["public"]
+    with pytest.raises(NotAllowed):
+        agent.use(holidays, data_class="internal").call({"day": "2026-11-13"}, idempotency_key="internal-1")
+    with pytest.raises(ValueError):
+        agent.use(holidays, data_class="secret")
 
 
 def test_a_candidate_whose_input_differs_is_skipped_unless_the_sample_adapts(tmp_path: Path) -> None:
@@ -471,7 +516,7 @@ def test_without_a_handler_the_consumer_is_sent_to_the_payment_page() -> None:
     decision = default_decision(agent, run)
     assert decision.decision == "payment_needed"
     assert decision.fields["payment"] == {
-        "url": "https://buy.stripe.com/northwind?plan=pack&ref=rsv_1",
+        "url": "https://buy.stripe.com/northwind?plan=pack&client_reference_id=rsv_1",
         "amount": "8.00",
         "currency": "USD",
         "description": "500 runs",
@@ -517,3 +562,183 @@ def test_a_need_can_run_shorter_or_longer_than_two_weeks(tmp_path: Path) -> None
     assert fake.needs[-1]["expires_days"] == 7  # set when posted, the extension still unused
     with pytest.raises(ValueError):
         agent.post_need("Too long", expires_days=40)
+
+
+def test_an_agent_that_only_uses_services_announces_itself_and_waits_to_be_confirmed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # It has no adapter to announce it: from_env finds its agent.json, announces it with no address, and holds its
+    # callbacks back until its publisher has confirmed it.
+    uses_only = {
+        "ekl": "1.0",
+        "mode": "active_participant",
+        "execution_mode": "storage_free",
+        "agent": {"handle": "@ap-inbox", "display_name": "AP Inbox", "purpose": "Uses document services."},
+        "adapter": {},
+        "capabilities": [],
+    }
+    (tmp_path / "agent.json").write_text(json.dumps(uses_only))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("EKL_AGENT_FILE", raising=False)
+    monkeypatch.setenv("EKL_AGENT_CREDENTIAL", "ekla_test")
+    monkeypatch.setenv("EKL_PROVIDER_CREDENTIAL", "eklp_test")
+    monkeypatch.setattr("ekl_provider_adapter.agent.ACTIVE_POLL_SECONDS", 0.01)
+    agent = Agent.from_env()
+    assert agent._announcement is not None
+    api, config = agent._announcement
+    announced: list[tuple[str, dict[str, Any]]] = []
+
+    async def announce(endpoint: str, sent: dict[str, Any]) -> Any:
+        announced.append((endpoint, sent))
+        return type("Answer", (), {"version": 1})()
+
+    asked = 0
+
+    async def identify() -> str:
+        nonlocal asked
+        asked += 1
+        return "active" if asked == 3 else "review"
+
+    monkeypatch.setattr(api, "announce", announce)
+    monkeypatch.setattr(agent, "_identify", identify)
+    asyncio.run(agent._ensure_ready())
+    assert announced == [("", config)] and config["capabilities"] == [] and asked == 3 and agent._ready
+    # An agent whose agent.json offers services is announced by its adapter instead.
+    (tmp_path / "agent.json").write_text(
+        json.dumps(uses_only | {"capabilities": [{"tool": "x", "class": "read_only"}]})
+    )
+    assert Agent.from_env()._announcement is None
+
+
+class _Announcer:
+    """Stands in for the provider API an agent without a server announces its agent.json with."""
+
+    def __init__(self) -> None:
+        self.announced: list[str] = []
+
+    async def announce(self, endpoint: str, _sent: dict[str, Any]) -> Any:
+        self.announced.append(endpoint)
+        return type("Answer", (), {"version": 1})()
+
+
+def _confirmed_on_read(fake: FakeNetwork, read: int) -> list[int]:
+    """The publisher confirms the agent while it waits: agent_get_self reports it active from this read on."""
+    reads: list[int] = []
+    own = fake._tool_agent_get_self
+
+    def get_self() -> dict[str, Any]:
+        reads.append(1)
+        fake.state = "active" if len(reads) >= read else "review"
+        return own()
+
+    fake._tool_agent_get_self = get_self  # type: ignore[method-assign]
+    return reads
+
+
+def test_a_script_s_first_action_announces_the_agent_and_waits_to_be_confirmed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # No run(): a script on a laptop only calls services. Its first action announces agent.json, waits until the
+    # publisher confirms the agent, then acts.
+    monkeypatch.setattr("ekl_provider_adapter.agent.ACTIVE_POLL_SECONDS", 0.01)
+    fake = FakeNetwork()
+    fake.provider("@vat", "cap_vat_check", lambda _: {"valid": True}, summary="validate vat")
+    reads = _confirmed_on_read(fake, 3)
+    agent = _agent(fake, tmp_path)
+    announcer = _Announcer()
+    agent._announcement = (announcer, {"agent": {"handle": "@ap-inbox"}, "capabilities": []})  # type: ignore[assignment]
+    agent._announced_on = fake
+    [candidate] = agent.find("validate vat")
+    assert agent.use(candidate).call({"vat_number": "DE1"}).value == {"valid": True}
+    assert announcer.announced == [""] and len(reads) == 3  # announced once, with no address
+
+
+def test_run_once_reads_what_waits_retries_a_failing_callback_and_returns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A run on a schedule handles everything waiting in one go, retrying a callback that fails within the run, and
+    # declares its interval.
+    monkeypatch.setattr("ekl_provider_adapter.agent.RETRY_SECONDS", 0)
+    fake = FakeNetwork()
+    agent = _agent(fake, tmp_path)
+    tries: list[str] = []
+
+    @agent.on_message
+    def flaky(message: Any) -> None:
+        tries.append(str(message.text))
+        if str(message.text) == "second" and tries.count("second") < 3:
+            raise TimeoutError("the mail server was slow")
+
+    for text in ("first", "second", "third"):
+        fake.message("@peer", text)
+    assert agent.run_once(check_in_seconds=900) == 3
+    assert tries == ["first", "second", "second", "second", "third"] and not fake.failed
+    assert fake.reads and all(r == {"check_in_seconds": 900} for r in fake.reads)
+    assert agent.run_once() == 0  # nothing waits any more
+
+
+def test_run_once_for_an_agent_not_yet_confirmed_reads_nothing(tmp_path: Path) -> None:
+    fake = FakeNetwork()
+    fake.state = "review"
+    agent = _agent(fake, tmp_path)
+    agent._announcement = (_Announcer(), {"agent": {"handle": "@ap-inbox"}, "capabilities": []})  # type: ignore[assignment]
+    agent._announced_on = fake
+    fake.message("@peer", "hello")
+    with pytest.raises(NotConfirmed) as refused:
+        agent.run_once()
+    assert "ekl agent confirm @ap-inbox" in str(refused.value) and fake.reads == []
+
+
+def test_run_once_while_another_copy_reads_returns_at_once(tmp_path: Path) -> None:
+    fake = FakeNetwork()
+    agent = _agent(fake, tmp_path)
+    handled: list[Any] = []
+    agent.on_message(handled.append)
+    fake.message("@peer", "hello")
+    fake._tool_events_next = lambda **_: {"events": [], "next_cursor": 0, "lease": {"held": False}}  # type: ignore[method-assign]
+    assert agent.run_once() == 0 and handled == []
+
+
+def test_a_grant_that_lapsed_unused_is_reserved_again_once(tmp_path: Path) -> None:
+    # The laptop slept between the provider's approval and the call: nothing ran under the first grant, so the run is
+    # reserved again as a new execution of the same logical intent, under the same idempotency key.
+    fake = FakeNetwork()
+    vat = fake.provider("@vat", "cap_vat_check", lambda _: {"valid": True}, price="0.10", summary="validate vat")
+    journal = AgentJournal(str(tmp_path / "journal.db"))
+    agent = Agent(fake, journal)
+    [candidate] = agent.find("validate vat")
+    fake.approval = "lapse"
+    result = agent.use(candidate).call({"vat_number": "DE1"}, idempotency_key="supplier-7")
+    first, second = fake.reserved
+    assert second["logical_intent_id"] == first["execution_id"] != second["execution_id"]
+    assert result.execution_id == second["execution_id"] and vat.calls == 1
+    recorded = journal.call("supplier-7")
+    assert recorded is not None and recorded.execution_id == second["execution_id"]
+
+
+def test_a_grant_that_lapses_twice_is_not_retried_again(tmp_path: Path) -> None:
+    fake = FakeNetwork()
+    vat = fake.provider("@vat", "cap_vat_check", lambda _: {"valid": True}, price="0.10", summary="validate vat")
+    agent = _agent(fake, tmp_path)
+    [candidate] = agent.find("validate vat")
+    own = fake._tool_execution_reserve
+
+    def always_lapses(execution_id: str, **request: Any) -> dict[str, Any]:
+        fake.approval = "lapse"
+        return own(execution_id, **request)
+
+    fake._tool_execution_reserve = always_lapses  # type: ignore[method-assign]
+    with pytest.raises(RunNotApproved) as lapsed:
+        agent.use(candidate).call({"vat_number": "DE1"})
+    assert lapsed.value.code == "GRANT_EXPIRED" and len(fake.reserved) == 2 and vat.calls == 0
+
+
+def test_a_program_in_a_terminal_logs_the_agent_not_each_http_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    root = logging.getLogger()
+    monkeypatch.setattr(root, "handlers", [])
+    monkeypatch.setattr(root, "level", logging.WARNING)
+    for name in ("httpx", "httpx2", "httpcore"):
+        monkeypatch.setattr(logging.getLogger(name), "level", logging.NOTSET)
+    _log_to_terminal()
+    assert logging.getLogger("ekl_provider_adapter.agent").isEnabledFor(logging.INFO)
+    assert not any(logging.getLogger(n).isEnabledFor(logging.INFO) for n in ("httpx", "httpx2", "httpcore"))

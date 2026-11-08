@@ -200,6 +200,9 @@ class AdapterCore:
         self._given_endpoint = endpoint
         self._given_storage = storage
         self._agent: AgentFile | None = None
+        # Without a local agent.json, the announced version waiting for review, read from the network: listed as a
+        # local file's would be, so the review and the checks find its tools (C.8.2).
+        self._waiting: AgentFile | None = None
         self.storage: Storage | None = None
         # The validation candidate's number, and the active version calls are admitted under. Confirmed
         # versions are kept by number, the candidate's and the active one's at least, so an admitted call runs under
@@ -226,7 +229,16 @@ class AdapterCore:
     def endpoint(self) -> str:
         """The endpoint announced and proved: given in code or EKL_ADAPTER_ENDPOINT, else agent.json's."""
         local = self.local.agent.adapter.endpoint if self.local else None
-        return self._given_endpoint or local or (self._agent.adapter.endpoint if self._agent else None) or ""
+        waiting = self._waiting.adapter.endpoint if self._waiting else None
+        confirmed = self._agent.adapter.endpoint if self._agent else None
+        return self._given_endpoint or local or waiting or confirmed or ""
+
+    @property
+    def _announced_offered(self) -> list[Capability]:
+        """What the announced agent.json offers: the local file's, else the one waiting for review on the network."""
+        if self.local:
+            return self.local.agent.offered
+        return self._waiting.offered if self._waiting else []
 
     @property
     def listed(self) -> list[Capability]:
@@ -234,7 +246,7 @@ class AdapterCore:
         agent.json offers."""
         confirmed = self._agent.offered if self._agent else []
         names = {c.tool for c in confirmed}
-        return confirmed + [c for c in (self.local.agent.offered if self.local else []) if c.tool not in names]
+        return confirmed + [c for c in self._announced_offered if c.tool not in names]
 
     def apply_config(self, agent: AgentFile, version: int) -> None:
         """Use this confirmed configuration from now on. Refused (ValueError) when it needs something this process
@@ -268,6 +280,12 @@ class AdapterCore:
             log.warning("could not load the confirmed configuration from the network: %s", exc)
             return self.configured
         self.active_version = answer.active_version
+        if self.local is None:
+            try:
+                self._waiting = AgentFile.model_validate(answer.announced) if answer.announced else None
+            except ValueError as exc:
+                log.warning("the announced agent.json waiting for review doesn't load here: %s", exc)
+                self._waiting = None
         if answer.config is not None and not (self.configured and answer.version == self.config_version):
             try:
                 self.apply_config(AgentFile.model_validate(answer.config), answer.version)
@@ -306,7 +324,7 @@ class AdapterCore:
         """Whether the server still provides the tool, as far as the adapter knows: the candidate or the local
         agent.json offers it."""
         return (self.configured and self.agent.capability(tool) is not None) or any(
-            c.tool == tool for c in (self.local.agent.offered if self.local else [])
+            c.tool == tool for c in self._announced_offered
         )
 
     async def _admitted_capability(self, cap: Capability, admission: Admission) -> Capability | str:
@@ -349,7 +367,10 @@ class AdapterCore:
         announce = getattr(self.api, "announce", None)
         if self.local is None or announce is None:
             return True
-        if not self.endpoint:
+        # Only this process's own address is announced: the one given at deployment, or agent.json's. The confirmed
+        # configuration's address may belong to another deployment of the same agent, such as a run on a laptop.
+        own = self._given_endpoint or self.local.agent.adapter.endpoint
+        if not own:
             if self._announced is None:
                 log.warning(
                     "agent.json has no adapter.endpoint: set it to this adapter's public address to announce it"
@@ -363,7 +384,7 @@ class AdapterCore:
         if config == self._announced:
             return True
         try:
-            answer: Announcement = await announce(self.endpoint, config)
+            answer: Announcement = await announce(own, config)
         except ProviderApiError as exc:
             log.warning("could not announce agent.json to the network: %s", exc)
             return not exc.retryable
@@ -574,6 +595,21 @@ class AdapterCore:
                 outcome="failed_before_effect",
             )
         cap = admitted
+        if cap.input_schema:
+            # The arguments must fit the version the call was admitted under, whatever the server's code accepts now.
+            try:
+                jsonschema.validate(arguments, cap.input_schema)
+            except jsonschema.ValidationError as exc:
+                await self._settle(
+                    cap, attempt_id, admission_id, "failed_before_effect", None, None, error_code="INVALID_REQUEST"
+                )
+                return error_result(
+                    "INVALID_REQUEST",
+                    f"the arguments don't fit {cap.tool} as the version this call was admitted under declares it: "
+                    f"{exc.message}",
+                    admission_id=admission_id,
+                    outcome="failed_before_effect",
+                )
         effective = self._effective_arguments(cap, arguments, admission)
         if isinstance(effective, str):
             await self._settle(cap, attempt_id, admission_id, "failed_before_effect", None, None, error_code=effective)

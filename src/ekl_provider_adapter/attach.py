@@ -5,8 +5,10 @@
     from ekl_provider_adapter import attach
     app = attach(server)      # instead of: app = server.streamable_http_app()
 
-It needs its agent.json (EKL_AGENT_FILE, else EKL_AGENT_JSON, else ./agent.json), EKL_PROVIDER_CREDENTIAL and
-EKL_NETWORK_URL. It announces agent.json and serves the version its publisher confirmed, read from the network.
+It needs EKL_PROVIDER_CREDENTIAL and EKL_NETWORK_URL. With an agent.json (EKL_AGENT_FILE, else EKL_AGENT_JSON, else
+./agent.json) it announces it; without one, `ekl agent sync` announces it and the adapter lists what the network holds.
+Either way it serves the version its publisher confirmed, read from the network. Without EKL_PROVIDER_CREDENTIAL it
+is the server's own app, unchanged, so tests and local runs need no switch around it.
 
 The server keeps its own endpoint and clients. The adapter adds its endpoint beside it and calls the server's tools
 through the SDK's normal dispatch: it sees the tool name, arguments, result and request metadata, nothing else.
@@ -34,9 +36,12 @@ from ekl_provider_adapter.api import HttpProviderApi, ProviderApi
 from ekl_provider_adapter.config import DEFAULT_NETWORK_URL, AgentFile, LocalFile, inline_agent_file
 from ekl_provider_adapter.core import AdapterCore, Hooks, Settings
 from ekl_provider_adapter.network_client import McpNetwork, Network
+from ekl_provider_adapter.relay import Relay, relay_address_now, relayed
 from ekl_provider_adapter.runs import HttpRunsApi, Runs
 from ekl_provider_adapter.server import adapter_routes
 from ekl_provider_adapter.storage import Storage, open_storage
+from ekl_provider_adapter.stripe_events import StripeEvents
+from ekl_provider_adapter.stripe_webhook import stripe_routes
 
 log = logging.getLogger("ekl_provider_adapter")
 
@@ -94,6 +99,26 @@ class AdapterApp(Starlette):
     runs: Runs
 
 
+def without_network(
+    server: MCPServer, streamable_http_path: str, network_url: str | None, http_options: dict[str, Any]
+) -> AdapterApp:
+    """The server's own app, for a process without the agent key: no /ekl, nothing announced, no event loop. Its
+    `agent` raises AgentNotEnabled; its `runs` has no payment page and nothing to approve."""
+    existing = server.streamable_http_app(streamable_http_path=streamable_http_path, **http_options)
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_: Starlette) -> AsyncIterator[None]:
+        async with existing.router.lifespan_context(existing):
+            yield
+
+    app = AdapterApp(routes=[Mount("/", app=existing)], lifespan=lifespan)
+    app.agent = Agent(None)
+    app.runs = Runs(
+        HttpRunsApi(network_url or os.environ.get("EKL_NETWORK_URL") or DEFAULT_NETWORK_URL, ""), lambda: None
+    )
+    return app
+
+
 def runs_for(core: AdapterCore, local: LocalFile | None, api: Any | None, network_url: str, credential: str) -> Runs:
     """Run approval for this adapter: the confirmed configuration's payment page once there is one, else the local
     agent.json's."""
@@ -141,6 +166,8 @@ def attach(
     agent_credential: str | None = None,
     agent_network: Network | None = None,
     runs_api: Any | None = None,
+    stripe_webhook_secret: str | None = None,
+    stripe_key: str | None = None,
     **http_options: Any,
 ) -> AdapterApp:
     """The server's own app with the adapter's endpoint beside it.
@@ -153,7 +180,13 @@ def attach(
 
     The returned app's `agent` lets the agent take part itself. It turns on with EKL_AGENT_CREDENTIAL
     (or `agent_credential`); `agent_network` replaces the network, for tests with `testing.FakeNetwork`. Its `runs`
-    approves paid runs: register a handler with `app.runs.on_approval`, or approve later with `app.runs.approve`."""
+    approves paid runs: register a handler with `app.runs.on_approval`, or approve later with `app.runs.approve`.
+    With `stripe_webhook_secret` (or EKL_STRIPE_WEBHOOK_SECRET), runs paid on the publisher's Stripe account are
+    approved from its webhook at `<path>/stripe`; with `stripe_key` (or EKL_STRIPE_KEY) instead, from Stripe's Events
+    API, which needs no public address."""
+    if not (credential or os.environ.get("EKL_PROVIDER_CREDENTIAL")):
+        log.info("EuKollab is off: EKL_PROVIDER_CREDENTIAL isn't set, so the server runs without %s", "/ekl")
+        return without_network(server, streamable_http_path, network_url, http_options)
     try:
         local = local_file(agent_file)
     except ValueError as invalid:  # pydantic's ValidationError is a ValueError
@@ -204,12 +237,16 @@ def attach(
             ]
             return types.ReadResourceResult(contents=contents)
 
+    # With EKL_RELAY=1 the server needs no public address: its endpoint is the relay address the network keeps for it.
+    endpoint = (
+        relay_address_now(found_network, found_credential) if relayed() else os.environ.get("EKL_ADAPTER_ENDPOINT")
+    )
     core = AdapterCore(
         local,
         api or HttpProviderApi(found_network, found_credential),
         invoke,
         credential=found_credential,
-        endpoint=os.environ.get("EKL_ADAPTER_ENDPOINT"),
+        endpoint=endpoint,
         storage=storage_for(local, storage),
         hooks=hooks,
         settings=settings,
@@ -227,14 +264,27 @@ def attach(
         async with existing.router.lifespan_context(existing), adapter_lifespan(app):
             await own.start()
             watching = asyncio.ensure_future(runs.watch()) if found_credential or runs_api else None
+            relaying = (
+                asyncio.ensure_future(Relay(app, found_network, found_credential, path=core.path).run())
+                if relayed()
+                else None
+            )
+            found_key = stripe_key or os.environ.get("EKL_STRIPE_KEY")
+            paying = asyncio.ensure_future(StripeEvents(runs, found_key).watch()) if found_key else None
+            if relaying is not None:
+                # Run from a terminal (`ekl agent run`): its requests to the network would bury the calls it serves.
+                logging.getLogger("httpx2").setLevel(logging.WARNING)
+                log.info("serving the agent's calls through the network's relay at %s", endpoint)
             try:
                 yield
             finally:
-                if watching is not None:
-                    watching.cancel()
+                for task in (watching, relaying, paying):
+                    if task is not None:
+                        task.cancel()
                 await own.stop()
 
-    combined = AdapterApp(routes=[*routes, Mount("/", app=existing)], lifespan=lifespan)
+    stripe = stripe_routes(core.path, runs, stripe_webhook_secret or os.environ.get("EKL_STRIPE_WEBHOOK_SECRET"))
+    combined = AdapterApp(routes=[*routes, *stripe, Mount("/", app=existing)], lifespan=lifespan)
     combined.state.ekl_core = core
     combined.agent = own
     combined.runs = runs

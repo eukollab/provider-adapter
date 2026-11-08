@@ -45,6 +45,10 @@ test("the network's published fingerprint vectors", () => {
 test("ekl-json-1 canonical vectors", () => {
   const ekl = JSON.parse(readFileSync(join(contracts, "vectors", "ekl-json-1.json"), "utf8"));
   for (const v of ekl.valid) assert.equal(canonical(JSON.parse(v.input)), v.canonical, v.name);
+  // JSON.parse resolves the other invalid inputs (duplicate keys, large integers) before canonical sees them; a lone
+  // surrogate survives parsing, so canonical itself must refuse it.
+  const lone = ekl.invalid.find((v) => v.name === "lone surrogate");
+  assert.throws(() => canonical(JSON.parse(lone.input)), /lone surrogate/);
 });
 
 test("a salt is 32 bytes", () => {

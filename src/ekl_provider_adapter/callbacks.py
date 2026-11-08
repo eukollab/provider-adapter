@@ -179,8 +179,8 @@ async def _service(agent: Agent, handle: str, capability_id: str) -> Candidate:
 def bridge_runs(runs: Runs, url: str, secret: str, http: httpx2.AsyncClient | None = None) -> None:
     """Paid runs waiting for approval go to the publisher's app as `run.approval_requested`, signed like every
     callback. Its answer is the decision: {"decision": "approve", "runs": 500}, {"decision": "payment_needed", "url":
-    …, "amount": …, "description": …}, {"decision": "decline", "reason": …}, or nothing to decide later through the
-    local API's /agent/decide_run."""
+    …, "amount": …, "description": …}, {"decision": "decline", "reason": …}, or nothing: the payment page in
+    agent.json, or without one a decision later through the local API's /agent/decide_run."""
 
     @runs.on_approval
     async def approval(run: RunRequest) -> RunDecision | None:

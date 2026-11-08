@@ -34,13 +34,18 @@ def _number(value: float) -> str:
 
 
 def _string(value: str) -> str:
+    # RFC 8785 makes invalid Unicode an error. json.loads joins an escaped surrogate pair into one character, so a
+    # surrogate left in a string is a lone one.
+    if any("\ud800" <= c <= "\udfff" for c in value):
+        raise ValueError("a lone surrogate is not valid Unicode")
     # json.dumps with ensure_ascii=False escapes exactly what RFC 8785 requires (quote, backslash, controls with the
     # short forms and lower-case \u00XX) and leaves everything else, including non-ASCII, as is.
     return json.dumps(value, ensure_ascii=False)
 
 
 def canonical(value: Any) -> str:
-    """The canonical text of a JSON value. Refuses values JSON cannot represent exactly."""
+    """The canonical text of a JSON value. Refuses what ekl-json-1 refuses: integers beyond the safe range, NaN and
+    Infinity, non-string keys and invalid Unicode."""
     if value is None or isinstance(value, bool):
         return json.dumps(value)
     if isinstance(value, int):

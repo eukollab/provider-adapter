@@ -425,11 +425,21 @@ class FakeNetwork:
         if version is not None and not 1 <= version <= self.confirmed:
             raise ProviderApiError("NOT_FOUND", f"no confirmed configuration version {version}", retryable=False)
         found = self.versions[number - 1] if number else None
+        waiting = self.versions[-1] if version is None and len(self.versions) > self.confirmed else None
         return ConfigAnswer(
             version=number,
             config=copy.deepcopy(found) if found is not None else None,
             active_version=self.active_version,
+            announced=self._as_served(waiting) if waiting is not None else None,
         )
+
+    def _as_served(self, config: dict[str, Any]) -> dict[str, Any]:
+        """An announced agent.json as the network returns it: with the endpoint it was announced from."""
+        endpoint = next((a["endpoint"] for a in reversed(self.announcements) if a["config"] == config), None)
+        served = copy.deepcopy(config)
+        if endpoint:
+            served["adapter"] = (served.get("adapter") or {}) | {"endpoint": endpoint}
+        return served
 
     async def pending(self) -> PendingAdmissions:
         self.calls["pending"] += 1

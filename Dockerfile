@@ -19,6 +19,8 @@ COPY src ./src
 RUN pip install --no-cache-dir ".[postgres]"
 RUN useradd --create-home connector && mkdir /data && chown connector /data
 USER connector
+# Its own writable folder: an agent that takes part keeps its journal in .ekl/ there.
+WORKDIR /home/connector
 ENV PORT=8000 PYTHONUNBUFFERED=1
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s CMD python -c \

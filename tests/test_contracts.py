@@ -3,6 +3,7 @@
 """The adapter speaks the Provider API exactly as the contracts define it: every request it sends validates against
 the protocol's ekp/1.1/http/provider_*.input.json, and the fake network answers with what the output schemas allow."""
 
+import inspect
 import json
 from typing import Any
 
@@ -11,6 +12,7 @@ import jsonschema
 import pytest
 from referencing import Registry, Resource
 
+from ekl_provider_adapter.agent import Agent
 from ekl_provider_adapter.api import HttpProviderApi
 from ekl_provider_adapter.conformance.harness import Call, Harness
 from ekl_provider_adapter.conformance.network import http_app
@@ -90,3 +92,16 @@ async def test_requests_and_answers_follow_the_contracts() -> None:
         validator(f"{name}.output").validate(body)
     paths = {p for p, _ in sent}
     assert {"/v1/provider/announce", "/v1/provider/admit", "/v1/provider/complete", "/v1/provider/reconcile"} <= paths
+
+
+def test_every_callback_is_a_handler_the_network_accepts() -> None:
+    # The runtime names its callbacks on every events_next; one name the contract doesn't know refuses the whole poll,
+    # and the agent then receives no events at all.
+    agent = Agent(None)
+    for name, register in inspect.getmembers(agent, inspect.ismethod):
+        if name.startswith("on_") and name != "on_start":
+            takes_callback = "callback" in inspect.signature(register).parameters
+            (register if takes_callback else register())(lambda *_: None)
+    schema = json.loads((EKP / "tools" / "events_next.input.json").read_text(encoding="utf-8"))
+    jsonschema.Draft202012Validator(schema, registry=registry()).validate({"handlers": agent.handler_names()})
+    assert "on_review_due" in agent.handler_names()

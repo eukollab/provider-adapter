@@ -19,6 +19,7 @@ pytestmark = pytest.mark.anyio
 
 PLANS = [{"type": "free", "daily_limit": 200}, {"type": "per_call", "currency": "USD", "price": "0.001"}]
 DATA = {"accepted_data_classes": ["public"], "inputs": {"retention": "none"}, "results": {"retention": "none"}}
+PAYMENT = {"link": "https://buy.stripe.com/test_holidays", "note": "Packs of 500 checks"}
 ENVELOPE = {
     "io.modelcontextprotocol/protocolVersion": "2026-07-28",
     "io.modelcontextprotocol/clientCapabilities": {},
@@ -29,7 +30,9 @@ def declared_server() -> MCPServer:
     server = MCPServer(
         "holiday-calendar",
         title="Holiday Calendar",
-        extensions=[EuKollab(mode="active_participant", interests=["calendar"], data=DATA, plans=PLANS)],
+        extensions=[
+            EuKollab(mode="active_participant", interests=["calendar"], data=DATA, plans=PLANS, payment=PAYMENT)
+        ],
     )
 
     @server.tool(title="Long weekends", meta=service(class_="read_only", category="calendar", limitations="None."))
@@ -67,6 +70,7 @@ async def test_the_declarations_are_on_the_wire_and_follow_the_contract() -> Non
         "mode": "active_participant",
         "interests": ["calendar"],
         "data_declared": True,
+        "payment": PAYMENT,
         "defaults": {"data": DATA, "plans": PLANS},
     }
     [tool] = tools["tools"]

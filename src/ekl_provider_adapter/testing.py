@@ -68,6 +68,8 @@ class FakeNetwork:
     def __init__(self, handle: str = "@my-agent", rank_by: str = "accuracy"):
         self.handle, self.agent_id = handle, _id("agt")
         self.config: dict[str, Any] = {"sourcing": {"rank_by": rank_by, "mode": "auto_within_limits"}}
+        # A new agent's rules share public and synthetic data only, as the network's defaults do.
+        self.data_classes = {"public", "synthetic"}
         self.providers: dict[str, FakeProvider] = {}
         self.posts: dict[str, dict[str, Any]] = {}
         self.replies: list[dict[str, Any]] = []
@@ -84,8 +86,14 @@ class FakeNetwork:
         self.agreements: dict[str, dict[str, Any]] = {}
         self.executions: dict[str, dict[str, Any]] = {}
         # Paid runs wait for the provider's approval: "approve" after one read, "payment" (asked, then expired) or
-        # "decline". None approves at once, as a standing approval would.
+        # "decline". None approves at once, as a standing approval would. "lapse" approves, but the first grant
+        # expires unused, as when the machine sleeps before the call.
         self.approval: str | None = None
+        # The agent's state, as agent_get_self reports it: "review" or "added" test an agent not yet confirmed.
+        self.state = "active"
+        # Every reservation asked for, and what each events_next read declared, to check against.
+        self.reserved: list[dict[str, Any]] = []
+        self.reads: list[dict[str, Any]] = []
         self.reservations: dict[str, dict[str, Any]] = {}
         self._events: list[dict[str, Any]] = []
         self._open_reviews: set[str] = set()
@@ -94,8 +102,13 @@ class FakeNetwork:
 
     # --- scripting ------------------------------------------------------------------------------------------------
 
-    def rules(self, *, rank_by: str | None = None, approve_each: bool | None = None) -> None:
-        """The console's sourcing rules: Prefer (accuracy, price, balanced) and Who chooses."""
+    def rules(
+        self, *, rank_by: str | None = None, approve_each: bool | None = None, data_classes: list[str] | None = None
+    ) -> None:
+        """The console's sourcing rules: Prefer (accuracy, price, balanced), Who chooses, and the data classes the
+        agent may share."""
+        if data_classes is not None:
+            self.data_classes = set(data_classes)
         if rank_by is not None:
             self.config["sourcing"]["rank_by"] = rank_by
         if approve_each is not None:
@@ -358,14 +371,17 @@ class FakeNetwork:
         return result
 
     def _tool_agent_get_self(self) -> dict[str, Any]:
-        return {"agent_id": self.agent_id, "handle": self.handle, "state": "active", "config": self.config}
+        return {"agent_id": self.agent_id, "handle": self.handle, "state": self.state, "config": self.config}
 
     def _tool_feed_subscribe(self, **subscription: Any) -> dict[str, Any]:
         self.subscriptions.append(subscription)
         return {"subscriptions": self.subscriptions}
 
-    def _tool_events_next(self, handlers: list[str] | None = None, **_: Any) -> dict[str, Any]:
+    def _tool_events_next(
+        self, handlers: list[str] | None = None, check_in_seconds: int | None = None, **_: Any
+    ) -> dict[str, Any]:
         self.handlers = list(handlers or [])
+        self.reads.append({"check_in_seconds": check_in_seconds})
         pending = [e for e in self._events if e["seq"] > self._acked]
         return {
             "events": pending[:50],
@@ -509,10 +525,17 @@ class FakeNetwork:
         }
         return {"connection_id": connection_id, "state": "pending"}
 
-    def _tool_collaboration_create(self, connection_id: str, capability_id: str, **_: Any) -> dict[str, Any]:
+    def _tool_collaboration_create(
+        self, connection_id: str, capability_id: str, data_class: str = "synthetic", **_: Any
+    ) -> dict[str, Any]:
+        if data_class not in self.data_classes:
+            raise NotAllowed(
+                f"data class {data_class} not allowed", code="POLICY_DENIED", detail={"rule": "data_class"}
+            )
         peer = self.connections[connection_id]["peer"]
         p = self._provider(peer, capability_id)
         made = {
+            "data_class": data_class,
             "collaboration_id": _id("col"),
             "engagement_state": "open",
             "price_per_call": p.price,
@@ -547,8 +570,12 @@ class FakeNetwork:
         p = self._provider(handle, capability_id)
         return str(json.dumps({"input": p.input_schema, "output": p.output_schema}, sort_keys=True))
 
-    def _tool_execution_reserve(self, execution_id: str, **_: Any) -> dict[str, Any]:
+    def _tool_execution_reserve(self, execution_id: str, **request: Any) -> dict[str, Any]:
+        self.reserved.append({"execution_id": execution_id} | request)
         record = {"reservation_id": _id("rsv"), "execution_id": execution_id, "state": "held"}
+        if self.approval == "lapse":
+            self.approval = None  # the next reservation is granted at once
+            return record | {"state": "expired", "reconciliation_reason": "grant expired before redemption"}
         if self.approval is None:
             return record | {"execution_grant": "fake-grant"}
         record["state"] = "awaiting_approval"

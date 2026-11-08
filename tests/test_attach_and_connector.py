@@ -6,9 +6,12 @@ own endpoint, and the fake network served over HTTP so the Provider API client i
 import asyncio
 import base64
 import contextlib
+import gzip
 import hashlib
 import hmac
+import importlib
 import json
+import os
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -20,7 +23,7 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.server.mcpserver import MCPServer
 from starlette.applications import Starlette
 
-from ekl_provider_adapter import attach
+from ekl_provider_adapter import attach, connector
 from ekl_provider_adapter.api import HttpProviderApi
 from ekl_provider_adapter.attach import local_file
 from ekl_provider_adapter.config import strip_local
@@ -30,6 +33,8 @@ from ekl_provider_adapter.core import Settings
 from ekl_provider_adapter.fingerprint import fingerprint, new_salt
 
 pytestmark = pytest.mark.anyio
+# The module, not the function the package exports under the same name.
+ATTACH_MODULE = importlib.import_module("ekl_provider_adapter.attach")
 
 CREDENTIAL = "eklp_test"
 ENDPOINT = "http://127.0.0.1/ekl"
@@ -170,6 +175,66 @@ async def test_the_adapter_announces_its_file_and_serves_once_confirmed(
         served_now = await adapter.call_tool("search_active_listings", {"area_ref": "x"}, meta=meta)
         assert (served_now.meta or {})["ekl"]["outcome"] == "succeeded"
         await app.state.ekl_core.drain()
+
+
+async def test_without_the_agent_key_attach_is_the_servers_own_app(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests, local runs and environments without the key keep the server exactly as it is: no /ekl, nothing
+    announced, and the agent's actions say it isn't enabled."""
+    monkeypatch.delenv("EKL_PROVIDER_CREDENTIAL", raising=False)
+    app = attach(homes_server(), host="0.0.0.0")
+    assert not app.agent.enabled
+    async with served(app, None) as http:
+        async with mcp(http, "/mcp") as own:
+            assert "internal_admin" in [t.name for t in (await own.list_tools()).tools]
+        assert (await http.get("/ekl/metrics")).status_code == 404
+    assert not hasattr(app.state, "ekl_core")
+
+
+async def test_without_agent_json_the_adapter_lists_what_ekl_announced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ekl agent sync announced the file from the publisher's machine; the deployed adapter has none. The review's
+    challenge finds the announced tools and the proof binds the announced endpoint; once confirmed, calls run."""
+    for name in ("EKL_AGENT_FILE", "EKL_AGENT_JSON", "EKL_ADAPTER_ENDPOINT"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.chdir(tmp_path)
+    network = FakeNetwork()
+    token = network.token("agt_consumer")
+    await network.announce(ENDPOINT, strip_local(AGENT))
+    app = attach(homes_server(), credential=CREDENTIAL, api=network_client(network))
+    core = app.state.ekl_core
+    async with served(app, token) as http, mcp(http, "/ekl") as adapter:
+        challenge = "cd" * 32
+        listed = await adapter.list_tools(meta={"ekl": {"challenge": challenge}})
+        assert [t.name for t in listed.tools] == ["search_active_listings"]
+        assert core.endpoint == ENDPOINT
+        assert (listed.meta or {})["ekl"]["proof"] == core.answer_challenge(challenge)
+        assert len(network.announcements) == 1  # ekl's; the adapter has nothing to announce
+        network.confirm()
+        meta = {"ekl": {"execution_id": "e1", "salt": new_salt()}}
+        result = await adapter.call_tool("search_active_listings", {"area_ref": "x"}, meta=meta)
+        assert (result.meta or {})["ekl"]["outcome"] == "succeeded"
+        await core.drain()
+
+
+async def test_a_run_without_its_own_address_never_announces(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A local run with EKL_ADAPTER_ENDPOINT empty, as ekl new agent writes it, announces nothing, even after
+    agent.json changes and though the network knows the deployed address: that address isn't this process's."""
+    network = confirmed(AGENT)
+    file = tmp_path / "agent.json"
+    file.write_text(json.dumps(AGENT | {"adapter": {"endpoint": "${EKL_ADAPTER_ENDPOINT}"}}))
+    monkeypatch.setenv("EKL_AGENT_FILE", str(file))
+    monkeypatch.setenv("EKL_ADAPTER_ENDPOINT", "")
+    app = attach(homes_server(), credential=CREDENTIAL, api=network_client(network))
+    core = app.state.ekl_core
+    await core.load_config()
+    assert core.endpoint == ENDPOINT  # the confirmed address still serves the challenge and the path
+    assert await core.announce_if_changed()
+    file.write_text(
+        json.dumps(AGENT | {"adapter": {"endpoint": "${EKL_ADAPTER_ENDPOINT}"}, "mode": "active_participant"})
+    )
+    assert await core.announce_if_changed()
+    assert network.calls["announce"] == 0 and not network.announcements
 
 
 async def test_announcing_retries_while_the_network_is_unreachable() -> None:
@@ -422,3 +487,44 @@ async def test_a_server_whose_agent_json_doesnt_validate_still_serves_its_own_en
             Client(streamable_http_client("http://localhost:8000/mcp", http_client=http)) as client,
         ):
             assert [t.name for t in (await client.list_tools()).tools]
+
+
+def test_the_connector_runs_the_callbacks_itself(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A deployed connector needs no second service for its callbacks: it runs eukollab_callbacks.py beside itself,
+    sent by ekl agent deploy or found beside agent.json, and only when the agent takes part and no other address is
+    set."""
+    script = "import sys, pathlib; pathlib.Path('ran').write_text(' '.join(sys.argv[1:]))\n"
+    monkeypatch.delenv("EKL_CALLBACK_URL", raising=False)
+    monkeypatch.delenv("EKL_CALLBACKS_PY", raising=False)
+    monkeypatch.delenv("EKL_CALLBACKS_PORT", raising=False)
+    (tmp_path / "agent.json").write_text("{}")
+    (tmp_path / connector.CALLBACKS_FILE).write_text(script)
+    monkeypatch.delenv("EKL_AGENT_CREDENTIAL", raising=False)
+    assert connector.start_callbacks(str(tmp_path / "agent.json")) is None
+    monkeypatch.setenv("EKL_AGENT_CREDENTIAL", "ekla_test")
+    child = connector.start_callbacks(str(tmp_path / "agent.json"))
+    assert child is not None and child.wait(timeout=30) == 0
+    # 8002, or a free port when another agent's callbacks already listen there.
+    port = (tmp_path / "ran").read_text().removeprefix("--port ")
+    assert port.isdigit() and os.environ["EKL_CALLBACK_URL"] == f"http://127.0.0.1:{port}/"
+    # Already pointed at the publisher's own app: the file is left alone.
+    assert connector.start_callbacks(str(tmp_path / "agent.json")) is None
+    monkeypatch.delenv("EKL_CALLBACK_URL")
+    sent = base64.b64encode(gzip.compress(script.replace("'ran'", "'sent'").encode())).decode()
+    monkeypatch.setenv("EKL_CALLBACKS_PY", sent)
+    child = connector.start_callbacks(None)
+    assert child is not None and child.wait(timeout=30) == 0
+    assert (Path(str(child.args[1])).parent / "sent").read_text().startswith("--port ")
+
+
+async def test_with_ekl_relay_an_attached_server_takes_its_relay_address(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`ekl agent run` in a new agent's folder starts its server with EKL_RELAY=1: no public address, and the
+    endpoint it announces is the relay address the network keeps for it."""
+    relay_url = "https://network.test/v1/relay/agt_homes/mcp"
+    monkeypatch.setenv("EKL_RELAY", "1")
+    monkeypatch.setattr(ATTACH_MODULE, "relay_address_now", lambda *_: relay_url)
+    app = attach(homes_server(), AGENT, credential=CREDENTIAL, api=network_client(confirmed(AGENT)))
+    assert app.state.ekl_core.endpoint == relay_url
+    monkeypatch.delenv("EKL_RELAY")
+    plain = attach(homes_server(), AGENT, credential=CREDENTIAL, api=network_client(confirmed(AGENT)))
+    assert plain.state.ekl_core.endpoint != relay_url

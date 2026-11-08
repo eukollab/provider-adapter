@@ -31,7 +31,8 @@ def _given(**fields: Any) -> dict[str, Any]:
 class EuKollab(Extension):
     """The agent-wide declaration: the MCP extension `ai.eukollab/agent`, whose settings the server advertises.
     `data` and `plans` apply to every service unless a service declares its own; giving `data` declares how the
-    agent handles data, unless `data_declared` says otherwise."""
+    agent handles data, unless `data_declared` says otherwise. `payment` is where consumers pay for its paid services:
+    {"link": "https://…", "note": "…"}."""
 
     identifier = AGENT_DECLARATION
 
@@ -50,6 +51,7 @@ class EuKollab(Extension):
         data_declared: bool | None = None,
         terms: dict[str, Any] | None = None,
         plans: list[dict[str, Any]] | None = None,
+        payment: dict[str, Any] | None = None,
     ) -> None:
         defaults = _given(data=data, plans=plans)
         self._settings = _given(
@@ -63,6 +65,7 @@ class EuKollab(Extension):
             website=website,
             data_declared=data_declared if data_declared is not None else (True if data is not None else None),
             terms=terms,
+            payment=payment,
             defaults=defaults or None,
         )
 

@@ -8,6 +8,12 @@ import { createHash, randomBytes } from "node:crypto";
 
 const SALT_BYTES = 32;
 
+// RFC 8785 makes invalid Unicode, such as a lone surrogate, an error.
+function string(value) {
+  if (!value.isWellFormed()) throw new Error("a lone surrogate is not valid Unicode");
+  return JSON.stringify(value);
+}
+
 export function canonical(value) {
   if (value === null || typeof value === "boolean") return JSON.stringify(value);
   if (typeof value === "number") {
@@ -15,11 +21,11 @@ export function canonical(value) {
     // Integers beyond 2^53 are refused where JSON is parsed: once parsed, a number cannot say it was one.
     return JSON.stringify(value); // -0 becomes "0", as RFC 8785 requires
   }
-  if (typeof value === "string") return JSON.stringify(value);
+  if (typeof value === "string") return string(value);
   if (Array.isArray(value)) return "[" + value.map(canonical).join(",") + "]";
   if (typeof value === "object") {
     const keys = Object.keys(value).sort(); // default sort compares UTF-16 code units
-    return "{" + keys.map((k) => JSON.stringify(k) + ":" + canonical(value[k])).join(",") + "}";
+    return "{" + keys.map((k) => string(k) + ":" + canonical(value[k])).join(",") + "}";
   }
   throw new Error(`${typeof value} is not a JSON value`);
 }

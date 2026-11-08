@@ -130,6 +130,12 @@ class AgentJournal:
             (call.idempotency_key, call.execution_id, call.salt, call.provider, call.capability_id, _now()),
         )
 
+    def replace_execution(self, idempotency_key: str, execution_id: str) -> None:
+        """A paid call whose grant lapsed unredeemed goes on as a new execution: nothing ran under the old one."""
+        self._run(
+            "UPDATE ekl_agent_calls SET execution_id = ? WHERE idempotency_key = ?", (execution_id, idempotency_key)
+        )
+
     def finish_call(self, idempotency_key: str, outcome: dict[str, Any]) -> None:
         """The outcome only: whether it ran, what was charged, whether the receipt checked. Never the result."""
         self._run(
