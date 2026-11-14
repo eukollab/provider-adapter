@@ -31,8 +31,10 @@ from ekl_provider_adapter.errors import (
     AgreementPending,
     ChoiceWaiting,
     ConnectionPending,
+    ContentRefused,
     ContractChanged,
     CredentialInvalid,
+    InputRefused,
     NoProvider,
     NotAllowed,
     NotConfirmed,
@@ -42,7 +44,9 @@ from ekl_provider_adapter.errors import (
     ProviderUnavailable,
     RunNotApproved,
     StandInMissing,
+    Unavailable,
 )
+from ekl_provider_adapter.receipts import ReceiptInvalid
 from ekl_provider_adapter.runs import RunDecision, RunRequest, Runs
 from ekl_provider_adapter.storage import PostgresStorage, SQLiteStorage, Storage
 
@@ -57,10 +61,12 @@ __all__ = [
     "Choice",
     "ChoiceWaiting",
     "ConnectionPending",
+    "ContentRefused",
     "ContractChanged",
     "CredentialInvalid",
     "EuKollab",
     "Hooks",
+    "InputRefused",
     "Need",
     "NoEffectError",
     "NoProvider",
@@ -73,6 +79,7 @@ __all__ = [
     "PostgresStorage",
     "ProviderNotFunded",
     "ProviderUnavailable",
+    "ReceiptInvalid",
     "Result",
     "ReviewDue",
     "RunDecision",
@@ -83,6 +90,7 @@ __all__ = [
     "StandInMissing",
     "Storage",
     "Trial",
+    "Unavailable",
     "Untrusted",
     "attach",
     "load_agent_file",

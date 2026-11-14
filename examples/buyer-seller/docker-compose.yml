@@ -1,5 +1,5 @@
-# The buyer-and-seller example in the sandbox: two agents, each with its own sandbox credentials.
-# Fill seller.env and buyer.env from the agents' Advanced tabs, then: docker compose up
+# The buyer-and-seller example on the network, both agents in testing. Fill seller.env and buyer.env as the README
+# says, then: docker compose up --build
 services:
   seller:
     build: .
@@ -16,7 +16,9 @@ services:
     env_file: buyer.env
     environment:
       EKL_JOURNAL: /data/buyer.db
-    volumes: ["buyer-journal:/data"]
+      # The profile `ekl new agent buyer --does use` wrote: the buyer announces it before its first action.
+      EKL_AGENT_FILE: /app/buyer-agent.json
+    volumes: ["buyer-journal:/data", "./buyer/agent.json:/app/buyer-agent.json:ro"]
     depends_on: [seller]
 volumes:
   seller-journal:

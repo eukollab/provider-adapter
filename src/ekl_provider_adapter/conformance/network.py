@@ -408,7 +408,7 @@ class FakeNetwork:
             state = "invalid"
         else:
             state = "waiting_for_review"
-        return Announcement(version=version, state=state, problems=list(self.problems))
+        return Announcement(version=version, state=state, problems=list(self.problems), endpoint_proof="v1")
 
     def confirm(self, version: int | None = None) -> None:
         """The publisher confirms a version, the latest announced by default; admit reports it from now on."""

@@ -28,7 +28,7 @@ from ekl_provider_adapter.api import HttpProviderApi
 from ekl_provider_adapter.attach import local_file
 from ekl_provider_adapter.config import strip_local
 from ekl_provider_adapter.conformance.network import FakeNetwork, ToolRules, http_app
-from ekl_provider_adapter.connector import Upstream, connector_app
+from ekl_provider_adapter.connector import Upstream, connector_app, upstream_headers
 from ekl_provider_adapter.core import Settings
 from ekl_provider_adapter.fingerprint import fingerprint, new_salt
 
@@ -75,7 +75,7 @@ def confirmed(agent: dict[str, Any]) -> FakeNetwork:
 
 def network_client(network: FakeNetwork) -> HttpProviderApi:
     transport = httpx2.ASGITransport(app=http_app(network, CREDENTIAL))
-    return HttpProviderApi("http://network", CREDENTIAL, http=httpx2.AsyncClient(transport=transport))
+    return HttpProviderApi("https://network", CREDENTIAL, http=httpx2.AsyncClient(transport=transport))
 
 
 @contextlib.asynccontextmanager
@@ -237,6 +237,37 @@ async def test_a_run_without_its_own_address_never_announces(tmp_path: Path, mon
     assert network.calls["announce"] == 0 and not network.announcements
 
 
+async def test_an_attached_server_deployed_at_its_own_address_announces_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A server with the adapter attached from its agent package has no agent.json where it runs. Deployed with
+    EKL_ADAPTER_ENDPOINT, it announces the network's copy under that address once, for the publisher to review; a
+    copy that already has the address, or a run without one, announces nothing."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("EKL_AGENT_FILE", raising=False)
+    monkeypatch.delenv("EKL_AGENT_JSON", raising=False)
+    hosted = "https://unit-converter.example.com/ekl"
+    network = confirmed(AGENT)
+    monkeypatch.setenv("EKL_ADAPTER_ENDPOINT", hosted)
+    core = attach(homes_server(), credential=CREDENTIAL, api=network_client(network)).state.ekl_core
+    assert await core.announce_if_changed()
+    assert await core.announce_if_changed()
+    assert [a["endpoint"] for a in network.announcements] == [hosted]
+    announced = network.announcements[0]["config"]
+    assert announced["adapter"]["endpoint"] == hosted
+    assert announced["capabilities"] == strip_local(AGENT)["capabilities"]
+
+    again = attach(homes_server(), credential=CREDENTIAL, api=network_client(network)).state.ekl_core
+    network.confirm()
+    assert await again.announce_if_changed()
+    assert len(network.announcements) == 1  # the confirmed copy has this address already
+
+    monkeypatch.setenv("EKL_ADAPTER_ENDPOINT", "")
+    local = attach(homes_server(), credential=CREDENTIAL, api=network_client(confirmed(AGENT))).state.ekl_core
+    assert await local.announce_if_changed()
+    assert network.calls["announce"] == 1
+
+
 async def test_announcing_retries_while_the_network_is_unreachable() -> None:
     network = FakeNetwork()
     network.faults.unavailable = True
@@ -279,6 +310,70 @@ async def test_the_connector_reaches_tools_over_mcp() -> None:
             assert (again.meta or {})["ekl"]["code"] == "RESULT_UNAVAILABLE"
         await upstream_http.aclose()
     assert network.runs("agt_consumer", "e1") == 1
+
+
+def _keyed(app: Any, header: str, key: str) -> Any:
+    """The server behind a hosted platform's key check: requests without the key are refused before MCP sees them."""
+
+    async def guarded(scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] == "http" and dict(scope["headers"]).get(header.lower().encode()) != key.encode():
+            await send({"type": "http.response.start", "status": 401, "headers": []})
+            await send({"type": "http.response.body", "body": b"unauthorized"})
+            return
+        await app(scope, receive, send)
+
+    return guarded
+
+
+async def test_the_connector_sends_the_configured_headers_to_a_server_that_requires_a_key() -> None:
+    network = confirmed(AGENT)
+    token = network.token("agt_consumer")
+    upstream_app = homes_server().streamable_http_app(host="0.0.0.0", stateless_http=True, json_response=True)
+    keyed = _keyed(upstream_app, "Authorization", "Bearer platform-key")
+    async with upstream_app.router.lifespan_context(upstream_app):
+        refused = Upstream(
+            "http://127.0.0.1/mcp",
+            http=httpx2.AsyncClient(transport=httpx2.ASGITransport(app=keyed), base_url="http://127.0.0.1"),
+        )
+        with pytest.raises(ExceptionGroup):  # the MCP client's task group carries the refusal
+            await refused.tools()
+        upstream_http = httpx2.AsyncClient(transport=httpx2.ASGITransport(app=keyed), base_url="http://127.0.0.1")
+        upstream = Upstream(
+            "http://127.0.0.1/mcp", http=upstream_http, headers={"Authorization": "Bearer platform-key"}
+        )
+        app = connector_app(AGENT, credential=CREDENTIAL, api=network_client(network), upstream=upstream)
+        async with served(app, token) as http, mcp(http, "/ekl") as adapter:
+            meta = {"ekl": {"execution_id": "e1", "salt": new_salt()}}
+            result = await adapter.call_tool("search_active_listings", {"area_ref": "x"}, meta=meta)
+            assert result.structured_content == {"area": "x", "listings": ["0-bed home"]}
+        await upstream_http.aclose()
+
+
+def test_upstream_headers_are_a_json_object_of_one_line_values() -> None:
+    assert upstream_headers(None) == {}
+    assert upstream_headers(" ") == {}
+    assert upstream_headers('{"Authorization": "Bearer k", "x-api-key": "k2"}') == {
+        "Authorization": "Bearer k",
+        "x-api-key": "k2",
+    }
+    for text, refusal in [
+        ("Bearer k", "JSON object"),
+        ('["Authorization"]', "JSON object"),
+        ('{"Bad Name": "k"}', "not a valid header name"),
+        ('{"Mcp-Session-Id": "k"}', "set by the MCP transport"),
+        ('{"Content-Type": "k"}', "set by the MCP transport"),
+        ('{"Authorization": "Bearer k\\r\\nX-Evil: 1"}', "one line"),
+        ('{"Authorization": 5}', "one line"),
+    ]:
+        with pytest.raises(ValueError, match=refusal) as caught:
+            upstream_headers(text)
+        assert "Bearer k" not in str(caught.value)  # the key itself is never repeated in an error
+
+
+def test_the_connector_reads_its_upstream_headers_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EKL_UPSTREAM_HEADERS", "Authorization: Bearer k")
+    with pytest.raises(ValueError, match="EKL_UPSTREAM_HEADERS must be a JSON object"):
+        connector_app(AGENT | {"upstream": {"mcp_url": "http://127.0.0.1/mcp"}}, credential=CREDENTIAL)
 
 
 async def test_the_connector_passes_arguments_through_unchanged() -> None:
@@ -427,7 +522,7 @@ async def test_the_connector_runs_from_environment_variables_alone(
     monkeypatch.setenv("EKL_AGENT_JSON", base64.b64encode(json.dumps(deployed).encode()).decode())
     monkeypatch.setenv("UP", "http://127.0.0.1/mcp")
     monkeypatch.setenv("EKL_PROVIDER_CREDENTIAL", CREDENTIAL)
-    monkeypatch.setenv("EKL_NETWORK_URL", "http://network")
+    monkeypatch.setenv("EKL_NETWORK_URL", "https://network")
     monkeypatch.setenv("EKL_UPSTREAM_MCP_URL", "http://127.0.0.1/mcp")
     monkeypatch.setenv("EKL_ADAPTER_ENDPOINT", ENDPOINT)
     network = FakeNetwork()
@@ -478,7 +573,7 @@ async def test_a_server_whose_agent_json_doesnt_validate_still_serves_its_own_en
         monkeypatch.delenv(name, raising=False)
     paid = {**AGENT["capabilities"][0], "plans": [{"type": "per_call", "currency": "USD", "price": "0.01"}]}
     (tmp_path / "agent.json").write_text(json.dumps(AGENT | {"capabilities": [paid]}))  # storage_free_accepted missing
-    app = attach(homes_server(), credential=CREDENTIAL, network_url="http://network")
+    app = attach(homes_server(), credential=CREDENTIAL, network_url="https://network")
     assert "agent.json doesn't validate" in caplog.text and "storage_free_accepted" in caplog.text
     async with app.router.lifespan_context(app):
         transport = httpx2.ASGITransport(app=app)
@@ -515,6 +610,68 @@ def test_the_connector_runs_the_callbacks_itself(tmp_path: Path, monkeypatch: py
     child = connector.start_callbacks(None)
     assert child is not None and child.wait(timeout=30) == 0
     assert (Path(str(child.args[1])).parent / "sent").read_text().startswith("--port ")
+
+
+def test_callbacks_sent_inline_find_agent_json_beside_them_and_keep_their_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`ekl agent run` and every deploy send the callbacks inline: they are unpacked into a fresh folder, with
+    agent.json beside them, as the generated callbacks read it to accept connections and answer needs for the services
+    offered.
+    Their record of handled events stays where the connector runs, so a restart doesn't handle an event twice."""
+    script = (
+        "import json, os, pathlib\n"
+        "here = pathlib.Path(__file__).parent\n"
+        "caps = json.loads((here / 'agent.json').read_text())['capabilities']\n"
+        "pathlib.Path(os.environ['OUT']).write_text(json.dumps([caps, os.environ['EKL_CALLBACKS_DB']]))\n"
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OUT", str(tmp_path / "seen.json"))
+    monkeypatch.setenv("EKL_AGENT_CREDENTIAL", "ekla_test")
+    monkeypatch.delenv("EKL_CALLBACK_URL", raising=False)
+    monkeypatch.delenv("EKL_AGENT_FILE", raising=False)
+    monkeypatch.delenv("EKL_CALLBACKS_DB", raising=False)
+    monkeypatch.setenv("EKL_AGENT_JSON", json.dumps({"capabilities": [{"tool": "convert_length"}]}))
+    monkeypatch.setenv("EKL_CALLBACKS_PY", base64.b64encode(gzip.compress(script.encode())).decode())
+    child = connector.start_callbacks(None)
+    assert child is not None and child.wait(timeout=30) == 0
+    caps, db = json.loads((tmp_path / "seen.json").read_text())
+    assert caps == [{"tool": "convert_length"}]
+    assert Path(db) == tmp_path.resolve() / ".ekl" / "callbacks.db"
+
+
+def test_the_callbacks_child_has_its_own_process_group_so_ctrl_c_reaches_only_the_connector(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ctrl-C in `ekl agent run` goes to the terminal's process group: the connector stops the callbacks itself, so
+    the child prints no KeyboardInterrupt traceback."""
+    (tmp_path / "agent.json").write_text("{}")
+    (tmp_path / connector.CALLBACKS_FILE).write_text(
+        "import os, sys\nsys.exit(0 if os.getpgid(0) == os.getpid() else 3)\n"
+    )
+    monkeypatch.setenv("EKL_AGENT_CREDENTIAL", "ekla_test")
+    monkeypatch.delenv("EKL_CALLBACK_URL", raising=False)
+    child = connector.start_callbacks(str(tmp_path / "agent.json"))
+    assert child is not None and child.wait(timeout=30) == 0
+
+
+@pytest.mark.parametrize(
+    ("variables", "expected"),
+    [
+        ({"RAILWAY_PUBLIC_DOMAIN": "homes-production.up.railway.app"}, "https://homes-production.up.railway.app/ekl"),
+        ({"FLY_APP_NAME": "homes-connector"}, "https://homes-connector.fly.dev/ekl"),
+        ({"RENDER_EXTERNAL_URL": "https://homes.onrender.com/"}, "https://homes.onrender.com/ekl"),
+        ({}, None),
+    ],
+)
+def test_on_a_host_that_names_its_domain_the_connector_knows_its_address_in_the_first_deploy(
+    monkeypatch: pytest.MonkeyPatch, variables: dict[str, str], expected: str | None
+) -> None:
+    for name in ("RAILWAY_PUBLIC_DOMAIN", "FLY_APP_NAME", "RENDER_EXTERNAL_URL"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in variables.items():
+        monkeypatch.setenv(name, value)
+    assert connector.hosted_endpoint() == expected
 
 
 async def test_with_ekl_relay_an_attached_server_takes_its_relay_address(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -39,3 +39,19 @@ def result_body(result: types.CallToolResult) -> Any:
     return [
         block.model_dump(mode="json", by_alias=True, exclude_none=True, exclude={"meta"}) for block in result.content
     ]
+
+
+UPSTREAM_FIELDS = ("name", "description", "inputSchema", "outputSchema", "annotations")
+
+
+def upstream_fingerprint(tools: list[types.Tool] | list[dict[str, Any]], declared: set[str]) -> str:
+    """EKP 1.2 §5.1: SHA-256 of ekl-json-1 of the declared tools of the server's tools/list, sorted by name, each
+    projected to its five interface fields, absent ones null. A tool changed upstream without a new agent.json changes
+    it; nothing else of a tool does."""
+    projected = []
+    for tool in tools:
+        wire = tool if isinstance(tool, dict) else tool.model_dump(mode="json", by_alias=True, exclude_none=True)
+        if wire.get("name") in declared:
+            projected.append({field: wire.get(field) for field in UPSTREAM_FIELDS})
+    projected.sort(key=lambda t: str(t["name"]).encode("utf-16-be", "surrogatepass"))
+    return hashlib.sha256(canonical(projected).encode("utf-8")).hexdigest()

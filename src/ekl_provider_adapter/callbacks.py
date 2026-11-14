@@ -2,27 +2,44 @@
 # SPDX-License-Identifier: Apache-2.0
 """The connector's agent side, for servers in any language.
 
-Events go to a route in the publisher's own app (EKL_CALLBACK_URL) as JSON, signed with an HMAC-SHA256 over the
-body keyed by the agent credential, in the X-EKL-Signature header (`sha256=<hex>`). The app answers with what to do:
-`{"reply": "…"}`, `{"accept": true}`, `{"decline": "…"}`, `{"review": {…}}`, `{"skip": true}`, or nothing. For
-actions the app starts itself (post a need, choose, call a service, or call a declared service with
-`POST /agent/service`), the connector serves the same calls as a small HTTP API on 127.0.0.1 only, and
+Events go to a route in the publisher's own app (EKL_CALLBACK_URL) as JSON, signed with callback protocol v2
+(callback_signing): the app holds EKL_CALLBACK_KEY, derived from the agent credential, never the credential itself.
+The app answers with what to do: `{"reply": "…"}`, `{"accept": true}`, `{"decline": "…"}`, `{"review": {…}}`,
+`{"skip": true}`, a run's decision, or nothing; a v2 app signs its answer, bound to the request it answers.
+
+A decision the app owes (a connection request, a paid run's approval, a reply to a need or a message) is journaled
+before it is first delivered, and applied at most once: a failed delivery (no connection, a timeout, a 5xx,
+IN_PROGRESS, or an answer that isn't signed once the app has answered with v2) leaves it pending and it is sent again,
+with the same event ID and the same body, after 2 s, 10 s, 1 min, 5 min and then every 15 min until its deadline. At the
+deadline its default applies: a connection request is declined, a run is left unapproved, nothing is replied. An answer
+that arrives later is logged and ignored.
+
+For actions the app starts itself (post a need, choose, call a service, or call a declared service with
+`POST /agent/service`), the connector serves the same calls as a small HTTP API on 127.0.0.1 only (local_guard), and
 `GET /agent/status` says whether it holds the agent-operation credential.
 """
 
-import hashlib
-import hmac
+import asyncio
+import contextlib
+import datetime as dt
 import json
+import logging
+import os
+import time
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx2
 import jsonschema
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
+from ekl_provider_adapter import callback_signing as cb
 from ekl_provider_adapter.agent import (
+    CURRENT_EVENT,
     Agent,
     Answer,
     Candidate,
@@ -34,16 +51,266 @@ from ekl_provider_adapter.agent import (
     PlannedService,
     ReviewDue,
 )
+from ekl_provider_adapter.agent_journal import AgentJournal, PendingDecision
+from ekl_provider_adapter.config import is_loopback, require_https
 from ekl_provider_adapter.errors import AgentError
-from ekl_provider_adapter.runs import RunDecision, RunRequest, Runs
+from ekl_provider_adapter.local_guard import LocalGuard
+from ekl_provider_adapter.runs import DecidedElsewhere, RunDecision, RunRequest, Runs
 
-SIGNATURE_HEADER = "X-EKL-Signature"
+log = logging.getLogger("ekl_provider_adapter.callbacks")
+
+# The pauses between deliveries of an undecided event; the last repeats until the deadline.
+BACKOFF_SECONDS = (2.0, 10.0, 60.0, 300.0, 900.0)
+# How often the deadline worker looks for decisions whose time is up.
+DEADLINE_CHECK_SECONDS = 30.0
+DELIVERY_TIMEOUT_SECONDS = 30.0
+V2_FLAG = "callback_v2"
+# Each decision kind's final deadline, configurable: connection requests a day, replies an hour. A run's comes with it.
+CONNECTION_HOURS = "EKL_CONNECTION_DECISION_HOURS"
+REPLY_MINUTES = "EKL_REPLY_DECISION_MINUTES"
+REPLY_EVENTS = ("need", "need_answered", "message")
+
+Perform = Callable[[dict[str, Any], dict[str, Any]], Awaitable[None]]
 
 
-def sign(secret: str, body: bytes) -> str:
-    """The X-EKL-Signature value for an event body. The app checks it by recomputing it over the raw body it
-    received, so only a sender holding the agent credential can post events to it."""
-    return "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+def callback_url(url: str) -> str:
+    """EKL_CALLBACK_URL as the connector may use it: events carry other agents' text and decisions, so anywhere but
+    this machine must be HTTPS. The connector refuses to start otherwise."""
+    return url if is_loopback(url) else require_https(url, "EKL_CALLBACK_URL")
+
+
+def _deadline(event: str, request: dict[str, Any], now: float) -> float:
+    if event == "connection_request":
+        return now + float(os.environ.get(CONNECTION_HOURS) or 24) * 3600
+    if event in REPLY_EVENTS:
+        return now + float(os.environ.get(REPLY_MINUTES) or 60) * 60
+    given = request.get("approval_deadline") or request.get("deadline")
+    if given:
+        with contextlib.suppress(ValueError):
+            when = dt.datetime.fromisoformat(str(given).replace("Z", "+00:00"))
+            return (when if when.tzinfo else when.replace(tzinfo=dt.UTC)).timestamp()
+    return now + 900  # a run waits at most fifteen minutes
+
+
+class CallbackChannel:
+    """Signed delivery to the publisher's app, and the decisions it owes, journaled.
+
+    `performers` carry an applied answer to the network, by event name; `defaults` what the deadline applies. Both
+    take the request as sent and the answer, so a decision picked up after a restart is carried the same way."""
+
+    def __init__(
+        self,
+        url: str,
+        credential: str,
+        journal: AgentJournal,
+        *,
+        agent_id: Callable[[], str] = lambda: os.environ.get("EKL_AGENT_ID", ""),
+        http: httpx2.AsyncClient | None = None,
+        clock: Callable[[], float] = time.time,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        legacy_until: dt.datetime = cb.LEGACY_UNTIL,
+    ) -> None:
+        self.url = callback_url(url)
+        self._credential = credential
+        self._key = cb.callback_key(credential)
+        self.journal = journal
+        self._agent_id = agent_id
+        self._http = http
+        self._clock = clock
+        self._sleep = sleep
+        self._legacy_until = legacy_until
+        self.performers: dict[str, Perform] = {}
+        self.defaults: dict[str, Perform] = {}
+        self._retrying: dict[str, asyncio.Task[None]] = {}
+        self._worker: asyncio.Task[None] | None = None
+
+    # --- one delivery -------------------------------------------------------------------------------------------
+
+    @property
+    def negotiated(self) -> bool:
+        """The app has answered with a valid v2 signature once: from then on only signed answers count."""
+        return self.journal.flag(V2_FLAG) == "true"
+
+    def _legacy(self) -> bool:
+        return not self.negotiated and dt.datetime.fromtimestamp(self._clock(), dt.UTC) < self._legacy_until
+
+    def body_for(self, event: str, event_id: str, data: dict[str, Any]) -> bytes:
+        return json.dumps(
+            {"event": event, "event_id": event_id, "agent_id": self._agent_id(), **data}, sort_keys=True, default=str
+        ).encode()
+
+    async def post(self, event_id: str, body: bytes) -> dict[str, Any] | None:  # noqa: PLR0911 - one exit per way a delivery fails
+        """One delivery of exactly these bytes. The app's answer, or None for a failed delivery: unreachable, a
+        timeout, a 5xx, IN_PROGRESS, a refusal, or an answer whose signature doesn't hold for this request."""
+        agent_id = str(json.loads(body).get("agent_id") or "")
+        t = int(self._clock())
+        headers = {
+            "Content-Type": "application/json",
+            cb.REQUEST_HEADER: cb.request_header(self._key, t, event_id, agent_id, body),
+        }
+        legacy = self._legacy()
+        if legacy:
+            headers[cb.LEGACY_HEADER] = cb.legacy_signature(self._credential, body)
+        client = self._http or httpx2.AsyncClient(timeout=DELIVERY_TIMEOUT_SECONDS, follow_redirects=False)
+        try:
+            answer = await client.post(self.url, content=body, headers=headers)
+        except httpx2.HTTPError as exc:
+            log.warning("event %s not delivered to the app (%s); it is sent again", event_id, type(exc).__name__)
+            return None
+        finally:
+            if self._http is None:
+                await client.aclose()
+        if answer.status_code >= 300:
+            code = "IN_PROGRESS" if answer.status_code == 409 and b"IN_PROGRESS" in answer.content else ""
+            log.warning("event %s: the app answered %s %s; it is sent again", event_id, answer.status_code, code)
+            return None
+        signature = answer.headers.get(cb.RESPONSE_HEADER)
+        if signature is not None:
+            if not cb.response_valid(
+                self._key,
+                signature,
+                event_id=event_id,
+                agent_id=agent_id,
+                request_digest=cb.digest(body),
+                status=answer.status_code,
+                body=answer.content,
+                now=self._clock(),
+            ):
+                log.warning("event %s: the app's answer is signed for another request or key; not applied", event_id)
+                return None
+            if not self.negotiated:
+                self.journal.set_flag(V2_FLAG, "true")
+        elif not legacy:
+            log.warning("event %s: the app's answer isn't signed (callback v2); not applied", event_id)
+            return None
+        else:
+            log.warning(
+                "event %s: the app answered without a callback v2 signature; accepted until %s, update its "
+                "callbacks (ekl agent init writes a v2 eukollab_callbacks.py)",
+                event_id,
+                self._legacy_until.date(),
+            )
+        if not answer.content.strip():
+            return {}
+        try:
+            found = answer.json()
+        except ValueError:
+            return None
+        return found if isinstance(found, dict) else {}
+
+    # --- decisions ----------------------------------------------------------------------------------------------
+
+    async def decide(self, event: str, data: dict[str, Any], event_id: str | None = None) -> dict[str, Any] | None:
+        """Journal the decision, deliver it once and, on a verified answer, apply it. Returns the applied answer, or
+        None while it is pending (retried in the background) or after its deadline."""
+        event_id = event_id or CURRENT_EVENT.get() or f"{event}:{data.get('reservation_id') or data}"
+        body = self.body_for(event, event_id, data)
+        row = self.journal.open_decision(
+            event_id, event, body.decode(), cb.digest(body), _deadline(event, data, self._clock())
+        )
+        retrying = self._retrying.get(event_id)
+        if row.state == "pending" and retrying is not None and not retrying.done():
+            return None  # asked again (a run still waiting) while its deliveries go on
+        return await self._attempt(row)
+
+    async def _attempt(self, row: PendingDecision) -> dict[str, Any] | None:
+        if row.state != "pending":
+            if not row.done:
+                await self._carry(row)
+            return row.answer if row.state == "applied" else None
+        answer = await self.post(row.event_id, row.body.encode())
+        if answer is None:
+            self._retry_later(row.event_id)
+            return None
+        if not self.journal.apply_decision(row.event_id, row.request_digest, answer):
+            now = self.journal.decision(row.event_id)
+            log.info(
+                "event %s: an answer arrived after the decision was %s; ignored",
+                row.event_id,
+                "made" if now and now.state == "applied" else "defaulted at its deadline",
+            )
+            return now.answer if now and now.state == "applied" else None
+        applied = self.journal.decision(row.event_id)
+        assert applied is not None
+        await self._carry(applied)
+        return answer
+
+    async def _carry(self, row: PendingDecision) -> None:
+        """What was decided, to the network; marked done only once that succeeded, so a restart carries it again."""
+        request = json.loads(row.body)
+        perform = (self.performers if row.state == "applied" else self.defaults).get(row.event)
+        if perform is not None:
+            await perform(request, row.answer)
+        self.journal.mark_done(row.event_id)
+
+    def _retry_later(self, event_id: str) -> None:
+        running = self._retrying.get(event_id)
+        if running is None or running.done():
+            self._retrying[event_id] = asyncio.ensure_future(self._retry(event_id))
+
+    async def _retry(self, event_id: str) -> None:
+        for attempt in range(10_000):
+            await self._sleep(BACKOFF_SECONDS[min(attempt, len(BACKOFF_SECONDS) - 1)])
+            row = self.journal.decision(event_id)
+            if row is None or row.state != "pending" or self._clock() >= row.deadline:
+                return
+            try:
+                answer = await self.post(event_id, row.body.encode())
+                if answer is not None:
+                    if self.journal.apply_decision(event_id, row.request_digest, answer):
+                        applied = self.journal.decision(event_id)
+                        assert applied is not None
+                        await self._carry(applied)
+                    return
+            except Exception:  # an unexpected failure must not end the retries: the deadline still decides
+                log.exception("event %s: delivery failed", event_id)
+
+    async def apply_defaults(self) -> int:
+        """Default every decision whose deadline passed; returns how many."""
+        due = self.journal.default_due()
+        for row in due:
+            log.info("event %s (%s): no answer before its deadline; its default applies", row.event_id, row.event)
+            try:
+                await self._carry(row)
+            except Exception:
+                log.exception("event %s: the default could not be applied yet", row.event_id)
+        return len(due)
+
+    async def _deadlines(self) -> None:
+        while True:
+            with contextlib.suppress(Exception):
+                await self.apply_defaults()
+            await self._sleep(DEADLINE_CHECK_SECONDS)
+
+    async def start(self) -> None:
+        """Pick up what a previous run left: pending decisions are delivered again, decided ones carried."""
+        for row in self.journal.unfinished():
+            if row.state == "pending":
+                self._retry_later(row.event_id)
+            else:
+                with contextlib.suppress(Exception):
+                    await self._carry(row)
+        if self._worker is None:
+            self._worker = asyncio.ensure_future(self._deadlines())
+
+    async def stop(self) -> None:
+        for task in [*self._retrying.values(), *([self._worker] if self._worker else [])]:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        self._retrying.clear()
+        self._worker = None
+
+    # --- events that aren't decisions ---------------------------------------------------------------------------
+
+    async def ask(self, event: str, data: dict[str, Any]) -> dict[str, Any]:
+        """An event the app is told of without a decision journal (a review period, an approved choice): a failed
+        delivery raises, so the network delivers the event again."""
+        event_id = CURRENT_EVENT.get() or event
+        answer = await self.post(event_id, self.body_for(event, event_id, data))
+        if answer is None:
+            raise AgentError(f"the app didn't take the {event} event; it comes back", code="CALLBACK_FAILED")
+        return answer
 
 
 def _candidate(c: Candidate | None) -> dict[str, Any] | None:
@@ -52,29 +319,80 @@ def _candidate(c: Candidate | None) -> dict[str, Any] | None:
     return {"handle": c.handle, "capability_id": c.capability_id, "summary": str(c.summary), "price": c.price}
 
 
-def bridge(agent: Agent, url: str, secret: str, http: httpx2.AsyncClient | None = None) -> None:
-    """Register every callback on `agent`, each forwarding its event to the publisher's app and applying its answer."""
+def _perform_for(agent: Agent, channel: CallbackChannel) -> None:
+    """How each applied answer, and each default at a deadline, reaches the network."""
 
-    async def ask(event: str, data: dict[str, Any]) -> dict[str, Any]:
-        body = json.dumps({"event": event, **data}, sort_keys=True, default=str).encode()
-        client = http or httpx2.AsyncClient(timeout=30)
+    async def reply_to(field: str, request: dict[str, Any], answer: dict[str, Any]) -> None:
+        if answer.get("reply"):
+            await agent.aio.reply(str(request[field]), str(answer["reply"]))
+
+    async def respond(request: dict[str, Any], answer: dict[str, Any]) -> None:
+        if answer.get("accept"):
+            await agent.aio.respond(str(request["connection_id"]), True, "")
+        elif "decline" in answer:
+            await agent.aio.respond(str(request["connection_id"]), False, str(answer["decline"] or ""))
+
+    async def decline_late(request: dict[str, Any], _: dict[str, Any]) -> None:
         try:
-            answer = await client.post(
-                url, content=body, headers={"Content-Type": "application/json", SIGNATURE_HEADER: sign(secret, body)}
-            )
-        finally:
-            if http is None:
-                await client.aclose()
-        answer.raise_for_status()  # an error leaves the event unacknowledged: it comes back
-        if not answer.content.strip():
-            return {}
-        found = answer.json()
-        return found if isinstance(found, dict) else {}
+            await agent.aio.respond(str(request["connection_id"]), False, "no answer before the deadline")
+        except AgentError as exc:  # decided meanwhile by a console rule, or withdrawn
+            log.info("connection %s not declined at its deadline: %s", request["connection_id"], exc.code)
+
+    async def send_message(request: dict[str, Any], answer: dict[str, Any]) -> None:
+        if answer.get("reply"):
+            await agent.aio.message(str(request["connection_id"]), str(answer["reply"]))
+
+    async def decide(request: dict[str, Any], answer: dict[str, Any]) -> None:
+        d = Decision(
+            agent, str(request["kind"]), str(request["subject_id"]), str(request["deadline"]), str(request["fallback"])
+        )
+        if ("accept" in answer or "decline" in answer) and d.kind not in ("connection_request", "paid_offer"):
+            # Answered in the console or with its own tool: an answer here can't be applied, and retrying the event
+            # wouldn't change that, so say so once and let the decision's fallback apply.
+            log.warning("a %s decision can't be answered from the callbacks; its fallback applies", d.kind)
+            return
+        if answer.get("accept"):
+            await agent.aio.decide(d, True)
+        elif "decline" in answer:
+            await agent.aio.decide(d, False, str(answer["decline"] or ""))
+
+    async def need_reply(request: dict[str, Any], answer: dict[str, Any]) -> None:
+        await reply_to("need_id", request, answer)
+
+    async def answered_reply(request: dict[str, Any], answer: dict[str, Any]) -> None:
+        await reply_to("reply_id", request, answer)
+
+    channel.performers.update(
+        {
+            "need": need_reply,
+            "need_answered": answered_reply,
+            "connection_request": respond,
+            "message": send_message,
+            "decision": decide,
+        }
+    )
+    channel.defaults["connection_request"] = decline_late
+
+
+def bridge(
+    agent: Agent,
+    url: str,
+    secret: str,
+    http: httpx2.AsyncClient | None = None,
+    channel: CallbackChannel | None = None,
+) -> CallbackChannel:
+    """Register every callback on `agent`, each forwarding its event to the publisher's app over `channel` (made from
+    the URL and the credential when not given) and applying its answer at most once."""
+    channel = channel or CallbackChannel(
+        url, secret, agent.journal, agent_id=lambda: os.environ.get("EKL_AGENT_ID") or agent.agent_id, http=http
+    )
+
+    _perform_for(agent, channel)
 
     @agent.on_need(matching="my_services")
     async def need(n: Need) -> None:
         service = n.matched_service
-        what = await ask(
+        await channel.decide(
             "need",
             {
                 "need_id": n.post_id,
@@ -84,20 +402,16 @@ def bridge(agent: Agent, url: str, secret: str, http: httpx2.AsyncClient | None 
                 "matched_service": service.__dict__ if service else None,
             },
         )
-        if what.get("reply"):
-            await agent.aio.reply(n.post_id, str(what["reply"]))
 
     @agent.on_need_answered
     async def answered(a: Answer) -> None:
-        what = await ask(
+        await channel.decide(
             "need_answered", {"need_id": a.need.post_id, "reply_id": a.post_id, "text": str(a.text), "author": a.author}
         )
-        if what.get("reply"):
-            await agent.aio.reply(a.post_id, str(what["reply"]))
 
     @agent.on_connection_request
     async def connection(r: ConnectionRequest) -> None:
-        what = await ask(
+        await channel.decide(
             "connection_request",
             {
                 "connection_id": r.connection_id,
@@ -106,39 +420,36 @@ def bridge(agent: Agent, url: str, secret: str, http: httpx2.AsyncClient | None 
                 "organisation": r.organisation.__dict__,
             },
         )
-        if what.get("accept"):
-            await agent.aio.respond(r.connection_id, True, "")
-        elif "decline" in what:
-            await agent.aio.respond(r.connection_id, False, str(what["decline"] or ""))
 
     @agent.on_message
     async def message(m: Message) -> None:
-        what = await ask(
-            "message", {"connection_id": m.connection_id, "from": m.sender, "text": str(m.text), "payload": m.payload}
+        await channel.decide(
+            "message",
+            {
+                "connection_id": m.connection_id,
+                "message_id": m.message_id,
+                "from": m.sender,
+                "text": str(m.text),
+                "payload": m.payload,
+            },
         )
-        if what.get("reply"):
-            await agent.aio.message(m.connection_id, str(what["reply"]))
 
     @agent.on_choice_approved
     async def approved(c: Choice) -> None:
-        await ask(
+        await channel.ask(
             "choice_approved",
             {"decision_id": c.decision_id, "main": _candidate(c.main), "backup": _candidate(c.backup)},
         )
 
     @agent.on_decision()
     async def decision(d: Decision) -> None:
-        what = await ask(
+        await channel.decide(
             "decision", {"kind": d.kind, "subject_id": d.subject_id, "deadline": d.deadline, "fallback": d.fallback}
         )
-        if what.get("accept"):
-            await agent.aio.decide(d, True)
-        elif "decline" in what:
-            await agent.aio.decide(d, False, str(what["decline"] or ""))
 
     @agent.on_review_due
     async def review_due(r: ReviewDue) -> None:
-        what = await ask(
+        what = await channel.ask(
             "review_due",
             {
                 "collaboration_id": r.collaboration_id,
@@ -168,6 +479,8 @@ def bridge(agent: Agent, url: str, secret: str, http: httpx2.AsyncClient | None 
                 str(given.get("comment") or ""),
             )
 
+    return channel
+
 
 async def _service(agent: Agent, handle: str, capability_id: str) -> Candidate:
     for found in await agent.aio.find(capability_id.removeprefix("cap_").replace("_", " "), limit=25):
@@ -176,33 +489,44 @@ async def _service(agent: Agent, handle: str, capability_id: str) -> Candidate:
     raise AgentError(f"{handle} offers no {capability_id} you can use.", code="NOT_FOUND")
 
 
-def bridge_runs(runs: Runs, url: str, secret: str, http: httpx2.AsyncClient | None = None) -> None:
+def bridge_runs(
+    runs: Runs,
+    url: str,
+    secret: str,
+    http: httpx2.AsyncClient | None = None,
+    *,
+    journal: AgentJournal | None = None,
+    channel: CallbackChannel | None = None,
+) -> CallbackChannel:
     """Paid runs waiting for approval go to the publisher's app as `run.approval_requested`, signed like every
-    callback. Its answer is the decision: {"decision": "approve", "runs": 500}, {"decision": "payment_needed", "url":
-    …, "amount": …, "description": …}, {"decision": "decline", "reason": …}, or nothing: the payment page in
-    agent.json, or without one a decision later through the local API's /agent/decide_run."""
+    callback and journaled like every decision, with the run's approval expiry as its deadline. Its answer is the
+    decision: {"decision": "approve", "runs": 500}, {"decision": "payment_needed", "url": …, "amount": …,
+    "description": …}, {"decision": "decline", "reason": …}, or nothing: the payment page in agent.json, or without one
+    a decision later through the local API's /agent/decide_run. A run whose delivery failed stays waiting, delivered
+    again until its deadline; it is never approved by default."""
+    channel = channel or CallbackChannel(url, secret, journal or AgentJournal(), http=http)
+
+    async def carry(request: dict[str, Any], answer: dict[str, Any]) -> None:
+        run = RunRequest.model_validate(request)
+        await runs.apply(run, decision_of(answer) if answer.get("decision") else None)
+
+    channel.performers["run.approval_requested"] = carry
 
     @runs.on_approval
     async def approval(run: RunRequest) -> RunDecision | None:
-        body = json.dumps({"event": "run.approval_requested", **run.model_dump()}, sort_keys=True).encode()
-        client = http or httpx2.AsyncClient(timeout=30)
-        try:
-            answer = await client.post(
-                url, content=body, headers={"Content-Type": "application/json", SIGNATURE_HEADER: sign(secret, body)}
-            )
-        finally:
-            if http is None:
-                await client.aclose()
-        answer.raise_for_status()
-        found = answer.json() if answer.content.strip() else {}
-        return decision_of(found) if isinstance(found, dict) and found.get("decision") else None
+        await channel.decide("run.approval_requested", run.model_dump(), f"run:{run.reservation_id}")
+        raise DecidedElsewhere
+
+    return channel
 
 
 def decision_of(body: dict[str, Any]) -> RunDecision:
     """A decision as the publisher's app writes it, in JSON."""
     kind = str(body["decision"])
     if kind == "approve":
-        return RunDecision.approve(runs=body.get("runs"), overage=bool(body.get("overage")))
+        # `until`, an ISO 8601 date-time, gives a standing approval that ends then, as Python's approve(until=) does.
+        until = dt.datetime.fromisoformat(str(body["until"])) if body.get("until") else None
+        return RunDecision.approve(runs=body.get("runs"), until=until, overage=bool(body.get("overage")))
     if kind == "payment_needed":
         return RunDecision.payment_needed(
             str(body["url"]), str(body["amount"]), str(body.get("description", "")), challenge=body.get("challenge")
@@ -213,7 +537,8 @@ def decision_of(body: dict[str, Any]) -> RunDecision:
 
 
 def local_api(agent: Agent, runs: Runs | None = None) -> Starlette:
-    """The actions the publisher's app starts itself. Bind it to 127.0.0.1 only: it acts with the agent credential."""
+    """The actions the publisher's app starts itself. Bind it to 127.0.0.1 only: it acts with the agent credential, and
+    LocalGuard refuses anything but the publisher's own programs."""
 
     async def post_need(body: dict[str, Any]) -> dict[str, Any]:
         need = await agent.aio.post_need(body["text"], body.get("topics", []), body.get("budget"))
@@ -240,10 +565,16 @@ def local_api(agent: Agent, runs: Runs | None = None) -> Starlette:
             "execution_id": result.execution_id,
             "charged": result.charged,
             "receipt_checked": result.receipt_checked,
+            "safety_flags": result.safety_flags,
         }
 
     async def message(body: dict[str, Any]) -> dict[str, Any]:
         return await agent.aio.message(body["connection_id"], body["text"])
+
+    async def close_agreement(body: dict[str, Any]) -> dict[str, Any]:
+        """use(...).close() for any language: the agreement ends and its review period opens on both sides."""
+        service = await _service(agent, body["handle"], body["capability_id"])
+        return await agent.aio.close_agreement(service, str(body.get("outcome") or "completed"))
 
     # One declared service per need and preference, so the choice made on the first call is reused.
     planned: dict[tuple[str, str | None], PlannedService] = {}
@@ -263,6 +594,7 @@ def local_api(agent: Agent, runs: Runs | None = None) -> Starlette:
             "charged": result.charged,
             "receipt_checked": result.receipt_checked,
             "stand_in": result.stand_in,
+            "safety_flags": result.safety_flags,
             "provider": declared.main.handle if declared.main else prefer,
         }
 
@@ -279,6 +611,7 @@ def local_api(agent: Agent, runs: Runs | None = None) -> Starlette:
         "choose": choose,
         "call": call,
         "message": message,
+        "close_agreement": close_agreement,
         "service": service,
     }
 
@@ -299,5 +632,6 @@ def local_api(agent: Agent, runs: Runs | None = None) -> Starlette:
             return JSONResponse({"error": "INVALID_REQUEST", "message": str(exc)}, status_code=400)
 
     return Starlette(
-        routes=[Route("/agent/status", status, methods=["GET"]), Route("/agent/{action}", run, methods=["POST"])]
+        routes=[Route("/agent/status", status, methods=["GET"]), Route("/agent/{action}", run, methods=["POST"])],
+        middleware=[Middleware(LocalGuard)],
     )

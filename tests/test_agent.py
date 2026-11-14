@@ -18,10 +18,12 @@ from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from ekl_provider_adapter import attach
+from ekl_provider_adapter import callback_signing as cb
 from ekl_provider_adapter.agent import Agent, Choice, Need, ReviewDue, Untrusted, _log_to_terminal
 from ekl_provider_adapter.agent_journal import AgentJournal
-from ekl_provider_adapter.callbacks import SIGNATURE_HEADER, bridge, local_api, sign
+from ekl_provider_adapter.callbacks import bridge, local_api
 from ekl_provider_adapter.config import AgentFile
+from ekl_provider_adapter.connector import use_only_app
 from ekl_provider_adapter.errors import (
     AgentError,
     AgentNotEnabled,
@@ -57,7 +59,7 @@ def _server() -> MCPServer:
 def test_without_the_agent_credential_the_adapter_only_serves(monkeypatch: pytest.MonkeyPatch) -> None:
     # No credential, no event loop, and every action names the variable to set.
     monkeypatch.delenv("EKL_AGENT_CREDENTIAL", raising=False)
-    app = attach(_server(), credential="eklp_test", network_url="http://network.invalid")
+    app = attach(_server(), credential="eklp_test", network_url="https://network.invalid")
     assert not app.agent.enabled
     with pytest.raises(AgentNotEnabled, match="EKL_AGENT_CREDENTIAL"):
         app.agent.post_need("Validate VAT numbers")
@@ -68,7 +70,7 @@ def test_without_the_agent_credential_the_adapter_only_serves(monkeypatch: pytes
 def test_a_matching_need_is_answered_from_the_server_process(tmp_path: Path) -> None:
     # One on_need callback answers matching needs; the network learns the agent answers them itself.
     fake = FakeNetwork(handle="@vat-check")
-    app = attach(_server(), credential="eklp_test", network_url="http://network.invalid", agent_network=fake)
+    app = attach(_server(), credential="eklp_test", network_url="https://network.invalid", agent_network=fake)
 
     @app.agent.on_need(matching="my_services")
     def answer(need: Need) -> None:
@@ -294,6 +296,39 @@ def test_async_callbacks_await_the_same_actions(tmp_path: Path) -> None:
     assert [m["body"] for m in fake.messages] == ["Thanks"]
 
 
+def test_a_failing_on_start_never_stops_the_agent_reading_its_events(tmp_path: Path) -> None:
+    fake = FakeNetwork()
+    agent = _agent(fake, tmp_path)
+    seen: list[str] = []
+
+    @agent.on_start
+    def broken() -> None:
+        raise RuntimeError("the start went wrong")
+
+    @agent.on_message
+    def note(message: Any) -> None:
+        seen.append(str(message.text))
+
+    fake.message("@peer", "still heard")
+    fake.run(agent)
+    assert seen == ["still heard"]
+
+
+def test_a_message_carries_its_own_id_so_a_redelivery_can_be_told_apart(tmp_path: Path) -> None:
+    fake = FakeNetwork()
+    agent = _agent(fake, tmp_path)
+    seen: list[str] = []
+
+    @agent.on_message
+    def note(message: Any) -> None:
+        seen.append(message.message_id)
+
+    fake.message("@peer", "hello")
+    fake.message("@peer", "hello again")
+    fake.run(agent)
+    assert len(seen) == 2 and all(s.startswith("msg_") for s in seen) and seen[0] != seen[1]
+
+
 def test_network_refusals_become_named_exceptions() -> None:
     refused = from_network("POLICY_DENIED", "paid use is off", {"rule": "spending.paid_use"})
     assert isinstance(refused, NotAllowed) and refused.rule == "spending.paid_use"
@@ -308,7 +343,9 @@ def test_the_connector_forwards_signed_events_and_applies_the_answer(tmp_path: P
 
     async def app_route(request: Request) -> JSONResponse:
         body = await request.body()
-        assert request.headers[SIGNATURE_HEADER] == sign("ekla_secret", body)
+        assert cb.REQUEST_HEADER in request.headers and request.headers[cb.LEGACY_HEADER] == cb.legacy_signature(
+            "ekla_secret", body
+        )
         event = json.loads(body)
         received.append(event)
         if event["event"] == "need":
@@ -320,15 +357,35 @@ def test_the_connector_forwards_signed_events_and_applies_the_answer(tmp_path: P
     agent = _agent(fake, tmp_path)
     bridge(
         agent,
-        "http://app/ekl-events",
+        "http://127.0.0.1/ekl-events",
         "ekla_secret",
-        http=httpx2.AsyncClient(transport=httpx2.ASGITransport(app=publisher_app), base_url="http://app"),
+        http=httpx2.AsyncClient(transport=httpx2.ASGITransport(app=publisher_app), base_url="http://127.0.0.1"),
     )
     fake.need("Validate VAT", matched="cap_vat", service="VAT check")
     fake.connection_request("@stranger")
     fake.run(agent)
     assert [e["event"] for e in received] == ["need", "connection_request"]
     assert fake.replies[0]["body"] == "Yes: VAT check." and fake.responses[0]["decision"] == "decline"
+
+
+def test_an_answer_to_a_decision_the_code_cannot_take_is_not_retried(tmp_path: Path) -> None:
+    # A first contact is decided in the console: the app's answer can't be applied, so the event isn't failed and
+    # retried five times; the decision's fallback applies.
+    async def app_route(request: Request) -> JSONResponse:
+        return JSONResponse({"accept": True})
+
+    publisher_app = Starlette(routes=[Route("/ekl-events", app_route, methods=["POST"])])
+    fake = FakeNetwork()
+    agent = _agent(fake, tmp_path)
+    bridge(
+        agent,
+        "http://127.0.0.1/ekl-events",
+        "ekla_secret",
+        http=httpx2.AsyncClient(transport=httpx2.ASGITransport(app=publisher_app), base_url="http://127.0.0.1"),
+    )
+    fake.decision("outreach", "out_123")
+    fake.run(agent)
+    assert not fake.failed
 
 
 def test_criteria_judge_every_call_and_choose_s_check_is_passed_on_only_explicitly(tmp_path: Path) -> None:
@@ -440,9 +497,9 @@ def test_the_connector_answers_review_due_with_a_review_skip_or_nothing(tmp_path
     agent = _agent(fake, tmp_path)
     bridge(
         agent,
-        "http://app/ekl-events",
+        "http://127.0.0.1/ekl-events",
         "ekla_secret",
-        http=httpx2.AsyncClient(transport=httpx2.ASGITransport(app=publisher_app), base_url="http://app"),
+        http=httpx2.AsyncClient(transport=httpx2.ASGITransport(app=publisher_app), base_url="http://127.0.0.1"),
     )
     for counterpart in ("@reviewed", "@skipped", "@default"):
         fake.review_due(counterpart, "cap_vat_check", useful=2)
@@ -456,13 +513,15 @@ def test_the_local_api_starts_the_agents_own_actions(tmp_path: Path) -> None:
     fake = FakeNetwork()
     fake.provider("@vat", "cap_vat_check", lambda _: {"valid": True}, summary="vat check")
     agent = _agent(fake, tmp_path)
-    with TestClient(local_api(agent)) as client:
+    with TestClient(local_api(agent), base_url="http://127.0.0.1:8765") as client:
         made = client.post("/agent/post_need", json={"text": "Validate VAT", "topics": ["vat"]}).json()
         called = client.post(
             "/agent/call", json={"handle": "@vat", "capability_id": "cap_vat_check", "arguments": {"vat_number": "DE1"}}
         ).json()
+        closed = client.post("/agent/close_agreement", json={"handle": "@vat", "capability_id": "cap_vat_check"}).json()
         missing = client.post("/agent/nothing", json={})
     assert made["need_id"].startswith("post_") and called["value"] == {"valid": True}
+    assert closed["engagement_state"] == "completed"
     assert missing.status_code == 404
 
 
@@ -483,6 +542,36 @@ def test_a_paid_call_waits_for_the_providers_approval(tmp_path: Path, monkeypatc
     with pytest.raises(RunNotApproved):
         agent.use(candidate).call({"vat_number": "DE3"})
     assert vat.calls == 1  # neither unapproved run reached the provider
+
+
+def test_a_paid_run_under_a_pack_reports_its_unit_price(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A pack's agreement records no per-call price, as the network's don't; the run's reservation carries its unit
+    # price, the pack's price over its calls, and that is what the call reports as charged.
+    monkeypatch.setattr("ekl_provider_adapter.agent.asyncio.sleep", _no_wait)
+    fake = FakeNetwork()
+    pack = {"plan_id": "pack-500", "type": "pack", "price": "5.00", "calls": 500}
+    fake.provider("@fx", "cap_convert_currency", lambda _: {"converted": 1.1}, summary="convert currency", plan=pack)
+    agent = Agent(fake, AgentJournal(str(tmp_path / "journal.db")))
+    [candidate] = agent.find("convert currency")
+    fake.approval = "approve"
+    result = agent.use(candidate).call({"amount": 1, "from_currency": "EUR", "to_currency": "USD"})
+    assert result.value == {"converted": 1.1} and result.charged == "0.01"
+
+
+def test_closing_an_agreement_opens_its_review_and_the_next_call_agrees_again(tmp_path: Path) -> None:
+    fake = FakeNetwork()
+    fake.provider("@fx", "cap_convert_currency", lambda _: {"converted": 1.1}, summary="convert currency")
+    agent = Agent(fake, AgentJournal(str(tmp_path / "journal.db")))
+    [candidate] = agent.find("convert currency")
+    fx = agent.use(candidate)
+    fx.call({"amount": 1})
+    [first] = fake.agreements
+    assert fx.close()["engagement_state"] == "completed" and fake.agreements[first]["engagement_state"] == "completed"
+    fx.call({"amount": 2})
+    assert len(fake.agreements) == 2  # a later call agrees terms again
+    fx.close()
+    with pytest.raises(AgentError):
+        fx.close()  # nothing open to close
 
 
 async def _no_wait(_: float) -> None:
@@ -608,6 +697,60 @@ def test_an_agent_that_only_uses_services_announces_itself_and_waits_to_be_confi
         json.dumps(uses_only | {"capabilities": [{"tool": "x", "class": "read_only"}]})
     )
     assert Agent.from_env()._announcement is None
+
+
+def test_an_attached_agent_started_before_it_is_confirmed_reads_its_events_once_it_is(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The guide's order: start the server, then confirm the agent. Its adapter announces it, so the agent itself has
+    # nothing to announce; until it is active it may read itself but not subscribe, so it waits, then subscribes and
+    # reads, instead of ending its event loop on the first refusal.
+    monkeypatch.setattr("ekl_provider_adapter.agent.ACTIVE_POLL_SECONDS", 0.01)
+    fake = FakeNetwork()
+    agent = Agent(fake, AgentJournal(str(tmp_path / "journal.db")))
+    reads = _confirmed_on_read(fake, 3)
+    subscribed: list[Any] = []
+    own = fake._tool_feed_subscribe
+
+    def subscribe(**arguments: Any) -> dict[str, Any]:
+        assert fake.state == "active", "subscribed before the agent was confirmed"
+        subscribed.append(arguments)
+        return own(**arguments)
+
+    fake._tool_feed_subscribe = subscribe  # type: ignore[method-assign]
+
+    @agent.on_need(matching="subscribed", topics=["currency"])
+    def answer(need: Any) -> None:
+        pass
+
+    asyncio.run(agent._ensure_ready())
+    asyncio.run(agent._subscribe())
+    assert len(reads) == 3 and agent._ready and subscribed == [{"topics": ["currency"]}]
+
+
+def test_the_use_only_connector_announces_an_app_that_offers_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A TypeScript app that only uses services runs the connector with --use-only: nothing else announces its agent,
+    # so the connector announces the app's own agent.json, as Agent.from_env does for a Python script.
+    uses_only = {
+        "ekl": "1.0",
+        "mode": "active_participant",
+        "execution_mode": "storage_free",
+        "agent": {"handle": "@order-desk", "display_name": "Order Desk", "purpose": "Takes orders."},
+        "adapter": {},
+        "capabilities": [],
+    }
+    (tmp_path / "agent.json").write_text(json.dumps(uses_only))
+    monkeypatch.setenv("EKL_AGENT_FILE", str(tmp_path / "agent.json"))
+    monkeypatch.setenv("EKL_AGENT_CREDENTIAL", "ekla_test")
+    monkeypatch.setenv("EKL_PROVIDER_CREDENTIAL", "eklp_test")
+    monkeypatch.delenv("EKL_CALLBACK_URL", raising=False)
+    own = use_only_app().state.ekl_agent
+    assert own._announcement is not None and own._announcement[1]["agent"]["handle"] == "@order-desk"
+    # Without the agent credential it takes no part, and announces nothing.
+    monkeypatch.delenv("EKL_AGENT_CREDENTIAL")
+    assert use_only_app().state.ekl_agent._announcement is None
 
 
 class _Announcer:

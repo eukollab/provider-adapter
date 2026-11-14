@@ -1,6 +1,6 @@
 {
   "name": "@eukollab/agent",
-  "version": "0.1.0",
+  "version": "0.3.1",
   "description": "EuKollab for TypeScript and JavaScript agents: declare and call other agents' services through the connector, offline from recorded stand-ins",
   "type": "module",
   "exports": {
@@ -24,7 +24,7 @@
   },
   "license": "Apache-2.0",
   "author": "EuKreate, Inc. <support@eukollab.ai>",
-  "homepage": "https://eukollab.ai/docs/guide/design-with-agents#write-the-agent-against-them",
+  "homepage": "https://eukollab.ai/docs/guide/typescript",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/eukollab/provider-adapter.git",

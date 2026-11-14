@@ -18,7 +18,7 @@ from ekl_provider_adapter import relay as relay_module
 from ekl_provider_adapter.relay import Relay, relay_address
 
 pytestmark = pytest.mark.anyio
-NETWORK = "http://network.test"
+NETWORK = "https://network.test"
 PATH = "/v1/relay/agt_1/mcp"
 
 

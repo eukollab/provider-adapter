@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from ekl_provider_adapter.private_files import private_file, private_sqlite
+
 SCHEMA = [
     """CREATE TABLE IF NOT EXISTS ekl_executions (
         attempt_id TEXT PRIMARY KEY,
@@ -178,7 +180,9 @@ class _SqlStorage:
         self._transaction(
             [
                 (
-                    f"INSERT INTO ekl_executions ({_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    # nosec B608: _COLUMNS is a constant column list; every value is a parameter.
+                    f"INSERT INTO ekl_executions ({_COLUMNS}) "  # nosec B608
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         record.attempt_id,
                         record.execution_id,
@@ -270,7 +274,8 @@ class _SqlStorage:
 
     def unfinished(self) -> list[ExecutionRecord]:
         rows = self._execute(
-            f"SELECT {_COLUMNS} FROM ekl_executions WHERE state IN ('attempted', 'running') ORDER BY created_at"
+            f"SELECT {_COLUMNS} FROM ekl_executions "  # nosec B608 - _COLUMNS is a constant column list
+            "WHERE state IN ('attempted', 'running') ORDER BY created_at"
         )
         return [_record(r) for r in rows]
 
@@ -287,7 +292,8 @@ class _SqlStorage:
         return stamp if rows else None
 
     def by_admission(self, admission_id: str) -> ExecutionRecord | None:
-        rows = self._execute(f"SELECT {_COLUMNS} FROM ekl_executions WHERE admission_id = ?", (admission_id,))
+        query = f"SELECT {_COLUMNS} FROM ekl_executions WHERE admission_id = ?"  # nosec B608 - constant column list
+        rows = self._execute(query, (admission_id,))
         return _record(rows[0]) if rows else None
 
     def purge(self, results_before: float, records_before: float) -> int:
@@ -317,6 +323,8 @@ class SQLiteStorage(_SqlStorage):
     exclusive = True
 
     def __init__(self, path: str) -> None:
+        if path != ":memory:":
+            private_file(Path(path + ".lock"))
         self._holder = Path(path + ".lock").open("a")  # noqa: SIM115 - held open for the life of the store
         if sys.platform != "win32":
             import fcntl  # noqa: PLC0415 - POSIX only
@@ -329,7 +337,10 @@ class SQLiteStorage(_SqlStorage):
                     "another adapter process uses this journal; several replicas need PostgreSQL storage"
                 ) from None
         self._lock = threading.Lock()
-        self._db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+        if path == ":memory:":
+            self._db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+        else:
+            self._db = private_sqlite(Path(path))
         self._db.execute("PRAGMA journal_mode=WAL")
         for statement in SCHEMA:
             self._db.execute(statement)

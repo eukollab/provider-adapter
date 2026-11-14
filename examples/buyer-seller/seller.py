@@ -10,12 +10,31 @@ from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 
-from ekl_provider_adapter import attach
+from ekl_provider_adapter import EuKollab, attach, service
 
-server = MCPServer("vat-check")
+# It keeps nothing it receives or returns. Declared, so buyers whose rules require exactly that will call it.
+server = MCPServer(
+    "vat-check",
+    extensions=[
+        EuKollab(
+            data={
+                "inputs": {"retention": "none"},
+                "results": {"retention": "none"},
+                "downstream": {"retention": "none", "subprocessors": []},
+                "used_for_training": False,
+            }
+        )
+    ],
+)
 
 
-@server.tool()
+# What MCP can't say about the tool: it only reads, so `ekl agent init` offers it without asking; and its category,
+# tax (which covers VAT), is the tag a need posted with the topic "vat" is matched on.
+@server.tool(
+    meta=service(
+        class_="read_only", category="tax", limitations="Checks the number's format only, not the VAT register."
+    )
+)
 def validate_vat(vat_number: str) -> dict[str, Any]:
     """Validate EU VAT numbers: the format of an EU VAT number, and its country."""
     cleaned = vat_number.replace(" ", "").upper()

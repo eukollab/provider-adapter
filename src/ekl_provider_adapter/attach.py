@@ -17,6 +17,7 @@ through the SDK's normal dispatch: it sees the tool name, arguments, result and 
 import asyncio
 import base64
 import contextlib
+import datetime as dt
 import logging
 import os
 from collections.abc import AsyncIterator
@@ -33,7 +34,14 @@ from starlette.routing import Mount
 from ekl_provider_adapter.agent import Agent
 from ekl_provider_adapter.agent_journal import AgentJournal
 from ekl_provider_adapter.api import HttpProviderApi, ProviderApi
-from ekl_provider_adapter.config import DEFAULT_NETWORK_URL, AgentFile, LocalFile, inline_agent_file
+from ekl_provider_adapter.config import (
+    DEFAULT_NETWORK_URL,
+    AgentFile,
+    LocalFile,
+    described,
+    inline_agent_file,
+    require_https,
+)
 from ekl_provider_adapter.core import AdapterCore, Hooks, Settings
 from ekl_provider_adapter.network_client import McpNetwork, Network
 from ekl_provider_adapter.relay import Relay, relay_address_now, relayed
@@ -60,7 +68,7 @@ def settings_from_environment(
     network = (
         network_url or os.environ.get("EKL_NETWORK_URL") or (local.agent.network.url if local else DEFAULT_NETWORK_URL)
     )
-    return found, network
+    return found, require_https(network, "EKL_NETWORK_URL")
 
 
 def local_file(agent_file: AgentFileSource | None) -> LocalFile | None:
@@ -90,6 +98,37 @@ def storage_for(local: LocalFile | None, storage: Storage | None) -> Storage | N
         return storage
     url = (local.agent.adapter.storage if local else None) or os.environ.get("EKL_ADAPTER_STORAGE")
     return open_storage(url) if url else None
+
+
+# The server's own MCP endpoint stays public by default until this day, then new and old deployments alike keep it
+# private unless they pass expose_mcp=True. Projects `ekl new` writes pass expose_mcp=False already.
+EXPOSE_MCP_DEFAULT_OFF_FROM = dt.date(2027, 1, 12)
+LOOPBACK_CLIENTS = frozenset({"127.0.0.1", "::1"})
+
+
+def expose_mcp_default(today: dt.date | None = None) -> bool:
+    given = os.environ.get("EKL_EXPOSE_MCP_DEFAULT_OFF_FROM")
+    off_from = dt.date.fromisoformat(given) if given else EXPOSE_MCP_DEFAULT_OFF_FROM
+    return (today or dt.date.today()) < off_from
+
+
+class _WithoutPath:
+    """The server's app with its own MCP endpoint answering 404 to anything but this machine: only the adapter's
+    endpoint, whose every call the network admits, is public. A client on the same machine (`ekl agent sync` reading
+    the server's tools, the publisher's own tests) still reaches it; the server's other routes stay as they are."""
+
+    def __init__(self, app: Any, path: str) -> None:
+        self.app = app
+        self.path = path.rstrip("/") or "/"
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        path = str(scope.get("path", ""))
+        client = (scope.get("client") or ("", 0))[0]
+        if scope["type"] == "http" and (path.rstrip("/") or "/") == self.path and client not in LOOPBACK_CLIENTS:
+            await send({"type": "http.response.start", "status": 404, "headers": [(b"content-length", b"0")]})
+            await send({"type": "http.response.body", "body": b""})
+            return
+        await self.app(scope, receive, send)
 
 
 class AdapterApp(Starlette):
@@ -168,6 +207,7 @@ def attach(
     runs_api: Any | None = None,
     stripe_webhook_secret: str | None = None,
     stripe_key: str | None = None,
+    expose_mcp: bool | None = None,
     **http_options: Any,
 ) -> AdapterApp:
     """The server's own app with the adapter's endpoint beside it.
@@ -183,7 +223,12 @@ def attach(
     approves paid runs: register a handler with `app.runs.on_approval`, or approve later with `app.runs.approve`.
     With `stripe_webhook_secret` (or EKL_STRIPE_WEBHOOK_SECRET), runs paid on the publisher's Stripe account are
     approved from its webhook at `<path>/stripe`; with `stripe_key` (or EKL_STRIPE_KEY) instead, from Stripe's Events
-    API, which needs no public address."""
+    API, which needs no public address.
+
+    `expose_mcp` says whether the server's own MCP endpoint (`streamable_http_path`) stays reachable beside the
+    adapter's. Its clients reach the server there with none of the network's checks, so a project that serves only
+    through EuKollab passes False. Left out, it stays exposed until EXPOSE_MCP_DEFAULT_OFF_FROM, with a warning at
+    start, and is private from then on."""
     if not (credential or os.environ.get("EKL_PROVIDER_CREDENTIAL")):
         log.info("EuKollab is off: EKL_PROVIDER_CREDENTIAL isn't set, so the server runs without %s", "/ekl")
         return without_network(server, streamable_http_path, network_url, http_options)
@@ -192,7 +237,9 @@ def attach(
     except ValueError as invalid:  # pydantic's ValidationError is a ValueError
         # The server still serves its own clients, so `ekl agent sync` can read it and write agent.json again
         # ; a file that doesn't validate is never announced.
-        log.error("agent.json doesn't validate, so nothing is announced; fix it with ekl agent sync. %s", invalid)
+        log.error(
+            "agent.json doesn't validate, so nothing is announced; fix it with ekl agent sync. %s", described(invalid)
+        )
         local = None
     found_credential, found_network = settings_from_environment(local, credential, network_url)
 
@@ -283,8 +330,19 @@ def attach(
                         task.cancel()
                 await own.stop()
 
+    exposed = expose_mcp if expose_mcp is not None else expose_mcp_default()
+    if exposed:
+        log.warning(
+            "the server's own MCP endpoint %s is public beside EuKollab's %s, without the network's checks; %s",
+            streamable_http_path,
+            core.path,
+            "pass expose_mcp=False to attach() to keep it private"
+            if expose_mcp
+            else f"from {EXPOSE_MCP_DEFAULT_OFF_FROM} it is private unless attach() passes expose_mcp=True",
+        )
+    own_app: Any = existing if exposed else _WithoutPath(existing, streamable_http_path)
     stripe = stripe_routes(core.path, runs, stripe_webhook_secret or os.environ.get("EKL_STRIPE_WEBHOOK_SECRET"))
-    combined = AdapterApp(routes=[*routes, *stripe, Mount("/", app=existing)], lifespan=lifespan)
+    combined = AdapterApp(routes=[*routes, *stripe, Mount("/", app=own_app)], lifespan=lifespan)
     combined.state.ekl_core = core
     combined.agent = own
     combined.runs = runs

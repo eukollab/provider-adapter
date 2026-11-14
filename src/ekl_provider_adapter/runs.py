@@ -96,6 +96,11 @@ class RunDecision:
 ApprovalHandler = Callable[[RunRequest], Awaitable[RunDecision | None]]
 
 
+class DecidedElsewhere(Exception):  # noqa: N818 - a signal, not a failure
+    """Raised by an approval handler whose decision is carried by another path (the publisher's app over signed
+    callbacks, which applies the answer itself or keeps the run pending until its deadline): nothing for Runs to do."""
+
+
 class RunsApiError(Exception):
     def __init__(self, code: str, message: str, *, retryable: bool) -> None:
         super().__init__(f"{code}: {message}")
@@ -283,14 +288,19 @@ class Runs:
         """Answer one waiting run within its first-answer deadline."""
         try:
             decision = await self._handler(run) if self._handler else None
-            agent = self._agent()
-            if decision is None and (self._handler is None or (agent is not None and agent.payment is not None)):
-                # No answer from the handler: agent.json's payment page, as without a handler. Without a page the
-                # run waits for a later decision.
-                decision = default_decision(agent, run)
+        except DecidedElsewhere:
+            return
         except Exception:  # a failing handler must not stop the loop; the run then lapses unanswered
             log.exception("the approval handler failed for %s", run.reservation_id)
             return
+        await self.apply(run, decision, answered=self._handler is not None)
+
+    async def apply(self, run: RunRequest, decision: RunDecision | None, *, answered: bool = True) -> None:
+        """Send a decision for a waiting run. None from a handler: agent.json's payment page when it has one (or always
+        without a handler, which declines when there is no page); otherwise the run waits for a later decision."""
+        agent = self._agent()
+        if decision is None and (not answered or (agent is not None and agent.payment is not None)):
+            decision = default_decision(agent, run)
         if decision is None:
             return
         if decision.decision == "payment_needed":

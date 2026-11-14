@@ -7,6 +7,8 @@ call arguments and results never leave the publisher's server.
 """
 
 import datetime as dt
+import hashlib
+import hmac
 from typing import Annotated, Any, Literal, Protocol
 
 import httpx2
@@ -142,11 +144,19 @@ class Problem(_Message):
 
 
 class Announcement(_Message):
-    """The network's answer to an announcement: the version it keeps the file as, and its problems."""
+    """The network's answer to an announcement: the version it keeps the file as, its problems, and which endpoint
+    proof it holds for the agent (v2 once it holds the proof key)."""
 
     version: int
     state: str  # waiting_for_review, confirmed or invalid
     problems: list[Problem] = Field(default_factory=list)
+    endpoint_proof: str | None = None
+
+
+def proof_key(credential: str) -> bytes:
+    """The agent's proof key (EKP 1.2 §3.1): derived from the key itself, so the key's hash, all a copy of the
+    network's database holds, can't make a proof."""
+    return hmac.new(credential.encode("utf-8"), b"ekl-endpoint-proof-v2", hashlib.sha256).digest()
 
 
 class ConfigAnswer(_Message):
@@ -194,6 +204,8 @@ class HttpProviderApi:
         self._base = network_url.rstrip("/")
         self._http = http or httpx2.AsyncClient(timeout=10)
         self._headers = {"Authorization": f"Bearer {credential}"}
+        self._credential = credential
+        self._proof_held = False
 
     async def _post(self, path: str, body: dict[str, Any] | None) -> dict[str, Any]:
         try:
@@ -202,7 +214,12 @@ class HttpProviderApi:
             else:
                 response = await self._http.post(f"{self._base}{path}", json=body, headers=self._headers)
         except httpx2.HTTPError as exc:
-            raise ProviderApiError("SERVICE_UNAVAILABLE", f"the network is unreachable: {exc}", retryable=True) from exc
+            host = httpx2.URL(self._base).host
+            raise ProviderApiError(
+                "SERVICE_UNAVAILABLE",
+                f"the network is unreachable ({type(exc).__name__} reaching {host})",
+                retryable=True,
+            ) from exc
         try:
             data: dict[str, Any] = response.json()
         except ValueError as exc:
@@ -251,8 +268,20 @@ class HttpProviderApi:
         return PendingAdmissions(pending=listed, complete=bool(complete))
 
     async def announce(self, endpoint: str, config: dict[str, Any]) -> Announcement:
-        found = await self._post("/v1/provider/announce", {"endpoint": endpoint, "config": config})
-        return Announcement.model_validate(found)
+        body: dict[str, Any] = {"endpoint": endpoint, "config": config}
+        if not self._proof_held:
+            # Sent until the network says it holds it; never again after.
+            body["proof_key"] = proof_key(self._credential).hex()
+        answer = Announcement.model_validate(await self._post("/v1/provider/announce", body))
+        self._proof_held = self._proof_held or answer.endpoint_proof == "v2"
+        return answer
+
+    async def presence(self, upstream_fingerprint: str, adapter_version: str) -> int:
+        """Report what the server declares now; the answer says how many seconds until the next report."""
+        found = await self._post(
+            "/v1/provider/presence", {"upstream_fingerprint": upstream_fingerprint, "adapter_version": adapter_version}
+        )
+        return int(found.get("next_report_seconds") or 3600)
 
     async def config(self, version: int | None = None) -> ConfigAnswer:
         """The validation candidate, or the confirmed version with this number; version 0 and no

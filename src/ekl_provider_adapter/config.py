@@ -17,8 +17,9 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 ENV_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 IDENT = re.compile(r"[^a-z0-9_]+")
@@ -106,8 +107,48 @@ class Upstream(_Open):
     mcp_url: str
 
 
+def described(exc: BaseException) -> str:
+    """An error as the logs may hold it. A validation error names each field and the kind of problem, never the value,
+    which may be a secret; a transport error names its class and host, never the URL, which may carry a token."""
+    errors = getattr(exc, "errors", None)
+    if isinstance(exc, ValidationError) and callable(errors):
+        # A value_error's message is this module's own text, which names fields and never their values.
+        return "; ".join(
+            ".".join(str(p) for p in e.get("loc", ()))
+            + f": {e.get('type')}"
+            + (f" ({e.get('msg')})" if e.get("type") == "value_error" else "")
+            for e in errors()
+        )
+    try:
+        host = exc.request.url.host  # type: ignore[attr-defined]  # httpx errors carry the request they failed on
+    except (AttributeError, RuntimeError):
+        host = None
+    if host:
+        return f"{type(exc).__name__} reaching {host}"
+    return str(exc)
+
+
+def is_loopback(url: str) -> bool:
+    host = (urlsplit(url).hostname or "").lower()
+    return host in ("localhost", "127.0.0.1", "::1") or host.endswith(".localhost")
+
+
+def require_https(url: str, what: str) -> str:
+    """The agent's credentials travel to the network and its callbacks to the app: anything but this machine must be
+    HTTPS, so neither crosses a network in clear."""
+    scheme = urlsplit(url).scheme
+    if scheme != "https" and not (scheme == "http" and is_loopback(url)):
+        raise ValueError(f"{what} must be https:// (http:// only on this machine), not {scheme or 'no scheme'}")
+    return url
+
+
 class Network(_Open):
     url: str = DEFAULT_NETWORK_URL
+
+    @field_validator("url")
+    @classmethod
+    def _https(cls, value: str) -> str:
+        return require_https(value, "network.url")
 
 
 class Defaults(_Open):
@@ -192,6 +233,41 @@ def _problems(file: AgentFile) -> list[str]:
 
 
 def _expand(value: Any) -> Any:
+    """${NAME} read from the environment, in the fields that may hold one; anywhere else a reference is refused, so a
+    secret named in agent.json can never be expanded into what is announced to the network."""
+    if not isinstance(value, dict):
+        raise ValueError("agent.json must hold one JSON object")
+    found = copy.deepcopy(value)
+    for section, keys in EXPANDED.items():
+        part = found.get(section)
+        if isinstance(part, dict):
+            for key in keys:
+                if key in part:
+                    part[key] = _expand_value(part[key])
+    refused = _references(found)
+    if refused:
+        raise ValueError(
+            f"agent.json refers to ${{{refused[1]}}} in {refused[0]}: only "
+            + ", ".join(f"{s}.{k}" for s, keys in EXPANDED.items() for k in keys)
+            + " may read the environment, because every other field is announced to the network"
+        )
+    return found
+
+
+def _references(value: Any, where: str = "") -> tuple[str, str] | None:
+    """The first ${NAME} left in a value, with where it is."""
+    if isinstance(value, str):
+        match = ENV_REFERENCE.search(value)
+        return (where or "the file", match.group(1)) if match else None
+    items = value.items() if isinstance(value, dict) else enumerate(value) if isinstance(value, list) else ()
+    for key, inner in items:
+        found = _references(inner, f"{where}.{key}" if where else str(key))
+        if found:
+            return found
+    return None
+
+
+def _expand_value(value: Any) -> Any:
     if isinstance(value, str):
 
         def lookup(match: re.Match[str]) -> str:
@@ -202,14 +278,15 @@ def _expand(value: Any) -> Any:
 
         return ENV_REFERENCE.sub(lookup, value)
     if isinstance(value, list):
-        return [_expand(v) for v in value]
-    if isinstance(value, dict):
-        return {k: _expand(v) for k, v in value.items()}
+        return [_expand_value(v) for v in value]
     return value
 
 
 # Settings only the adapter reads: the network ignores them, so they are stripped before announcing.
 LOCAL_SETTINGS = {"adapter": ("path", "storage"), "upstream": ("mcp_url",), "network": ("url",)}
+# The fields whose ${NAME} is read from the environment: the local settings, and the deployment's own public address,
+# which changes per deployment and is a public URL, never a secret.
+EXPANDED = {"adapter": ("endpoint", "path", "storage"), "upstream": ("mcp_url",), "network": ("url",)}
 
 
 def strip_local(raw: dict[str, Any]) -> dict[str, Any]:
@@ -247,7 +324,18 @@ class LocalFile:
         path = Path(source)
         text = path.read_text(encoding="utf-8")
         raw = _expand(json.loads(text))
-        return cls(AgentFile.model_validate(raw), strip_local(raw), path, text)
+        return cls(AgentFile.model_validate(raw), _inline_terms(strip_local(raw), path.parent), path, text)
+
+
+def _inline_terms(config: dict[str, Any], folder: Path) -> dict[str, Any]:
+    """Terms kept in a text file beside agent.json are announced with their text, as `ekl agent sync` announces them:
+    the network never reads the publisher's files, and an announcement without the text would differ from the
+    confirmed version and wait for review again on every start."""
+    terms = config.get("terms") or {}
+    found = folder / str(terms.get("text_file") or "")
+    if not terms.get("text_file") or terms.get("text") or not found.is_file():
+        return config
+    return {**config, "terms": {**terms, "text": found.read_text(encoding="utf-8")}}
 
 
 def inline_agent_file(text: str) -> dict[str, Any]:

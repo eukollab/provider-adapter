@@ -9,7 +9,9 @@ this endpoint, so an existing endpoint protected by a secret URL stays private.
 
 import asyncio
 import contextlib
+import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
+from importlib.metadata import PackageNotFoundError, version
 from typing import Any, Protocol
 
 import mcp_types as types
@@ -22,6 +24,9 @@ from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import BaseRoute, Route
 
 from ekl_provider_adapter.core import AdapterCore
+from ekl_provider_adapter.fingerprint import upstream_fingerprint
+
+log = logging.getLogger("ekl_provider_adapter")
 
 
 def _bearer(request: Any) -> str | None:
@@ -98,10 +103,10 @@ def build_server(
         tools = listed_tools(core, await declared())
         if challenge:
             try:
-                proof = core.answer_challenge(str(challenge))
+                proofs = core.challenge_proofs(str(challenge))
             except ValueError:
                 return types.ListToolsResult(tools=tools, meta={"ekl": {"code": "INVALID_REQUEST"}})
-            return types.ListToolsResult(tools=tools, meta={"ekl": {"proof": proof}})
+            return types.ListToolsResult(tools=tools, meta={"ekl": proofs})
         return types.ListToolsResult(tools=tools)
 
     async def call_tool(ctx: Any, params: types.CallToolRequestParams) -> types.CallToolResult:
@@ -133,6 +138,34 @@ def build_server(
     )
 
 
+PRESENCE_RETRY_SECONDS = 300
+
+
+async def report_presence(core: AdapterCore, declared: Callable[[], Awaitable[list[types.Tool]]]) -> None:
+    """At start and at least hourly, tell the network what the server declares now (its upstream fingerprint), so a
+    tool changed upstream without a new agent.json is noticed. A network that doesn't know the report yet is asked
+    again later; the adapter serves either way."""
+    report = getattr(core.api, "presence", None)
+    if report is None:
+        return
+    while True:
+        wait = PRESENCE_RETRY_SECONDS
+        try:
+            names = {c.tool for c in core.listed}
+            if names:
+                wait = await report(upstream_fingerprint(await declared(), names), adapter_version())
+        except Exception as exc:  # the next report tries again; serving never depends on it
+            log.info("presence not reported (%s); trying again later", type(exc).__name__)
+        await asyncio.sleep(min(max(wait, 60), 3600))
+
+
+def adapter_version() -> str:
+    try:
+        return version("ekl-provider-adapter")
+    except PackageNotFoundError:
+        return "0"
+
+
 def adapter_routes(
     core: AdapterCore,
     declared: Callable[[], Awaitable[list[types.Tool]]],
@@ -149,7 +182,7 @@ def adapter_routes(
         # A public endpoint: every call is checked by the network, so DNS-rebinding protection for local servers
         # does not apply.
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
-        host="0.0.0.0",  # not a bind address: tells the SDK this endpoint is public
+        host="0.0.0.0",  # nosec B104 - not a bind address: tells the SDK this endpoint is public
     )
 
     async def metrics(request: Request) -> Response:
@@ -170,7 +203,11 @@ def adapter_routes(
             await core.recover()
             # Announcing runs beside serving, so a network that cannot be reached never holds up the endpoint.
             # The outbox loop idles without a durable store; a configuration may switch to durable mode later.
-            loops = [asyncio.ensure_future(core.watch_config()), asyncio.ensure_future(core.run_outbox())]
+            loops = [
+                asyncio.ensure_future(core.watch_config()),
+                asyncio.ensure_future(core.run_outbox()),
+                asyncio.ensure_future(report_presence(core, declared)),
+            ]
             try:
                 yield
             finally:

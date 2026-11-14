@@ -160,6 +160,7 @@ async def test_the_connector_serves_a_declared_service_to_any_language(fixtures:
             "charged": "0",
             "receipt_checked": False,
             "stand_in": True,
+            "safety_flags": [],
             "provider": "@vat-check/validate",
         }
         missing = await c.post("/agent/service", json={"need": "x", "prefer": "@none/x", "input": {}})

@@ -12,6 +12,15 @@ from decimal import Decimal
 from typing import Any
 
 MAX_SAFE_INTEGER = 2**53 - 1
+# EKP 1.2 section 2: deeper input is refused before anything hashes or runs it, so a hostile payload can't exhaust the
+# stack of either side.
+MAX_DEPTH = 64
+
+
+class InputTooDeepError(ValueError):
+    """A value nested deeper than MAX_DEPTH arrays and objects."""
+
+    code = "INPUT_TOO_DEEP"
 
 
 def _number(value: float) -> str:
@@ -43,9 +52,11 @@ def _string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-def canonical(value: Any) -> str:
+def canonical(value: Any, depth: int = 0) -> str:
     """The canonical text of a JSON value. Refuses what ekl-json-1 refuses: integers beyond the safe range, NaN and
-    Infinity, non-string keys and invalid Unicode."""
+    Infinity, non-string keys, invalid Unicode and nesting deeper than 64 (InputTooDeepError)."""
+    if isinstance(value, list | tuple | dict) and depth >= MAX_DEPTH:
+        raise InputTooDeepError(f"nested deeper than {MAX_DEPTH}")
     if value is None or isinstance(value, bool):
         return json.dumps(value)
     if isinstance(value, int):
@@ -59,13 +70,30 @@ def canonical(value: Any) -> str:
     if isinstance(value, str):
         return _string(value)
     if isinstance(value, list | tuple):
-        return "[" + ",".join(canonical(v) for v in value) + "]"
+        return "[" + ",".join(canonical(v, depth + 1) for v in value) + "]"
     if isinstance(value, dict):
         if not all(isinstance(k, str) for k in value):
             raise ValueError("object keys must be strings")
         keys = sorted(value, key=lambda k: k.encode("utf-16-be", "surrogatepass"))
-        return "{" + ",".join(_string(k) + ":" + canonical(value[k]) for k in keys) + "}"
+        return "{" + ",".join(_string(k) + ":" + canonical(value[k], depth + 1) for k in keys) + "}"
     raise ValueError(f"{type(value).__name__} is not a JSON value")
+
+
+def too_deep(value: Any, depth: int = 0) -> bool:
+    """Whether a value nests deeper than MAX_DEPTH, checked without recursion so the check itself can't overflow."""
+    stack = [(value, depth)]
+    while stack:
+        item, level = stack.pop()
+        if isinstance(item, dict):
+            items: Any = item.values()
+        elif isinstance(item, list | tuple):
+            items = item
+        else:
+            continue
+        if level >= MAX_DEPTH:
+            return True
+        stack.extend((v, level + 1) for v in items)
+    return False
 
 
 def _unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

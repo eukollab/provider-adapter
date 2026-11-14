@@ -24,6 +24,7 @@ import json
 import secrets
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +60,9 @@ class FakeProvider:
     side_effect_class: str = "read_only"
     # How calls fail, to test failover: "unreachable" (nothing reaches it) or "timeout" (it ran, no answer came).
     fails: str = ""
+    # A plan other than per call, as agent.json publishes it: {"type": "pack", "price": "5.00", "calls": 500}. Its
+    # agreements record no per-call price, as the network's do; each run's reservation carries its unit price.
+    plan: dict[str, Any] | None = None
     calls: int = 0
 
 
@@ -66,6 +70,8 @@ class FakeNetwork:
     """EuKollab in memory, for one agent. Everything it is asked to do is recorded for the test to check."""
 
     def __init__(self, handle: str = "@my-agent", rank_by: str = "accuracy"):
+        # What agent_get_profile answers about each peer's availability, by handle.
+        self.availability: dict[str, list[dict[str, Any]]] = {}
         self.handle, self.agent_id = handle, _id("agt")
         self.config: dict[str, Any] = {"sourcing": {"rank_by": rank_by, "mode": "auto_within_limits"}}
         # A new agent's rules share public and synthetic data only, as the network's defaults do.
@@ -128,9 +134,10 @@ class FakeNetwork:
         example: dict[str, Any] | None = None,
         excluded_by: list[str] | None = None,
         side_effect_class: str = "read_only",
+        plan: dict[str, Any] | None = None,
     ) -> FakeProvider:
         """Another agent's service: `work` turns arguments into a result. `excluded_by` names the console rule that
-        excludes it."""
+        excludes it; `plan` is a pack or subscription it sells instead of a per-call price."""
         found = FakeProvider(
             handle,
             capability_id,
@@ -143,6 +150,7 @@ class FakeNetwork:
             example,
             excluded_by or [],
             side_effect_class,
+            plan=plan,
         )
         self.providers[f"{handle}/{capability_id}"] = found
         return found
@@ -348,8 +356,7 @@ class FakeNetwork:
         agent._loop = asyncio.get_running_loop()
         await agent._identify()
         await agent._subscribe()
-        for callback, _ in agent._callbacks.get("on_start", []):
-            await agent._invoke(callback)
+        await agent._started()  # as the event loop does: a failing on_start is logged, and events still arrive
         attempts: dict[str, int] = {}
         for _ in range(1000):
             page = await self.call("events_next", {"handlers": agent.handler_names()})
@@ -369,6 +376,10 @@ class FakeNetwork:
             raise AgentError(f"FakeNetwork does not know the tool {tool}.", code="NOT_FOUND")
         result: dict[str, Any] = handler(**{k: v for k, v in arguments.items() if v is not None})
         return result
+
+    def _tool_agent_get_profile(self, handle: str) -> dict[str, Any]:
+        """A peer's profile with its availability (EKP 1.2 §6.12), as set in `availability`."""
+        return {"handle": handle, "availability": list(self.availability.get(handle, []))}
 
     def _tool_agent_get_self(self) -> dict[str, Any]:
         return {"agent_id": self.agent_id, "handle": self.handle, "state": self.state, "config": self.config}
@@ -534,24 +545,32 @@ class FakeNetwork:
             )
         peer = self.connections[connection_id]["peer"]
         p = self._provider(peer, capability_id)
+        per_call = "0.00" if p.plan else p.price
         made = {
             "data_class": data_class,
             "collaboration_id": _id("col"),
             "engagement_state": "open",
-            "price_per_call": p.price,
+            "price_per_call": per_call,
             "currency": "USD",
             "terms": {
                 "capability_id": capability_id,
-                "price_per_call": p.price,
+                "price_per_call": per_call,
                 "hash": "terms-" + secrets.token_hex(4),
-            },
+            }
+            | ({"plan": p.plan} if p.plan else {}),
             "provider": peer,
         }
+        if p.plan:
+            made["plan"] = p.plan
         self.agreements[made["collaboration_id"]] = made
         return made
 
     def _tool_engagement_get(self, collaboration_id: str) -> dict[str, Any]:
         return dict(self.agreements[collaboration_id])
+
+    def _tool_engagement_close(self, collaboration_id: str, outcome: str = "completed") -> dict[str, Any]:
+        self.agreements[collaboration_id]["engagement_state"] = outcome
+        return {"collaboration_id": collaboration_id, "engagement_state": outcome}
 
     def _tool_peer_get_access(self, connection_id: str, capability_ids: list[str]) -> dict[str, Any]:
         expires = (dt.datetime.now(dt.UTC) + dt.timedelta(minutes=15)).isoformat()
@@ -572,7 +591,7 @@ class FakeNetwork:
 
     def _tool_execution_reserve(self, execution_id: str, **request: Any) -> dict[str, Any]:
         self.reserved.append({"execution_id": execution_id} | request)
-        record = {"reservation_id": _id("rsv"), "execution_id": execution_id, "state": "held"}
+        record = {"reservation_id": _id("rsv"), "execution_id": execution_id, "state": "held"} | self._unit(request)
         if self.approval == "lapse":
             self.approval = None  # the next reservation is granted at once
             return record | {"state": "expired", "reconciliation_reason": "grant expired before redemption"}
@@ -581,6 +600,16 @@ class FakeNetwork:
         record["state"] = "awaiting_approval"
         self.reservations[record["reservation_id"]] = record
         return dict(record)
+
+    def _unit(self, request: dict[str, Any]) -> dict[str, Any]:
+        """The run's unit price as the network reserves it: the per-call price, or a pack's price over its calls."""
+        agreement = self.agreements.get(str(request.get("collaboration_id")), {})
+        p = self.providers.get(f"{agreement.get('provider', '')}/{request.get('capability_id', '')}")
+        if p is None:
+            return {}
+        plan = p.plan or {}
+        price = Decimal(str(plan.get("price") or p.price)) / Decimal(int(plan.get("calls") or 1))
+        return {"amount_atoms": str(int(price * 1_000_000)), "amount_scale": 6}
 
     def _tool_execution_reservation_get(self, reservation_id: str) -> dict[str, Any]:
         record = self.reservations[reservation_id]
@@ -639,7 +668,6 @@ class FakeNetwork:
                 "receipt": {
                     "input_fingerprint": fingerprint(salt, arguments),
                     "output_fingerprint": fingerprint(salt, value),
-                    "amount": p.price,
                 },
             }
             self.executions[execution_id] = kept

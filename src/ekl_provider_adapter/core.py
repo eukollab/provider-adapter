@@ -32,9 +32,11 @@ from ekl_provider_adapter.api import (
     PendingAdmission,
     ProviderApi,
     ProviderApiError,
+    proof_key,
 )
-from ekl_provider_adapter.config import AgentFile, Capability, LocalFile
+from ekl_provider_adapter.config import AgentFile, Capability, LocalFile, described
 from ekl_provider_adapter.fingerprint import fingerprint, result_body
+from ekl_provider_adapter.jcs import MAX_DEPTH, too_deep
 from ekl_provider_adapter.storage import ExecutionRecord, Storage, open_storage
 
 log = logging.getLogger("ekl_provider_adapter")
@@ -203,6 +205,9 @@ class AdapterCore:
         # Without a local agent.json, the announced version waiting for review, read from the network: listed as a
         # local file's would be, so the review and the checks find its tools (C.8.2).
         self._waiting: AgentFile | None = None
+        # Without a local agent.json, the network's copy as it came, the one waiting for review else the confirmed
+        # one: what a deployment given its own address announces under that address.
+        self._network_copy: dict[str, Any] | None = None
         self.storage: Storage | None = None
         # The validation candidate's number, and the active version calls are admitted under. Confirmed
         # versions are kept by number, the candidate's and the active one's at least, so an admitted call runs under
@@ -244,9 +249,28 @@ class AdapterCore:
     def listed(self) -> list[Capability]:
         """The tools the endpoint lists: the confirmed configuration's offered tools, then those only the announced
         agent.json offers."""
-        confirmed = self._agent.offered if self._agent else []
+        confirmed = [c for c in (self._agent.offered if self._agent else []) if self.declared_locally(c)]
         names = {c.tool for c in confirmed}
         return confirmed + [c for c in self._announced_offered if c.tool not in names]
+
+    def declared_locally(self, cap: Capability) -> bool:
+        """Whether the agent.json deployed here declares this tool, with the same argument names the adapter fills in.
+        The local file bounds what is served: a tool or an injected argument that exists only in the network's copy
+        never reaches the server, whatever that copy says. Without a local file there is nothing to bound by, and the
+        confirmed configuration is served as before."""
+        if self.local is None:
+            return True
+        own = self.local.agent.capability(cap.tool)
+        if own is None:
+            return False
+        return (own.effects.idempotency_argument, own.effects.dry_run_argument) == (
+            cap.effects.idempotency_argument,
+            cap.effects.dry_run_argument,
+        )
+
+    def undeclared_tools(self) -> list[str]:
+        """The confirmed configuration's tools the local agent.json doesn't declare as served: unavailable here."""
+        return [c.tool for c in (self._agent.offered if self._agent else []) if not self.declared_locally(c)]
 
     def apply_config(self, agent: AgentFile, version: int) -> None:
         """Use this confirmed configuration from now on. Refused (ValueError) when it needs something this process
@@ -277,20 +301,21 @@ class AdapterCore:
         try:
             answer = await fetch()
         except Exception as exc:  # unreachable now: keep what we have and try again later
-            log.warning("could not load the confirmed configuration from the network: %s", exc)
+            log.warning("could not load the confirmed configuration from the network: %s", described(exc))
             return self.configured
         self.active_version = answer.active_version
         if self.local is None:
+            self._network_copy = answer.announced or answer.config
             try:
                 self._waiting = AgentFile.model_validate(answer.announced) if answer.announced else None
             except ValueError as exc:
-                log.warning("the announced agent.json waiting for review doesn't load here: %s", exc)
+                log.warning("the announced agent.json waiting for review doesn't load here: %s", described(exc))
                 self._waiting = None
         if answer.config is not None and not (self.configured and answer.version == self.config_version):
             try:
                 self.apply_config(AgentFile.model_validate(answer.config), answer.version)
             except ValueError as exc:
-                log.error("cannot use confirmed configuration version %s: %s", answer.version, exc)
+                log.error("cannot use confirmed configuration version %s: %s", answer.version, described(exc))
         keep = {self.config_version, self.active_version}
         self._versions = {n: v for n, v in self._versions.items() if n in keep}
         if self.active_version:
@@ -305,7 +330,7 @@ class AdapterCore:
             answer = await self.api.config(number)
             found = AgentFile.model_validate(answer.config) if answer.config is not None else None
         except (ProviderApiError, ValueError) as exc:
-            log.warning("could not load confirmed configuration version %s: %s", number, exc)
+            log.warning("could not load confirmed configuration version %s: %s", number, described(exc))
             return None
         if found is not None:
             self._versions[number] = found
@@ -357,7 +382,7 @@ class AdapterCore:
         try:
             self.local = LocalFile.read(local.path)
         except ValueError as exc:
-            log.warning("%s changed but cannot be used, so it is not announced: %s", local.path, exc)
+            log.warning("%s changed but cannot be used, so it is not announced: %s", local.path, described(exc))
             self.local = replace(local, text=text)  # reported once, until the file changes again
 
     async def announce_if_changed(self) -> bool:
@@ -365,8 +390,10 @@ class AdapterCore:
         the network could not be reached, so the caller tries again soon."""
         self.reload_local()
         announce = getattr(self.api, "announce", None)
-        if self.local is None or announce is None:
+        if announce is None:
             return True
+        if self.local is None:
+            return await self._announce_own_address(announce)
         # Only this process's own address is announced: the one given at deployment, or agent.json's. The confirmed
         # configuration's address may belong to another deployment of the same agent, such as a run on a laptop.
         own = self._given_endpoint or self.local.agent.adapter.endpoint
@@ -387,6 +414,29 @@ class AdapterCore:
             answer: Announcement = await announce(own, config)
         except ProviderApiError as exc:
             log.warning("could not announce agent.json to the network: %s", exc)
+            return not exc.retryable
+        self._announced, self.announcement = config, answer
+        _log_announcement(answer)
+        return True
+
+    async def _announce_own_address(self, announce: Any) -> bool:
+        """Without a local agent.json (a server with the adapter attached from its agent package): when deployed
+        with its own address, announce the network's copy under that address, once, as an adapter with a file
+        announces its file when it starts. Nothing to do without a given address, or when the copy already has it."""
+        own = self._given_endpoint
+        if not own or self._announced is not None:
+            return True
+        if self._network_copy is None:
+            await self.load_config()
+        copy = self._network_copy
+        if copy is None or copy.get("adapter", {}).get("endpoint") == own:
+            self._announced = copy or {}
+            return True
+        config = copy | {"adapter": {**copy.get("adapter", {}), "endpoint": own}}
+        try:
+            answer: Announcement = await announce(own, config)
+        except ProviderApiError as exc:
+            log.warning("could not announce this deployment's address to the network: %s", exc)
             return not exc.retryable
         self._announced, self.announcement = config, answer
         _log_announcement(answer)
@@ -421,12 +471,26 @@ class AdapterCore:
         return hmac.compare_digest(presented.encode("utf-8"), self._credential.encode("utf-8"))
 
     def answer_challenge(self, challenge: str) -> str:
-        """The endpoint challenge's proof: HMAC-SHA256 keyed with the hex SHA-256 of the provider credential
-        (all the network keeps of it), over the challenge hex followed by this endpoint's URL. Only the holder of this
-        agent's credential, answering at this endpoint, can produce it."""
+        """The v1 proof: HMAC-SHA256 keyed with the hex SHA-256 of the provider credential (all the network kept of it
+        before proof v2), over the challenge hex followed by this endpoint's URL. Accepted only from agents whose proof
+        key the network doesn't hold, and only until 2027-05-11."""
         bytes.fromhex(challenge)  # refuse anything but hex
         key = hashlib.sha256(self._credential.encode("utf-8")).hexdigest().encode("ascii")
         return hmac.new(key, (challenge + self.endpoint).encode("utf-8"), hashlib.sha256).hexdigest()
+
+    def challenge_proofs(self, challenge: str) -> dict[str, str]:
+        """The proofs for an endpoint challenge: proof_v2 always, keyed with the proof key, which the hash a database
+        copy holds can't make; and v1 beside it only until the network says it holds the proof key (no downgrade)."""
+        bytes.fromhex(challenge)
+        signed = f"ekl-challenge-v2\n{challenge}\n{self.endpoint}".encode()
+        proofs = {"proof_v2": hmac.new(proof_key(self._credential), signed, hashlib.sha256).hexdigest()}
+        if not self.proof_v2_only:
+            proofs["proof"] = self.answer_challenge(challenge)
+        return proofs
+
+    @property
+    def proof_v2_only(self) -> bool:
+        return bool(self.announcement and self.announcement.endpoint_proof == "v2")
 
     # --- one call ---------------------------------------------------------------------------------------------
 
@@ -445,6 +509,13 @@ class AdapterCore:
         cap = self.agent.capability(tool) or self._held_capability(tool)
         if cap is None:
             return error_result("NOT_LISTED", f"{tool} is not offered on the network")
+        if not self.declared_locally(cap):
+            log.warning(
+                "%s is in the confirmed configuration but not declared in the local agent.json; not served", tool
+            )
+            return error_result("NOT_LISTED", f"{tool} is not declared in this deployment's agent.json")
+        if too_deep(arguments):
+            return error_result("INPUT_TOO_DEEP", f"the arguments nest deeper than {MAX_DEPTH}")
         ekl = dict((meta or {}).get("ekl") or {})
         if not token or not ekl:
             # Nothing runs without the network's say.

@@ -2,11 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """agent.json rules the adapter enforces before anything starts."""
 
+import json
+from pathlib import Path
 from typing import Any
 
 import pytest
 
-from ekl_provider_adapter.config import load_agent_file
+from ekl_provider_adapter.config import LocalFile, load_agent_file
 
 BASE: dict[str, Any] = {"ekl": "1.0", "mode": "service_provider", "execution_mode": "storage_free"}
 
@@ -63,3 +65,20 @@ def test_values_come_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> No
 def test_defaults_apply_to_each_capability() -> None:
     agent = load_agent_file(file({"tool": "t", "class": "read_only"}, defaults={"data": {"inputs": {"journal": True}}}))
     assert agent.capabilities[0].data.inputs.journal is True
+
+
+def test_terms_kept_in_a_file_are_announced_with_their_text(tmp_path: Path) -> None:
+    # As ekl agent sync announces them: an announcement without the text would differ from the confirmed version.
+    (tmp_path / "terms.md").write_text("FX Rates terms.\n")
+    (tmp_path / "agent.json").write_text(
+        json.dumps(
+            file(
+                {"tool": "convert", "class": "read_only"},
+                agent={"handle": "@fx", "display_name": "FX", "purpose": "Converts."},
+                adapter={},
+                terms={"text_file": "terms.md", "version": "1"},
+            )
+        )
+    )
+    announced = LocalFile.read(tmp_path / "agent.json").config
+    assert announced["terms"] == {"text_file": "terms.md", "version": "1", "text": "FX Rates terms.\n"}

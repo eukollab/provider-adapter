@@ -65,7 +65,9 @@ class McpNetwork:
     """The network over MCP, with the agent-operation credential."""
 
     def __init__(self, network_url: str, credential: str):
-        self.endpoint = network_url.rstrip("/") + "/mcp"
+        # The network's own address: its issuer, its key set and its screening rules are found from it.
+        self.base_url = network_url.rstrip("/")
+        self.endpoint = self.base_url + "/mcp"
         self.credential = credential
 
     async def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:

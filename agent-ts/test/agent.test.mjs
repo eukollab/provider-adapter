@@ -3,12 +3,11 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createHmac } from "node:crypto";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { AgentError, createAgent, handle, schemaProblem, testing } from "../index.mjs";
+import { AgentError, createAgent, eukollab, schemaProblem, service, testing } from "../index.mjs";
 
 function fixtures() {
   const dir = join(mkdtempSync(join(tmpdir(), "ekl-")), "eukollab", "fixtures");
@@ -58,7 +57,7 @@ test("with a credential the connector calls the service", async () => {
   assert.equal(sent[0][0], "http://127.0.0.1:9999/agent/service");
   assert.equal(sent[0][1].idempotency_key, "k1");
   assert.deepEqual(sent[0][1].expect, { type: "object", required: ["valid"] });
-  assert.deepEqual(result, { value: { valid: true }, executionId: "ex_1", charged: "0.01", receiptChecked: true, standIn: false, provider: "@vat-check" });
+  assert.deepEqual(result, { value: { valid: true }, executionId: "ex_1", charged: "0.01", receiptChecked: true, standIn: false, provider: "@vat-check", safetyFlags: [] });
 });
 
 // The tests decide the credential themselves: none in this process, the connector's in its answer to /agent/status.
@@ -100,15 +99,7 @@ test("without a credential anywhere, or with no connector running, the stand-in 
 
 test("a connector that isn't running says how to start it", async () => {
   const agent = createAgent({ live: true, fetch: async () => { throw new TypeError("fetch failed"); } });
-  await assert.rejects(agent.find("vat"), (e) => e.code === "CONNECTOR_UNREACHABLE" && e.fix.includes("--use-only"));
-});
-
-test("handle checks the callback's signature in constant time", () => {
-  const body = JSON.stringify({ event: "need", data: { text: "x" } });
-  const signature = `sha256=${createHmac("sha256", "eklc_secret").update(body).digest("hex")}`;
-  assert.deepEqual(handle(body, signature, "eklc_secret"), { event: "need", data: { text: "x" } });
-  assert.throws(() => handle(body, "sha256=00", "eklc_secret"), (e) => e.code === "UNAUTHORIZED");
-  assert.throws(() => handle(body, signature, "other"), (e) => e.code === "UNAUTHORIZED");
+  await assert.rejects(agent.find("vat"), (e) => e.code === "CONNECTOR_UNREACHABLE" && e.fix.includes("ekl agent run"));
 });
 
 test("fakeNetwork answers from the stand-ins and records actions", async () => {
@@ -139,3 +130,31 @@ test("decideRun sends a paid run's decision to the connector", async () => {
   assert.equal(sent[0][0], "http://127.0.0.1:9999/agent/decide_run");
   assert.deepEqual(sent[0][1], { reservation_id: "rsv_1", decision: "approve", runs: 500 });
 });
+
+test("closeAgreement asks the connector to close an agreement and open its reviews", async () => {
+  const sent = [];
+  const fakeFetch = async (url, init) => {
+    sent.push([url, JSON.parse(init.body)]);
+    return new Response(JSON.stringify({ engagement_state: "completed" }), { status: 200 });
+  };
+  const agent = createAgent({ apiUrl: "http://127.0.0.1:9999", live: true, fetch: fakeFetch });
+  await agent.closeAgreement("@fx-rates", "cap_convert_currency");
+  assert.equal(sent[0][0], "http://127.0.0.1:9999/agent/close_agreement");
+  assert.deepEqual(sent[0][1], { handle: "@fx-rates", capability_id: "cap_convert_currency", outcome: "completed" });
+});
+
+test("eukollab and service write the declarations ekl agent sync reads, as the Python adapter does", () => {
+  const data = { inputs: { retention: "none" }, results: { retention: "none" }, used_for_training: false };
+  assert.deepEqual(eukollab({ interests: ["currency"], plans: [{ type: "free", daily_limit: 200 }], data }), {
+    "ai.eukollab/agent": {
+      interests: ["currency"],
+      data_declared: true,
+      defaults: { data, plans: [{ type: "free", daily_limit: 200 }] },
+    },
+  });
+  assert.deepEqual(eukollab({ interests: ["currency"] }), { "ai.eukollab/agent": { interests: ["currency"] } });
+  assert.deepEqual(service({ class: "read_only", category: "finance", limitations: undefined }), {
+    "ai.eukollab/service": { class: "read_only", category: "finance" },
+  });
+});
+

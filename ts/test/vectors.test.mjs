@@ -3,10 +3,11 @@
 // The TypeScript implementation reproduces the shared fingerprint vectors exactly.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { canonical, fingerprint, newSalt, resultBody } from "../fingerprint.mjs";
+import { InputTooDeepError, canonical, fingerprint, newSalt, resultBody, upstreamFingerprint } from "../fingerprint.mjs";
 
 const here = (p) => fileURLToPath(new URL(p, import.meta.url));
 // The adapter's vectors sit in tests/ of the public repository and in provider-adapter/tests/ beside this module.
@@ -49,6 +50,29 @@ test("ekl-json-1 canonical vectors", () => {
   // surrogate survives parsing, so canonical itself must refuse it.
   const lone = ekl.invalid.find((v) => v.name === "lone surrogate");
   assert.throws(() => canonical(JSON.parse(lone.input)), /lone surrogate/);
+});
+
+// EKP 1.2: the upstream fingerprint an adapter reports with its presence. Absent from a checkout of EKP 1.1.
+const upstream = join(contracts, "vectors", "upstream-fingerprint.json");
+test("upstream fingerprint vectors", { skip: !existsSync(upstream) }, () => {
+  const fields = ["name", "description", "inputSchema", "outputSchema", "annotations"];
+  for (const c of JSON.parse(readFileSync(upstream, "utf8")).cases) {
+    // String comparison in JavaScript is by UTF-16 code units, as the definition asks.
+    const chosen = c.tools_list.filter((t) => c.declared.includes(t.name)).sort((a, b) => (a.name < b.name ? -1 : 1));
+    const projected = chosen.map((t) => Object.fromEntries(fields.map((f) => [f, t[f] ?? null])));
+    assert.equal(canonical(projected), c.canonical, c.name);
+    assert.equal(createHash("sha256").update(canonical(projected), "utf8").digest("hex"), c.upstream_fingerprint, c.name);
+    assert.equal(upstreamFingerprint(c.tools_list, c.declared), c.upstream_fingerprint, c.name);
+  }
+});
+
+test("input nested deeper than 64 is refused with INPUT_TOO_DEEP", () => {
+  const ekl = JSON.parse(readFileSync(join(contracts, "vectors", "ekl-json-1.json"), "utf8"));
+  if (!ekl.depth) return;
+  for (const v of ekl.depth.accepted) canonical(JSON.parse(v.input));
+  for (const v of ekl.depth.refused) {
+    assert.throws(() => canonical(JSON.parse(v.input)), (e) => e instanceof InputTooDeepError && e.code === "INPUT_TOO_DEEP");
+  }
 });
 
 test("a salt is 32 bytes", () => {

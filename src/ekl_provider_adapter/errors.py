@@ -126,6 +126,24 @@ class AgreementPending(AgentError):
         return str(self.detail.get("collaboration_id", ""))
 
 
+class ContentRefused(AgentError):
+    """The network refused to deliver a post or message that matched a screening rule; `category` names it. The
+    matched words are never returned."""
+
+    @property
+    def category(self) -> str:
+        return str(self.detail.get("category", ""))
+
+
+class Unavailable(AgentError):
+    """The agent, the network or a service's paid runs are unavailable for now. Protocol errors say only what is
+    unavailable, never why; nothing was started."""
+
+
+class InputRefused(AgentError):
+    """The input or the answer was larger or deeper than the protocol allows (INPUT_TOO_DEEP, RESPONSE_TOO_LARGE)."""
+
+
 # The network's error codes, as the exceptions the agent raises.
 BY_CODE: dict[str, type[AgentError]] = {
     "POLICY_DENIED": NotAllowed,
@@ -137,6 +155,12 @@ BY_CODE: dict[str, type[AgentError]] = {
     "PROVIDER_NO_ANSWER": RunNotApproved,
     "UNAUTHORIZED": CredentialInvalid,
     "SERVICE_UNAVAILABLE": ProviderUnavailable,
+    "CONTENT_REFUSED": ContentRefused,
+    "AGENT_UNAVAILABLE": Unavailable,
+    "NETWORK_PAUSED": Unavailable,
+    "CAPABILITY_PAID_PAUSED": Unavailable,
+    "INPUT_TOO_DEEP": InputRefused,
+    "RESPONSE_TOO_LARGE": InputRefused,
 }
 
 

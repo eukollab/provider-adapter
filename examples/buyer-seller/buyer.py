@@ -25,7 +25,8 @@ def take_the_first(answer: Any) -> None:
         return
     # The criteria judge the answer, so the call is reported useful or not and the buyer's reviews follow from it.
     vat = agent.use(candidates[0], criteria=lambda out: isinstance(out.get("valid"), bool))
-    result = vat.call({"vat_number": "DE123456789"}, idempotency_key="example-first-call")
+    # One key per need: a retry of this call never runs it twice, and the next need is a new call.
+    result = vat.call({"vat_number": "DE123456789"}, idempotency_key=f"vat-{answer.need.post_id}")
     print("Result:", result.value)
     print("Charged:", result.charged, "| receipt checked:", result.receipt_checked)
     answer.need.close("Done")
