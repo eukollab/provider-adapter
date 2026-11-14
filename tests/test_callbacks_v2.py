@@ -307,6 +307,9 @@ def test_a_callback_url_off_this_machine_must_be_https() -> None:
 
 
 def _template(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str = "callbacks") -> ModuleType:
+    if not (TEMPLATES / "eukollab_callbacks.py").is_file():
+        # The template is ekl's, not this package's: the adapter's own repository has no copy of it.
+        pytest.skip("the eukollab_callbacks.py template ships with ekl")
     text = (TEMPLATES / "eukollab_callbacks.py").read_text().replace("{{name}}", "Homes")
     path = tmp_path / "eukollab_callbacks.py"
     path.write_text(text.replace("{{adapter_version}}", "0"))

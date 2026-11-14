@@ -121,6 +121,9 @@ def test_a_body_over_1_mb_is_refused(tmp_path: Path) -> None:
 
 
 def _template(tmp_path: Path) -> Any:
+    if not (TEMPLATES / "eukollab_callbacks.py").is_file():
+        # The template is ekl's, not this package's: the adapter's own repository has no copy of it.
+        pytest.skip("the eukollab_callbacks.py template ships with ekl")
     text = (
         (TEMPLATES / "eukollab_callbacks.py").read_text().replace("{{name}}", "X").replace("{{adapter_version}}", "0")
     )
