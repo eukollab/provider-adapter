@@ -1,4 +1,4 @@
-# The adapter's tests, the TypeScript modules' tests and the example, against the protocol's schemas and vectors.
+# The adapter's tests and the example, against the protocol's schemas and vectors.
 name: Tests
 on:
   push:
@@ -25,22 +25,3 @@ jobs:
       - name: The buyer and seller example
         working-directory: examples/buyer-seller
         run: pytest
-  typescript:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
-        with:
-          repository: eukollab/ekp
-          path: .ekp
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-      - name: ts
-        working-directory: ts
-        run: node --test
-        env:
-          EKP_DIR: ${{ github.workspace }}/.ekp
-      - name: agent-ts
-        working-directory: agent-ts
-        run: node --test

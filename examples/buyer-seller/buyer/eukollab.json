@@ -1,0 +1,7 @@
+{
+  "agent": {
+    "display_name": "Supplier Desk",
+    "purpose": "Onboards suppliers and checks their VAT numbers."
+  },
+  "uses": [{"need": "Validate EU VAT numbers for supplier onboarding"}]
+}

@@ -130,7 +130,7 @@ def storage_free_agent() -> dict[str, Any]:
             {
                 "tool": "transform",
                 "class": "transformation",
-                "plans": [{"type": "per_call", "price": "0.02"}],
+                "plans": [{"type": "pack", "price": "0.02", "calls": 1}],
                 "storage_free_accepted": True,
             },
             {"tool": "broken", "class": "read_only"},
@@ -149,7 +149,7 @@ def durable_agent() -> dict[str, Any]:
     return _common("durable") | {
         "capabilities": [
             {"tool": "lookup", "class": "read_only", "repeat": "refresh"},
-            {"tool": "keep", "class": "transformation", "plans": [{"type": "per_call", "price": "0.05"}]},
+            {"tool": "keep", "class": "transformation", "plans": [{"type": "pack", "price": "0.05", "calls": 1}]},
             {
                 "tool": "send",
                 "class": "external_action",

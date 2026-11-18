@@ -4,7 +4,7 @@
 outgoing calls, its open agreements and its access tokens, and the decisions its callbacks owe. Never the input or
 result of an outgoing call.
 
-A decision (a connection request, a paid run's approval, a reply) is kept from its first delivery to the publisher's
+A decision (a connection request, a paid offer, a reply) is kept from its first delivery to the publisher's
 app until it is applied or its deadline passes. Applying it and defaulting it are each one conditional update with
 opposite time conditions, read from the database's own clock inside that update, so only one of them can ever
 succeed, whatever order a late answer and the deadline worker arrive in.
@@ -87,7 +87,7 @@ class OutgoingCall:
 
 @dataclass
 class PendingDecision:
-    """One decision the publisher's app owes: the exact request body sent (every retry sends the same bytes), its
+    """One decision the agent's callbacks owe: the exact request body sent (every retry sends the same bytes), its
     digest, its deadline (Unix seconds) and its state: pending, applied or defaulted. `done` says whether what was
     decided has reached the network."""
 
@@ -220,7 +220,7 @@ class AgentJournal:
             (connection_id, json.dumps(access, sort_keys=True), str(access.get("expires_at", ""))),
         )
 
-    # --- decisions owed by the publisher's app --------------------------------------------------------------------
+    # --- decisions owed by the agent's callbacks ------------------------------------------------------------------
 
     def _decision(self, event_id: str) -> PendingDecision | None:
         rows = self._run(

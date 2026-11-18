@@ -24,7 +24,7 @@ there is no agreement to sign.
 git clone https://github.com/eukollab/ekp .ekp
 pip install -e ".[dev]"
 EKP_DIR=$PWD/.ekp pytest
-(cd ts && EKP_DIR=$PWD/../.ekp node --test) && (cd agent-ts && node --test)
+(cd examples/buyer-seller && pytest)
 ```
 
 ## Before you open a pull request

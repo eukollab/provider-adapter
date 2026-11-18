@@ -20,7 +20,7 @@ from ekl_provider_adapter.jcs import InputTooDeepError, canonical, too_deep
 from ekl_provider_adapter.receipts import CallMade, KeySet, ReceiptInvalid, receipt_digest, verify
 from ekl_provider_adapter.screening import Rules, RulesInvalid, Screener, verified_rules
 from ekl_provider_adapter.testing import FakeNetwork
-from tests.conftest import CONTRACTS
+from tests.conftest import CONTRACTS, use
 
 VECTORS = CONTRACTS / "vectors"
 
@@ -148,7 +148,7 @@ def test_ac312_a_private_key_in_a_result_raises_a_leak_flag_and_nothing_of_it_le
     secret = "-----BEGIN " + "PRIVATE KEY-----\nMIIEvQ\n-----END " + "PRIVATE KEY-----"
     fake, agent = _screened_agent(tmp_path, {"text": secret})
     [candidate] = agent.find("leaky lookup")
-    result = agent.use(candidate).call({"q": "x"})
+    result = use(agent, candidate).call({"q": "x"})
     assert result.safety_flags == [{"category": "credential_leak", "rules_version": "local"}]
     sent = json.dumps(fake.reports)
     assert "PRIVATE KEY" not in sent and "MIIEvQ" not in sent
@@ -157,7 +157,7 @@ def test_ac312_a_private_key_in_a_result_raises_a_leak_flag_and_nothing_of_it_le
 def test_a_rule_phrase_matches_after_normalisation(tmp_path: Path) -> None:
     _, agent = _screened_agent(tmp_path, {"text": "An EXAMPLE Prohibited Phrase, in capitals"})
     [candidate] = agent.find("leaky lookup")
-    flags = agent.use(candidate).call({"q": "x"}).safety_flags
+    flags = use(agent, candidate).call({"q": "x"}).safety_flags
     assert flags == [{"category": "prohibited_content", "rules_version": "2026-11-12.1"}]
 
 
@@ -165,12 +165,12 @@ def test_ac249_only_the_consumers_own_configuration_turns_screening_off(tmp_path
     secret = {"text": "-----BEGIN " + "PRIVATE KEY-----", "consumer": {"screen_results": False}}
     _, agent = _screened_agent(tmp_path, secret)  # what the provider sends can't turn it off
     [candidate] = agent.find("leaky lookup")
-    assert agent.use(candidate).call({"q": "x"}).safety_flags
+    assert use(agent, candidate).call({"q": "x"}).safety_flags
     _, off = _screened_agent(
         tmp_path / "off", {"text": "-----BEGIN " + "PRIVATE KEY-----"}, {"consumer": {"screen_results": False}}
     )
     [candidate] = off.find("leaky lookup")
-    assert off.use(candidate).call({"q": "x"}).safety_flags == []
+    assert use(off, candidate).call({"q": "x"}).safety_flags == []
 
 
 def test_the_depth_limit_matches_the_protocol_vectors() -> None:

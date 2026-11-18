@@ -18,9 +18,9 @@ from pathlib import Path
 from typing import Any
 
 import mcp_types as types
+from pydantic import ValidationError
 
 from ekl_provider_adapter.api import CompleteRequest, Completion, ProviderApiError
-from ekl_provider_adapter.attach import tool_error_result
 from ekl_provider_adapter.config import AgentFile, LocalFile, strip_local
 from ekl_provider_adapter.conformance.network import FakeNetwork, ToolRules
 from ekl_provider_adapter.conformance.toolbox import ENDPOINT, Crash, Toolbox, durable_agent, storage_free_agent
@@ -137,7 +137,14 @@ class Harness:
             try:
                 result = await server.call_tool(tool, arguments)
             except ToolError as exc:
-                return tool_error_result(exc)
+                # The SDK raises ToolError where a remote client would see isError. Invalid arguments never reached
+                # the tool, so they are declared without effect; anything else is left for the outcome rules.
+                no_effect = isinstance(exc.__cause__, ValidationError)
+                return types.CallToolResult(
+                    content=[types.TextContent(type="text", text=str(exc))],
+                    is_error=True,
+                    meta={"ekl": {"effect": "none"}} if no_effect else None,
+                )
             assert isinstance(result, types.CallToolResult)
             return result
 

@@ -1,42 +1,37 @@
 # Copyright © 2026 EuKreate, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""The adapter works both ways: the agent's callbacks and actions, run against testing.FakeNetwork."""
+"""The connector works both ways: the agent's side, its events and actions, run against testing.FakeNetwork."""
 
 import asyncio
 import json
-import logging
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import httpx2
 import pytest
-from mcp.server.mcpserver import MCPServer
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
-from ekl_provider_adapter import attach
 from ekl_provider_adapter import callback_signing as cb
-from ekl_provider_adapter.agent import Agent, Choice, Need, ReviewDue, Untrusted, _log_to_terminal
+from ekl_provider_adapter.agent import Agent, Choice, Need, ReviewDue, Untrusted
 from ekl_provider_adapter.agent_journal import AgentJournal
 from ekl_provider_adapter.callbacks import bridge, local_api
-from ekl_provider_adapter.config import AgentFile
 from ekl_provider_adapter.connector import use_only_app
 from ekl_provider_adapter.errors import (
     AgentError,
     AgentNotEnabled,
+    BalanceLow,
+    CallFinished,
     NoProvider,
     NotAllowed,
-    NotConfirmed,
-    PaymentNeeded,
-    ProviderNotFunded,
-    RunNotApproved,
     from_network,
 )
-from ekl_provider_adapter.runs import RunDecision, RunRequest, Runs, default_decision
 from ekl_provider_adapter.testing import FakeNetwork
+from tests.conftest import use
 
 VAT_SCHEMA = {"type": "object", "required": ["vat_number"], "properties": {"vat_number": {"type": "string"}}}
 VALID = {"type": "object", "required": ["valid"], "properties": {"valid": {"type": "boolean"}}}
@@ -46,33 +41,21 @@ def _agent(fake: FakeNetwork, tmp_path: Path) -> Agent:
     return Agent(fake, AgentJournal(str(tmp_path / "journal.db")))
 
 
-def _server() -> MCPServer:
-    server = MCPServer("demo")
-
-    @server.tool()
-    def echo(text: str) -> str:
-        return text
-
-    return server
-
-
-def test_without_the_agent_credential_the_adapter_only_serves(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_without_the_agent_credential_the_connector_only_serves(monkeypatch: pytest.MonkeyPatch) -> None:
     # No credential, no event loop, and every action names the variable to set.
     monkeypatch.delenv("EKL_AGENT_CREDENTIAL", raising=False)
-    app = attach(_server(), credential="eklp_test", network_url="https://network.invalid")
-    assert not app.agent.enabled
+    agent = Agent(None)
+    assert not agent.enabled
     with pytest.raises(AgentNotEnabled, match="EKL_AGENT_CREDENTIAL"):
-        app.agent.post_need("Validate VAT numbers")
-    with pytest.raises(AgentNotEnabled):
-        app.agent.use(None)  # type: ignore[arg-type]  # refused before the service is looked at
+        agent.post_need("Validate VAT numbers")
 
 
-def test_a_matching_need_is_answered_from_the_server_process(tmp_path: Path) -> None:
+def test_a_matching_need_is_answered(tmp_path: Path) -> None:
     # One on_need callback answers matching needs; the network learns the agent answers them itself.
     fake = FakeNetwork(handle="@vat-check")
-    app = attach(_server(), credential="eklp_test", network_url="https://network.invalid", agent_network=fake)
+    agent = _agent(fake, tmp_path)
 
-    @app.agent.on_need(matching="my_services")
+    @agent.on_need(matching="my_services")
     def answer(need: Need) -> None:
         assert need.matched_service is not None
         need.reply(f"I can do this with {need.matched_service.name}, {need.matched_service.price}.")
@@ -80,9 +63,19 @@ def test_a_matching_need_is_answered_from_the_server_process(tmp_path: Path) -> 
     fake.need(
         "Validate EU VAT numbers", author="@buyer", matched="cap_vat", service="Validate VAT", price="$0.05 / call"
     )
-    fake.run(app.agent)
+    fake.run(agent)
     assert [r["body"] for r in fake.replies] == ["I can do this with Validate VAT, $0.05 / call."]
     assert "on_need" in fake.handlers
+
+
+def test_a_connection_request_answered_already_is_settled_not_failed(tmp_path: Path) -> None:
+    """A console rule answered it first, while the callbacks were starting: answering again settles it, and the
+    callback isn't retried and recorded as failed."""
+    fake = FakeNetwork()
+    agent = _agent(fake, tmp_path)
+    fake.connections["con_1"] = {"connection_id": "con_1", "state": "declined"}
+    answered = agent._sync(agent.aio.respond("con_1", True, ""))
+    assert answered == {"connection_id": "con_1", "already_answered": True} and fake.responses == []
 
 
 def test_subscribed_needs_and_connection_requests(tmp_path: Path) -> None:
@@ -153,7 +146,7 @@ def test_post_a_need_choose_by_trial_and_call(tmp_path: Path) -> None:
     def use_it(answer: Any) -> None:
         choice = agent.choose(answer.need, sample={"vat_number": "DE123456789"}, check=lambda out: out["valid"] is True)
         results.append(choice)
-        vat = agent.use(choice.main)
+        vat = use(agent, choice.main)
         results.append(vat.call({"vat_number": "DE987654321"}, criteria=lambda out: out["valid"]))
         answer.need.close("Found a provider")
 
@@ -207,12 +200,12 @@ def test_an_agreement_declares_the_data_class_the_agent_shares(tmp_path: Path) -
     fake.provider("@holidays", "cap_is_holiday", lambda _: {"holiday": False}, summary="public holiday by country")
     agent = _agent(fake, tmp_path)
     [holidays] = agent.find("public holiday")
-    assert agent.use(holidays).call({"day": "2026-11-12"}).value == {"holiday": False}
+    assert use(agent, holidays).call({"day": "2026-11-12"}).value == {"holiday": False}
     assert [a["data_class"] for a in fake.agreements.values()] == ["public"]
     with pytest.raises(NotAllowed):
-        agent.use(holidays, data_class="internal").call({"day": "2026-11-13"}, idempotency_key="internal-1")
+        use(agent, holidays, data_class="internal").call({"day": "2026-11-13"}, idempotency_key="internal-1")
     with pytest.raises(ValueError):
-        agent.use(holidays, data_class="secret")
+        use(agent, holidays, data_class="secret")
 
 
 def test_a_candidate_whose_input_differs_is_skipped_unless_the_sample_adapts(tmp_path: Path) -> None:
@@ -246,23 +239,24 @@ def test_approving_each_choice_waits_for_the_publisher(tmp_path: Path) -> None:
     choice = agent.choose("validate vat", sample={"vat_number": "DE1"})
     assert choice.waiting and choice.main is not None
     with pytest.raises(NotAllowed):
-        agent.use(choice.main).call({"vat_number": "DE1"})
+        use(agent, choice.main).call({"vat_number": "DE1"})
     fake.approve(choice.decision_id)
     fake.run(agent)
     assert len(approved) == 1 and approved[0].main is not None and approved[0].main.handle == "@vat"
-    assert agent.use(approved[0].main).call({"vat_number": "DE1"}).value == {"valid": True}
+    assert use(agent, approved[0].main).call({"vat_number": "DE1"}).value == {"valid": True}
 
 
 def test_the_same_idempotency_key_never_runs_or_pays_twice(tmp_path: Path) -> None:
-    # The execution ID and salt are journaled before the first attempt.
+    # The execution ID and salt are journaled before the first attempt, so a free call repeated from a new process
+    # reaches the same execution, which the provider answers again without new work. A paid one: the next test.
     fake = FakeNetwork()
-    vat = fake.provider("@vat", "cap_vat_check", lambda _: {"valid": True}, price="0.10", summary="validate vat")
+    vat = fake.provider("@vat", "cap_vat_check", lambda _: {"valid": True}, summary="validate vat")
     journal = str(tmp_path / "journal.db")
     first = Agent(fake, AgentJournal(journal))
     [candidate] = first.find("validate vat")
-    one = first.use(candidate).call({"vat_number": "DE1"}, idempotency_key="supplier-42")
+    one = use(first, candidate).call({"vat_number": "DE1"}, idempotency_key="supplier-42")
     restarted = Agent(fake, AgentJournal(journal))  # a new process, the same journal
-    again = restarted.use(candidate).call({"vat_number": "DE1"}, idempotency_key="supplier-42")
+    again = use(restarted, candidate).call({"vat_number": "DE1"}, idempotency_key="supplier-42")
     assert again.execution_id == one.execution_id and vat.calls == 1
 
 
@@ -332,16 +326,16 @@ def test_a_message_carries_its_own_id_so_a_redelivery_can_be_told_apart(tmp_path
 def test_network_refusals_become_named_exceptions() -> None:
     refused = from_network("POLICY_DENIED", "paid use is off", {"rule": "spending.paid_use"})
     assert isinstance(refused, NotAllowed) and refused.rule == "spending.paid_use"
-    pay = from_network("PAYMENT_NEEDED", "pay first", {"payment": {"url": "https://pay"}})
-    assert isinstance(pay, PaymentNeeded) and pay.payment_link == "https://pay"
-    assert isinstance(from_network("PROVIDER_NOT_FUNDED", "try later"), ProviderNotFunded)
+    low = from_network("BALANCE_LOW", "the wallet is low", {"needed": "8.00", "currency": "USD"})
+    assert isinstance(low, BalanceLow) and (low.needed, low.currency) == ("8.00", "USD")
+    assert "Account → Money → Buying" in str(low)
 
 
 def test_the_connector_forwards_signed_events_and_applies_the_answer(tmp_path: Path) -> None:
-    # A server in another language answers through its own route.
+    # The callbacks file the connector runs answers each event it is posted.
     received: list[dict[str, Any]] = []
 
-    async def app_route(request: Request) -> JSONResponse:
+    async def callbacks_route(request: Request) -> JSONResponse:
         body = await request.body()
         assert cb.REQUEST_HEADER in request.headers and request.headers[cb.LEGACY_HEADER] == cb.legacy_signature(
             "ekla_secret", body
@@ -352,14 +346,14 @@ def test_the_connector_forwards_signed_events_and_applies_the_answer(tmp_path: P
             return JSONResponse({"reply": f"Yes: {event['matched_service']['name']}."})
         return JSONResponse({"decline": "not now"})
 
-    publisher_app = Starlette(routes=[Route("/ekl-events", app_route, methods=["POST"])])
+    callbacks_file = Starlette(routes=[Route("/ekl-events", callbacks_route, methods=["POST"])])
     fake = FakeNetwork()
     agent = _agent(fake, tmp_path)
     bridge(
         agent,
         "http://127.0.0.1/ekl-events",
         "ekla_secret",
-        http=httpx2.AsyncClient(transport=httpx2.ASGITransport(app=publisher_app), base_url="http://127.0.0.1"),
+        http=httpx2.AsyncClient(transport=httpx2.ASGITransport(app=callbacks_file), base_url="http://127.0.0.1"),
     )
     fake.need("Validate VAT", matched="cap_vat", service="VAT check")
     fake.connection_request("@stranger")
@@ -369,19 +363,19 @@ def test_the_connector_forwards_signed_events_and_applies_the_answer(tmp_path: P
 
 
 def test_an_answer_to_a_decision_the_code_cannot_take_is_not_retried(tmp_path: Path) -> None:
-    # A first contact is decided in the console: the app's answer can't be applied, so the event isn't failed and
+    # A first contact is decided in the console: the callbacks' answer can't be applied, so the event isn't failed and
     # retried five times; the decision's fallback applies.
-    async def app_route(request: Request) -> JSONResponse:
+    async def callbacks_route(request: Request) -> JSONResponse:
         return JSONResponse({"accept": True})
 
-    publisher_app = Starlette(routes=[Route("/ekl-events", app_route, methods=["POST"])])
+    callbacks_file = Starlette(routes=[Route("/ekl-events", callbacks_route, methods=["POST"])])
     fake = FakeNetwork()
     agent = _agent(fake, tmp_path)
     bridge(
         agent,
         "http://127.0.0.1/ekl-events",
         "ekla_secret",
-        http=httpx2.AsyncClient(transport=httpx2.ASGITransport(app=publisher_app), base_url="http://127.0.0.1"),
+        http=httpx2.AsyncClient(transport=httpx2.ASGITransport(app=callbacks_file), base_url="http://127.0.0.1"),
     )
     fake.decision("outreach", "out_123")
     fake.run(agent)
@@ -395,14 +389,14 @@ def test_criteria_judge_every_call_and_choose_s_check_is_passed_on_only_explicit
     fake.provider("@vat", "cap_vat_check", lambda a: {"valid": a["vat_number"].startswith("DE")}, summary="vat check")
     agent = _agent(fake, tmp_path)
     service = agent.find("vat check")[0]
-    by_use = agent.use(service, criteria=lambda out: out["valid"])
+    by_use = use(agent, service, criteria=lambda out: out["valid"])
     by_use.call({"vat_number": "DE1"})
     by_use.call({"vat_number": "FR1"})
     by_use.call({"vat_number": "FR2"}, criteria=lambda out: out["valid"] is False)  # the call's own criteria win
     choice = agent.choose("vat check", sample={"vat_number": "DE9"}, check=lambda out: out["valid"] is True)
     assert choice.main is not None and choice.check is not None
-    agent.use(choice.main).call({"vat_number": "FR3"})  # not judged by the check
-    agent.use(choice.main, criteria=choice.check).call({"vat_number": "FR4"})
+    use(agent, choice.main).call({"vat_number": "FR3"})  # not judged by the check
+    use(agent, choice.main, criteria=choice.check).call({"vat_number": "FR4"})
     assert [r["result"] for r in fake.reports] == ["useful", "not_useful", "useful", "not_assessed", "not_useful"]
     assert [r.get("criteria_met") for r in fake.reports] == ["yes", "no", "yes", None, "no"]
 
@@ -487,19 +481,19 @@ def test_the_connector_answers_review_due_with_a_review_skip_or_nothing(tmp_path
         "@skipped": {"skip": True},
     }
 
-    async def app_route(request: Request) -> JSONResponse:
+    async def callbacks_route(request: Request) -> JSONResponse:
         event = json.loads(await request.body())
         received.append(event)
         return JSONResponse(answers.get(event["counterpart"], {}))
 
-    publisher_app = Starlette(routes=[Route("/ekl-events", app_route, methods=["POST"])])
+    callbacks_file = Starlette(routes=[Route("/ekl-events", callbacks_route, methods=["POST"])])
     fake = FakeNetwork(handle="@buyer")
     agent = _agent(fake, tmp_path)
     bridge(
         agent,
         "http://127.0.0.1/ekl-events",
         "ekla_secret",
-        http=httpx2.AsyncClient(transport=httpx2.ASGITransport(app=publisher_app), base_url="http://127.0.0.1"),
+        http=httpx2.AsyncClient(transport=httpx2.ASGITransport(app=callbacks_file), base_url="http://127.0.0.1"),
     )
     for counterpart in ("@reviewed", "@skipped", "@default"):
         fake.review_due(counterpart, "cap_vat_check", useful=2)
@@ -525,37 +519,52 @@ def test_the_local_api_starts_the_agents_own_actions(tmp_path: Path) -> None:
     assert missing.status_code == 404
 
 
-def test_a_paid_call_waits_for_the_providers_approval(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # Every paid run waits for its provider's approval; nothing reaches the provider before it.
-    monkeypatch.setattr("ekl_provider_adapter.agent.asyncio.sleep", _no_wait)
+def test_the_local_api_answers_a_low_wallet_with_what_the_pack_needs(tmp_path: Path) -> None:
+    # Apps in other languages map on `error` and show `detail`: the pack's price and its currency.
+    fake = FakeNetwork()
+    fake.provider("@vat", "cap_vat_check", lambda _: {"valid": True}, price="0.10", summary="vat check")
+    fake.wallet = Decimal(0)
+    with TestClient(local_api(_agent(fake, tmp_path)), base_url="http://127.0.0.1:8765") as client:
+        refused = client.post(
+            "/agent/call", json={"handle": "@vat", "capability_id": "cap_vat_check", "arguments": {"vat_number": "DE1"}}
+        )
+        gone = client.post("/agent/decide_run", json={"reservation_id": "rsv_1", "decision": "approve"})
+    body = refused.json()
+    assert refused.status_code == 402 and body["error"] == "BALANCE_LOW"
+    assert body["detail"] == {"needed": "0.10", "currency": "USD"} and body["message"]
+    assert gone.status_code == 404
+
+
+def test_a_paid_call_is_paid_from_the_wallet_without_waiting(tmp_path: Path) -> None:
+    # Nobody approves a paid run: it buys its pack from the wallet at once, offering the pack's whole price, or is
+    # refused with BALANCE_LOW before anything reaches the provider.
     fake = FakeNetwork()
     vat = fake.provider("@vat", "cap_vat_check", lambda _: {"valid": True}, price="0.10", summary="validate vat")
-    agent = Agent(fake, AgentJournal(str(tmp_path / "journal.db")))
+    agent = _agent(fake, tmp_path)
     [candidate] = agent.find("validate vat")
-    fake.approval = "approve"
-    assert agent.use(candidate).call({"vat_number": "DE1"}).value == {"valid": True} and vat.calls == 1
-    fake.approval = "payment"
-    with pytest.raises(PaymentNeeded) as unpaid:
-        agent.use(candidate).call({"vat_number": "DE2"})
-    assert unpaid.value.payment_link == "https://buy.stripe.com/fake"
-    fake.approval = "decline"
-    with pytest.raises(RunNotApproved):
-        agent.use(candidate).call({"vat_number": "DE3"})
-    assert vat.calls == 1  # neither unapproved run reached the provider
+    fake.wallet = Decimal("0.10")
+    result = use(agent, candidate).call({"vat_number": "DE1"})
+    assert result.value == {"valid": True} and result.charged == "0.10" and vat.calls == 1
+    assert fake.reserved[0]["requested_max_amount_atoms"] == "100000"
+    assert "approval_wait_seconds" not in fake.reserved[0]
+    with pytest.raises(BalanceLow) as low:
+        use(agent, candidate).call({"vat_number": "DE2"})
+    assert low.value.code == "BALANCE_LOW" and low.value.needed == "0.10" and vat.calls == 1
 
 
-def test_a_paid_run_under_a_pack_reports_its_unit_price(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # A pack's agreement records no per-call price, as the network's don't; the run's reservation carries its unit
-    # price, the pack's price over its calls, and that is what the call reports as charged.
-    monkeypatch.setattr("ekl_provider_adapter.agent.asyncio.sleep", _no_wait)
+def test_a_run_offers_the_whole_pack_and_later_runs_use_its_calls(tmp_path: Path) -> None:
+    # The first run buys the pack, holding its whole price; the next ones take its calls and cost nothing more.
     fake = FakeNetwork()
     pack = {"plan_id": "pack-500", "type": "pack", "price": "5.00", "calls": 500}
     fake.provider("@fx", "cap_convert_currency", lambda _: {"converted": 1.1}, summary="convert currency", plan=pack)
-    agent = Agent(fake, AgentJournal(str(tmp_path / "journal.db")))
+    agent = _agent(fake, tmp_path)
     [candidate] = agent.find("convert currency")
-    fake.approval = "approve"
-    result = agent.use(candidate).call({"amount": 1, "from_currency": "EUR", "to_currency": "USD"})
-    assert result.value == {"converted": 1.1} and result.charged == "0.01"
+    fx = use(agent, candidate)
+    first = fx.call({"amount": 1, "from_currency": "EUR", "to_currency": "USD"})
+    second = fx.call({"amount": 2, "from_currency": "EUR", "to_currency": "USD"})
+    assert first.value == {"converted": 1.1} and (first.charged, second.charged) == ("5.00", "0.00")
+    assert {r["requested_max_amount_atoms"] for r in fake.reserved} == {"5000000"}
+    assert fake._tool_packs_list()["packs"][0]["calls_left"] == 498
 
 
 def test_closing_an_agreement_opens_its_review_and_the_next_call_agrees_again(tmp_path: Path) -> None:
@@ -563,7 +572,7 @@ def test_closing_an_agreement_opens_its_review_and_the_next_call_agrees_again(tm
     fake.provider("@fx", "cap_convert_currency", lambda _: {"converted": 1.1}, summary="convert currency")
     agent = Agent(fake, AgentJournal(str(tmp_path / "journal.db")))
     [candidate] = agent.find("convert currency")
-    fx = agent.use(candidate)
+    fx = use(agent, candidate)
     fx.call({"amount": 1})
     [first] = fake.agreements
     assert fx.close()["engagement_state"] == "completed" and fake.agreements[first]["engagement_state"] == "completed"
@@ -572,76 +581,6 @@ def test_closing_an_agreement_opens_its_review_and_the_next_call_agrees_again(tm
     fx.close()
     with pytest.raises(AgentError):
         fx.close()  # nothing open to close
-
-
-async def _no_wait(_: float) -> None:
-    return None
-
-
-def test_without_a_handler_the_consumer_is_sent_to_the_payment_page() -> None:
-    agent = AgentFile.model_validate(
-        {
-            "ekl": "1.0",
-            "mode": "service_provider",
-            "execution_mode": "durable",
-            "payment": {"link": "https://buy.stripe.com/northwind?plan=pack"},
-            "capabilities": [
-                {
-                    "tool": "extract",
-                    "class": "read_only",
-                    "plans": [{"plan_id": "pack500", "type": "pack", "price": "8.00", "calls": 500}],
-                }
-            ],
-        }
-    )
-    run = RunRequest(
-        reservation_id="rsv_1",
-        execution_id="ex_1",
-        consumer={"agent_id": "agt_1"},
-        capability_id="cap_extract",
-        plan_id="pack500",
-        unit_price="0.016",
-    )
-    decision = default_decision(agent, run)
-    assert decision.decision == "payment_needed"
-    assert decision.fields["payment"] == {
-        "url": "https://buy.stripe.com/northwind?plan=pack&client_reference_id=rsv_1",
-        "amount": "8.00",
-        "currency": "USD",
-        "description": "500 runs",
-    }
-    assert default_decision(agent.model_copy(update={"payment": None}), run).decision == "decline"
-
-
-def test_the_approval_handler_answers_each_waiting_run() -> None:
-    answered: list[tuple[str, RunDecision]] = []
-
-    class Api:
-        def __init__(self) -> None:
-            self.rounds = 0
-
-        async def next(self, _wait: int) -> list[RunRequest]:
-            self.rounds += 1
-            if self.rounds > 1:
-                raise asyncio.CancelledError
-            return [
-                RunRequest(reservation_id="rsv_9", execution_id="ex_9", consumer={"agent_id": "a"}, capability_id="c")
-            ]
-
-        async def decide(self, reservation_id: str, decision: RunDecision) -> dict[str, Any]:
-            answered.append((reservation_id, decision))
-            return {}
-
-    runs = Runs(Api(), lambda: None)
-
-    @runs.on_approval
-    async def approve(run: RunRequest) -> RunDecision:
-        return RunDecision.approve(runs=10)
-
-    with pytest.raises(asyncio.CancelledError):
-        asyncio.run(runs.watch())
-    [(reservation_id, decision)] = answered
-    assert reservation_id == "rsv_9" and decision.fields == {"unit": "plan", "standing": {"runs": 10}}
 
 
 def test_a_need_can_run_shorter_or_longer_than_two_weeks(tmp_path: Path) -> None:
@@ -656,8 +595,8 @@ def test_a_need_can_run_shorter_or_longer_than_two_weeks(tmp_path: Path) -> None
 def test_an_agent_that_only_uses_services_announces_itself_and_waits_to_be_confirmed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # It has no adapter to announce it: from_env finds its agent.json, announces it with no address, and holds its
-    # callbacks back until its publisher has confirmed it.
+    # Nothing serving calls announces it: the use-only connector finds its agent.json, announces it with no address,
+    # and holds its callbacks back until its publisher has confirmed it.
     uses_only = {
         "ekl": "1.0",
         "mode": "active_participant",
@@ -672,7 +611,7 @@ def test_an_agent_that_only_uses_services_announces_itself_and_waits_to_be_confi
     monkeypatch.setenv("EKL_AGENT_CREDENTIAL", "ekla_test")
     monkeypatch.setenv("EKL_PROVIDER_CREDENTIAL", "eklp_test")
     monkeypatch.setattr("ekl_provider_adapter.agent.ACTIVE_POLL_SECONDS", 0.01)
-    agent = Agent.from_env()
+    agent = use_only_app().state.ekl_agent
     assert agent._announcement is not None
     api, config = agent._announcement
     announced: list[tuple[str, dict[str, Any]]] = []
@@ -692,17 +631,17 @@ def test_an_agent_that_only_uses_services_announces_itself_and_waits_to_be_confi
     monkeypatch.setattr(agent, "_identify", identify)
     asyncio.run(agent._ensure_ready())
     assert announced == [("", config)] and config["capabilities"] == [] and asked == 3 and agent._ready
-    # An agent whose agent.json offers services is announced by its adapter instead.
+    # An agent whose agent.json offers services is announced by the connector serving its calls instead.
     (tmp_path / "agent.json").write_text(
         json.dumps(uses_only | {"capabilities": [{"tool": "x", "class": "read_only"}]})
     )
-    assert Agent.from_env()._announcement is None
+    assert use_only_app().state.ekl_agent._announcement is None
 
 
-def test_an_attached_agent_started_before_it_is_confirmed_reads_its_events_once_it_is(
+def test_an_agent_started_before_it_is_confirmed_reads_its_events_once_it_is(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The guide's order: start the server, then confirm the agent. Its adapter announces it, so the agent itself has
+    # The guide's order: deploy, then confirm the agent. Its connector announces it, so the agent's side has
     # nothing to announce; until it is active it may read itself but not subscribe, so it waits, then subscribes and
     # reads, instead of ending its event loop on the first refusal.
     monkeypatch.setattr("ekl_provider_adapter.agent.ACTIVE_POLL_SECONDS", 0.01)
@@ -728,11 +667,11 @@ def test_an_attached_agent_started_before_it_is_confirmed_reads_its_events_once_
     assert len(reads) == 3 and agent._ready and subscribed == [{"topics": ["currency"]}]
 
 
-def test_the_use_only_connector_announces_an_app_that_offers_nothing(
+def test_the_use_only_connector_announces_an_agent_that_offers_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # A TypeScript app that only uses services runs the connector with --use-only: nothing else announces its agent,
-    # so the connector announces the app's own agent.json, as Agent.from_env does for a Python script.
+    # An agent that only uses services runs the connector with --use-only: nothing else announces it, so the
+    # connector announces its own agent.json.
     uses_only = {
         "ekl": "1.0",
         "mode": "active_participant",
@@ -745,7 +684,6 @@ def test_the_use_only_connector_announces_an_app_that_offers_nothing(
     monkeypatch.setenv("EKL_AGENT_FILE", str(tmp_path / "agent.json"))
     monkeypatch.setenv("EKL_AGENT_CREDENTIAL", "ekla_test")
     monkeypatch.setenv("EKL_PROVIDER_CREDENTIAL", "eklp_test")
-    monkeypatch.delenv("EKL_CALLBACK_URL", raising=False)
     own = use_only_app().state.ekl_agent
     assert own._announcement is not None and own._announcement[1]["agent"]["handle"] == "@order-desk"
     # Without the agent credential it takes no part, and announces nothing.
@@ -778,11 +716,11 @@ def _confirmed_on_read(fake: FakeNetwork, read: int) -> list[int]:
     return reads
 
 
-def test_a_script_s_first_action_announces_the_agent_and_waits_to_be_confirmed(
+def test_the_first_action_announces_the_agent_and_waits_to_be_confirmed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # No run(): a script on a laptop only calls services. Its first action announces agent.json, waits until the
-    # publisher confirms the agent, then acts.
+    # An agent that only uses services: its first action announces agent.json, waits until the publisher confirms
+    # the agent, then acts.
     monkeypatch.setattr("ekl_provider_adapter.agent.ACTIVE_POLL_SECONDS", 0.01)
     fake = FakeNetwork()
     fake.provider("@vat", "cap_vat_check", lambda _: {"valid": True}, summary="validate vat")
@@ -792,66 +730,20 @@ def test_a_script_s_first_action_announces_the_agent_and_waits_to_be_confirmed(
     agent._announcement = (announcer, {"agent": {"handle": "@ap-inbox"}, "capabilities": []})  # type: ignore[assignment]
     agent._announced_on = fake
     [candidate] = agent.find("validate vat")
-    assert agent.use(candidate).call({"vat_number": "DE1"}).value == {"valid": True}
+    assert use(agent, candidate).call({"vat_number": "DE1"}).value == {"valid": True}
     assert announcer.announced == [""] and len(reads) == 3  # announced once, with no address
 
 
-def test_run_once_reads_what_waits_retries_a_failing_callback_and_returns(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # A run on a schedule handles everything waiting in one go, retrying a callback that fails within the run, and
-    # declares its interval.
-    monkeypatch.setattr("ekl_provider_adapter.agent.RETRY_SECONDS", 0)
-    fake = FakeNetwork()
-    agent = _agent(fake, tmp_path)
-    tries: list[str] = []
-
-    @agent.on_message
-    def flaky(message: Any) -> None:
-        tries.append(str(message.text))
-        if str(message.text) == "second" and tries.count("second") < 3:
-            raise TimeoutError("the mail server was slow")
-
-    for text in ("first", "second", "third"):
-        fake.message("@peer", text)
-    assert agent.run_once(check_in_seconds=900) == 3
-    assert tries == ["first", "second", "second", "second", "third"] and not fake.failed
-    assert fake.reads and all(r == {"check_in_seconds": 900} for r in fake.reads)
-    assert agent.run_once() == 0  # nothing waits any more
-
-
-def test_run_once_for_an_agent_not_yet_confirmed_reads_nothing(tmp_path: Path) -> None:
-    fake = FakeNetwork()
-    fake.state = "review"
-    agent = _agent(fake, tmp_path)
-    agent._announcement = (_Announcer(), {"agent": {"handle": "@ap-inbox"}, "capabilities": []})  # type: ignore[assignment]
-    agent._announced_on = fake
-    fake.message("@peer", "hello")
-    with pytest.raises(NotConfirmed) as refused:
-        agent.run_once()
-    assert "ekl agent confirm @ap-inbox" in str(refused.value) and fake.reads == []
-
-
-def test_run_once_while_another_copy_reads_returns_at_once(tmp_path: Path) -> None:
-    fake = FakeNetwork()
-    agent = _agent(fake, tmp_path)
-    handled: list[Any] = []
-    agent.on_message(handled.append)
-    fake.message("@peer", "hello")
-    fake._tool_events_next = lambda **_: {"events": [], "next_cursor": 0, "lease": {"held": False}}  # type: ignore[method-assign]
-    assert agent.run_once() == 0 and handled == []
-
-
 def test_a_grant_that_lapsed_unused_is_reserved_again_once(tmp_path: Path) -> None:
-    # The laptop slept between the provider's approval and the call: nothing ran under the first grant, so the run is
+    # The laptop slept between the reservation and the call: nothing ran under the first grant, so the run is
     # reserved again as a new execution of the same logical intent, under the same idempotency key.
     fake = FakeNetwork()
     vat = fake.provider("@vat", "cap_vat_check", lambda _: {"valid": True}, price="0.10", summary="validate vat")
     journal = AgentJournal(str(tmp_path / "journal.db"))
     agent = Agent(fake, journal)
     [candidate] = agent.find("validate vat")
-    fake.approval = "lapse"
-    result = agent.use(candidate).call({"vat_number": "DE1"}, idempotency_key="supplier-7")
+    fake.lapse = True
+    result = use(agent, candidate).call({"vat_number": "DE1"}, idempotency_key="supplier-7")
     first, second = fake.reserved
     assert second["logical_intent_id"] == first["execution_id"] != second["execution_id"]
     assert result.execution_id == second["execution_id"] and vat.calls == 1
@@ -867,21 +759,43 @@ def test_a_grant_that_lapses_twice_is_not_retried_again(tmp_path: Path) -> None:
     own = fake._tool_execution_reserve
 
     def always_lapses(execution_id: str, **request: Any) -> dict[str, Any]:
-        fake.approval = "lapse"
+        fake.lapse = True
         return own(execution_id, **request)
 
     fake._tool_execution_reserve = always_lapses  # type: ignore[method-assign]
-    with pytest.raises(RunNotApproved) as lapsed:
-        agent.use(candidate).call({"vat_number": "DE1"})
+    with pytest.raises(AgentError) as lapsed:
+        use(agent, candidate).call({"vat_number": "DE1"})
     assert lapsed.value.code == "GRANT_EXPIRED" and len(fake.reserved) == 2 and vat.calls == 0
 
 
-def test_a_program_in_a_terminal_logs_the_agent_not_each_http_request(monkeypatch: pytest.MonkeyPatch) -> None:
-    root = logging.getLogger()
-    monkeypatch.setattr(root, "handlers", [])
-    monkeypatch.setattr(root, "level", logging.WARNING)
-    for name in ("httpx", "httpx2", "httpcore"):
-        monkeypatch.setattr(logging.getLogger(name), "level", logging.NOTSET)
-    _log_to_terminal()
-    assert logging.getLogger("ekl_provider_adapter.agent").isEnabledFor(logging.INFO)
-    assert not any(logging.getLogger(n).isEnabledFor(logging.INFO) for n in ("httpx", "httpx2", "httpcore"))
+def test_a_network_that_no_longer_speaks_ekp_2_is_refused_before_anything_is_done(tmp_path: Path) -> None:
+    fake = FakeNetwork()
+    fake._tool_world_get_contract = lambda: {"protocol": "ekp/3.0", "accepted_protocols": []}  # type: ignore[method-assign]
+    with pytest.raises(AgentError) as refused:
+        _agent(fake, tmp_path).post_need("Validate EU VAT numbers")
+    assert refused.value.code == "PROFILE_UNSUPPORTED" and fake.posts == {}
+
+
+def test_a_retry_of_a_paid_call_that_ran_is_never_run_or_paid_again(tmp_path: Path) -> None:
+    # The same idempotency key after the call finished, from a new process with the same journal: the network returns
+    # the captured reservation, and the run is not reserved again as a new execution.
+    fake = FakeNetwork()
+    fake.wallet = Decimal("5")
+    vat = fake.provider(
+        "@vat",
+        "cap_vat_check",
+        lambda _: {"valid": True},
+        summary="validate vat",
+        plan={"plan_id": "pack-2", "type": "pack", "price": "1.00", "calls": 2},
+    )
+    journal = str(tmp_path / "journal.db")
+    [candidate] = Agent(fake, AgentJournal(journal)).find("validate vat")
+    first = use(Agent(fake, AgentJournal(journal)), candidate).call({"vat_number": "DE1"}, idempotency_key="sup-7")
+    assert first.charged == "1.00" and vat.calls == 1
+    with pytest.raises(CallFinished) as finished:
+        use(Agent(fake, AgentJournal(journal)), candidate).call({"vat_number": "DE1"}, idempotency_key="sup-7")
+    assert finished.value.code == "CALL_FINISHED" and finished.value.outcome == "succeeded"
+    assert "charged 1.00" in str(finished.value) and vat.calls == 1 and fake.wallet == Decimal("4")
+    # The pack's second call is still there for the next call.
+    second = use(Agent(fake, AgentJournal(journal)), candidate).call({"vat_number": "DE2"}, idempotency_key="sup-8")
+    assert second.charged == "0.00" and vat.calls == 2 and fake.wallet == Decimal("4")

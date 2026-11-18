@@ -1,21 +1,21 @@
 # Copyright © 2026 EuKreate, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""The connector's agent side, for servers in any language.
+"""The connector's agent side: the agent's events to its callbacks file, and the actions the file starts.
 
-Events go to a route in the publisher's own app (EKL_CALLBACK_URL) as JSON, signed with callback protocol v2
-(callback_signing): the app holds EKL_CALLBACK_KEY, derived from the agent credential, never the credential itself.
-The app answers with what to do: `{"reply": "…"}`, `{"accept": true}`, `{"decline": "…"}`, `{"review": {…}}`,
-`{"skip": true}`, a run's decision, or nothing; a v2 app signs its answer, bound to the request it answers.
+Events go to the agent's eukollab_callbacks.py, which the connector runs beside itself on 127.0.0.1, as JSON signed
+with callback protocol v2 (callback_signing): the file holds EKL_CALLBACK_KEY, derived from the agent credential, never
+the credential itself. The file answers with what to do: `{"reply": "…"}`, `{"accept": true}`, `{"decline": "…"}`,
+`{"review": {…}}`, `{"skip": true}`, or nothing; the file signs its answer, bound to the request it answers.
 
-A decision the app owes (a connection request, a paid run's approval, a reply to a need or a message) is journaled
+A decision the file owes (a connection request, a reply to a need or a message) is journaled
 before it is first delivered, and applied at most once: a failed delivery (no connection, a timeout, a 5xx,
-IN_PROGRESS, or an answer that isn't signed once the app has answered with v2) leaves it pending and it is sent again,
+IN_PROGRESS, or an answer that isn't signed once the file has answered with v2) leaves it pending and it is sent again,
 with the same event ID and the same body, after 2 s, 10 s, 1 min, 5 min and then every 15 min until its deadline. At the
-deadline its default applies: a connection request is declined, a run is left unapproved, nothing is replied. An answer
+deadline its default applies: a connection request is declined, nothing is replied. An answer
 that arrives later is logged and ignored.
 
-For actions the app starts itself (post a need, choose, call a service, or call a declared service with
-`POST /agent/service`), the connector serves the same calls as a small HTTP API on 127.0.0.1 only (local_guard), and
+For actions the callbacks start themselves (post a need, choose, call a service, or call a service the agent plans to
+use with `POST /agent/service`), the connector serves a small HTTP API on 127.0.0.1 only (local_guard), and
 `GET /agent/status` says whether it holds the agent-operation credential.
 """
 
@@ -52,10 +52,9 @@ from ekl_provider_adapter.agent import (
     ReviewDue,
 )
 from ekl_provider_adapter.agent_journal import AgentJournal, PendingDecision
-from ekl_provider_adapter.config import is_loopback, require_https
-from ekl_provider_adapter.errors import AgentError
+from ekl_provider_adapter.config import is_loopback
+from ekl_provider_adapter.errors import AgentError, BalanceLow
 from ekl_provider_adapter.local_guard import LocalGuard
-from ekl_provider_adapter.runs import DecidedElsewhere, RunDecision, RunRequest, Runs
 
 log = logging.getLogger("ekl_provider_adapter.callbacks")
 
@@ -65,7 +64,8 @@ BACKOFF_SECONDS = (2.0, 10.0, 60.0, 300.0, 900.0)
 DEADLINE_CHECK_SECONDS = 30.0
 DELIVERY_TIMEOUT_SECONDS = 30.0
 V2_FLAG = "callback_v2"
-# Each decision kind's final deadline, configurable: connection requests a day, replies an hour. A run's comes with it.
+# Each decision kind's final deadline, configurable: connection requests a day, replies an hour. A console
+# decision's comes with it.
 CONNECTION_HOURS = "EKL_CONNECTION_DECISION_HOURS"
 REPLY_MINUTES = "EKL_REPLY_DECISION_MINUTES"
 REPLY_EVENTS = ("need", "need_answered", "message")
@@ -73,27 +73,21 @@ REPLY_EVENTS = ("need", "need_answered", "message")
 Perform = Callable[[dict[str, Any], dict[str, Any]], Awaitable[None]]
 
 
-def callback_url(url: str) -> str:
-    """EKL_CALLBACK_URL as the connector may use it: events carry other agents' text and decisions, so anywhere but
-    this machine must be HTTPS. The connector refuses to start otherwise."""
-    return url if is_loopback(url) else require_https(url, "EKL_CALLBACK_URL")
-
-
 def _deadline(event: str, request: dict[str, Any], now: float) -> float:
     if event == "connection_request":
         return now + float(os.environ.get(CONNECTION_HOURS) or 24) * 3600
     if event in REPLY_EVENTS:
         return now + float(os.environ.get(REPLY_MINUTES) or 60) * 60
-    given = request.get("approval_deadline") or request.get("deadline")
+    given = request.get("deadline")
     if given:
         with contextlib.suppress(ValueError):
             when = dt.datetime.fromisoformat(str(given).replace("Z", "+00:00"))
             return (when if when.tzinfo else when.replace(tzinfo=dt.UTC)).timestamp()
-    return now + 900  # a run waits at most fifteen minutes
+    return now + 900  # an event without its own deadline waits fifteen minutes
 
 
 class CallbackChannel:
-    """Signed delivery to the publisher's app, and the decisions it owes, journaled.
+    """Signed delivery to the callbacks file, and the decisions it owes, journaled.
 
     `performers` carry an applied answer to the network, by event name; `defaults` what the deadline applies. Both
     take the request as sent and the answer, so a decision picked up after a restart is carried the same way."""
@@ -110,7 +104,10 @@ class CallbackChannel:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         legacy_until: dt.datetime = cb.LEGACY_UNTIL,
     ) -> None:
-        self.url = callback_url(url)
+        if not is_loopback(url):
+            # Events carry other agents' text and decisions: they go only to the callbacks file run on this machine.
+            raise ValueError(f"callbacks run on this machine only, not at {url}")
+        self.url = url
         self._credential = credential
         self._key = cb.callback_key(credential)
         self.journal = journal
@@ -128,7 +125,7 @@ class CallbackChannel:
 
     @property
     def negotiated(self) -> bool:
-        """The app has answered with a valid v2 signature once: from then on only signed answers count."""
+        """The file has answered with a valid v2 signature once: from then on only signed answers count."""
         return self.journal.flag(V2_FLAG) == "true"
 
     def _legacy(self) -> bool:
@@ -140,7 +137,7 @@ class CallbackChannel:
         ).encode()
 
     async def post(self, event_id: str, body: bytes) -> dict[str, Any] | None:  # noqa: PLR0911 - one exit per way a delivery fails
-        """One delivery of exactly these bytes. The app's answer, or None for a failed delivery: unreachable, a
+        """One delivery of exactly these bytes. The file's answer, or None for a failed delivery: unreachable, a
         timeout, a 5xx, IN_PROGRESS, a refusal, or an answer whose signature doesn't hold for this request."""
         agent_id = str(json.loads(body).get("agent_id") or "")
         t = int(self._clock())
@@ -155,14 +152,14 @@ class CallbackChannel:
         try:
             answer = await client.post(self.url, content=body, headers=headers)
         except httpx2.HTTPError as exc:
-            log.warning("event %s not delivered to the app (%s); it is sent again", event_id, type(exc).__name__)
+            log.warning("event %s not delivered to the callbacks (%s); it is sent again", event_id, type(exc).__name__)
             return None
         finally:
             if self._http is None:
                 await client.aclose()
         if answer.status_code >= 300:
             code = "IN_PROGRESS" if answer.status_code == 409 and b"IN_PROGRESS" in answer.content else ""
-            log.warning("event %s: the app answered %s %s; it is sent again", event_id, answer.status_code, code)
+            log.warning("event %s: the callbacks answered %s %s; it is sent again", event_id, answer.status_code, code)
             return None
         signature = answer.headers.get(cb.RESPONSE_HEADER)
         if signature is not None:
@@ -176,17 +173,17 @@ class CallbackChannel:
                 body=answer.content,
                 now=self._clock(),
             ):
-                log.warning("event %s: the app's answer is signed for another request or key; not applied", event_id)
+                log.warning("event %s: the answer is signed for another request or key; not applied", event_id)
                 return None
             if not self.negotiated:
                 self.journal.set_flag(V2_FLAG, "true")
         elif not legacy:
-            log.warning("event %s: the app's answer isn't signed (callback v2); not applied", event_id)
+            log.warning("event %s: the callbacks' answer isn't signed (callback v2); not applied", event_id)
             return None
         else:
             log.warning(
-                "event %s: the app answered without a callback v2 signature; accepted until %s, update its "
-                "callbacks (ekl agent init writes a v2 eukollab_callbacks.py)",
+                "event %s: the callbacks answered without a callback v2 signature; accepted until %s, update its "
+                "callbacks (ekl add writes a v2 eukollab_callbacks.py)",
                 event_id,
                 self._legacy_until.date(),
             )
@@ -203,14 +200,14 @@ class CallbackChannel:
     async def decide(self, event: str, data: dict[str, Any], event_id: str | None = None) -> dict[str, Any] | None:
         """Journal the decision, deliver it once and, on a verified answer, apply it. Returns the applied answer, or
         None while it is pending (retried in the background) or after its deadline."""
-        event_id = event_id or CURRENT_EVENT.get() or f"{event}:{data.get('reservation_id') or data}"
+        event_id = event_id or CURRENT_EVENT.get() or f"{event}:{data}"
         body = self.body_for(event, event_id, data)
         row = self.journal.open_decision(
             event_id, event, body.decode(), cb.digest(body), _deadline(event, data, self._clock())
         )
         retrying = self._retrying.get(event_id)
         if row.state == "pending" and retrying is not None and not retrying.done():
-            return None  # asked again (a run still waiting) while its deliveries go on
+            return None  # asked again while its deliveries go on
         return await self._attempt(row)
 
     async def _attempt(self, row: PendingDecision) -> dict[str, Any] | None:
@@ -304,12 +301,12 @@ class CallbackChannel:
     # --- events that aren't decisions ---------------------------------------------------------------------------
 
     async def ask(self, event: str, data: dict[str, Any]) -> dict[str, Any]:
-        """An event the app is told of without a decision journal (a review period, an approved choice): a failed
+        """An event the callbacks are told of without a decision journal (a review period, an approved choice): a failed
         delivery raises, so the network delivers the event again."""
         event_id = CURRENT_EVENT.get() or event
         answer = await self.post(event_id, self.body_for(event, event_id, data))
         if answer is None:
-            raise AgentError(f"the app didn't take the {event} event; it comes back", code="CALLBACK_FAILED")
+            raise AgentError(f"the callbacks didn't take the {event} event; it comes back", code="CALLBACK_FAILED")
         return answer
 
 
@@ -381,7 +378,7 @@ def bridge(
     http: httpx2.AsyncClient | None = None,
     channel: CallbackChannel | None = None,
 ) -> CallbackChannel:
-    """Register every callback on `agent`, each forwarding its event to the publisher's app over `channel` (made from
+    """Register every callback on `agent`, each forwarding its event to the callbacks file over `channel` (made from
     the URL and the credential when not given) and applying its answer at most once."""
     channel = channel or CallbackChannel(
         url, secret, agent.journal, agent_id=lambda: os.environ.get("EKL_AGENT_ID") or agent.agent_id, http=http
@@ -489,56 +486,9 @@ async def _service(agent: Agent, handle: str, capability_id: str) -> Candidate:
     raise AgentError(f"{handle} offers no {capability_id} you can use.", code="NOT_FOUND")
 
 
-def bridge_runs(
-    runs: Runs,
-    url: str,
-    secret: str,
-    http: httpx2.AsyncClient | None = None,
-    *,
-    journal: AgentJournal | None = None,
-    channel: CallbackChannel | None = None,
-) -> CallbackChannel:
-    """Paid runs waiting for approval go to the publisher's app as `run.approval_requested`, signed like every
-    callback and journaled like every decision, with the run's approval expiry as its deadline. Its answer is the
-    decision: {"decision": "approve", "runs": 500}, {"decision": "payment_needed", "url": …, "amount": …,
-    "description": …}, {"decision": "decline", "reason": …}, or nothing: the payment page in agent.json, or without one
-    a decision later through the local API's /agent/decide_run. A run whose delivery failed stays waiting, delivered
-    again until its deadline; it is never approved by default."""
-    channel = channel or CallbackChannel(url, secret, journal or AgentJournal(), http=http)
-
-    async def carry(request: dict[str, Any], answer: dict[str, Any]) -> None:
-        run = RunRequest.model_validate(request)
-        await runs.apply(run, decision_of(answer) if answer.get("decision") else None)
-
-    channel.performers["run.approval_requested"] = carry
-
-    @runs.on_approval
-    async def approval(run: RunRequest) -> RunDecision | None:
-        await channel.decide("run.approval_requested", run.model_dump(), f"run:{run.reservation_id}")
-        raise DecidedElsewhere
-
-    return channel
-
-
-def decision_of(body: dict[str, Any]) -> RunDecision:
-    """A decision as the publisher's app writes it, in JSON."""
-    kind = str(body["decision"])
-    if kind == "approve":
-        # `until`, an ISO 8601 date-time, gives a standing approval that ends then, as Python's approve(until=) does.
-        until = dt.datetime.fromisoformat(str(body["until"])) if body.get("until") else None
-        return RunDecision.approve(runs=body.get("runs"), until=until, overage=bool(body.get("overage")))
-    if kind == "payment_needed":
-        return RunDecision.payment_needed(
-            str(body["url"]), str(body["amount"]), str(body.get("description", "")), challenge=body.get("challenge")
-        )
-    if kind == "decline":
-        return RunDecision.decline(str(body.get("reason", "")))
-    raise ValueError("decision is approve, payment_needed or decline")
-
-
-def local_api(agent: Agent, runs: Runs | None = None) -> Starlette:
-    """The actions the publisher's app starts itself. Bind it to 127.0.0.1 only: it acts with the agent credential, and
-    LocalGuard refuses anything but the publisher's own programs."""
+def local_api(agent: Agent) -> Starlette:
+    """The actions the agent's callbacks start themselves. Bind it to 127.0.0.1 only: it acts with the agent
+    credential, and LocalGuard refuses anything but the publisher's own programs."""
 
     async def post_need(body: dict[str, Any]) -> dict[str, Any]:
         need = await agent.aio.post_need(body["text"], body.get("topics", []), body.get("budget"))
@@ -572,16 +522,16 @@ def local_api(agent: Agent, runs: Runs | None = None) -> Starlette:
         return await agent.aio.message(body["connection_id"], body["text"])
 
     async def close_agreement(body: dict[str, Any]) -> dict[str, Any]:
-        """use(...).close() for any language: the agreement ends and its review period opens on both sides."""
+        """The agreement for the service ends and its review period opens on both sides."""
         service = await _service(agent, body["handle"], body["capability_id"])
         return await agent.aio.close_agreement(service, str(body.get("outcome") or "completed"))
 
-    # One declared service per need and preference, so the choice made on the first call is reused.
+    # One planned service per need and preference, so the choice made on the first call is reused.
     planned: dict[tuple[str, str | None], PlannedService] = {}
 
     async def service(body: dict[str, Any]) -> dict[str, Any]:
-        """agent.service(need, prefer, sample, expect).call(input) for any language. `expect` is a JSON Schema the
-        output must satisfy, in place of Python's check, since a function can't cross languages."""
+        """A service the agent plans to use (`uses` in eukollab.json): chosen with trials on the first call, preferring
+        `prefer`, then called. `expect` is a JSON Schema the output must satisfy when the provider is chosen."""
         need, prefer, expect = str(body["need"]), body.get("prefer"), body.get("expect")
         if (need, prefer) not in planned:
             check = (lambda out: not any(jsonschema.Draft202012Validator(expect).iter_errors(out))) if expect else None
@@ -593,19 +543,11 @@ def local_api(agent: Agent, runs: Runs | None = None) -> Starlette:
             "execution_id": result.execution_id,
             "charged": result.charged,
             "receipt_checked": result.receipt_checked,
-            "stand_in": result.stand_in,
             "safety_flags": result.safety_flags,
             "provider": declared.main.handle if declared.main else prefer,
         }
 
-    async def decide(body: dict[str, Any]) -> dict[str, Any]:
-        """A paid run's decision made later, for example once the publisher's payment system confirmed it."""
-        if runs is None:
-            raise ValueError("this process approves no runs")
-        return await runs.api.decide(str(body["reservation_id"]), decision_of(body))
-
     actions = {
-        "decide_run": decide,
         "post_need": post_need,
         "find": find,
         "choose": choose,
@@ -616,8 +558,7 @@ def local_api(agent: Agent, runs: Runs | None = None) -> Starlette:
     }
 
     async def status(_: Request) -> Response:
-        # Whether the connector holds the agent-operation credential: a client in another language is live when it
-        # does, even without the credential in its own environment, and never answers from a stand-in then.
+        # Whether the connector holds the agent-operation credential: without it every action is refused.
         return JSONResponse({"live": agent.enabled})
 
     async def run(request: Request) -> Response:
@@ -626,8 +567,11 @@ def local_api(agent: Agent, runs: Runs | None = None) -> Starlette:
             return JSONResponse({"error": "NOT_FOUND"}, status_code=404)
         try:
             return JSONResponse(await action(await request.json()))
+        except BalanceLow as exc:
+            # `detail` carries what the next pack needs (`needed`, `currency`), so the callbacks can tell their person.
+            return JSONResponse({"error": exc.code, "message": str(exc), "detail": exc.detail}, status_code=402)
         except AgentError as exc:
-            return JSONResponse({"error": exc.code, "message": str(exc)}, status_code=409)
+            return JSONResponse({"error": exc.code, "message": str(exc), "detail": exc.detail}, status_code=409)
         except (KeyError, ValueError) as exc:
             return JSONResponse({"error": "INVALID_REQUEST", "message": str(exc)}, status_code=400)
 

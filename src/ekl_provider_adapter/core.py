@@ -420,7 +420,7 @@ class AdapterCore:
         return True
 
     async def _announce_own_address(self, announce: Any) -> bool:
-        """Without a local agent.json (a server with the adapter attached from its agent package): when deployed
+        """Without a local agent.json (a connector serving the confirmed configuration only): when deployed
         with its own address, announce the network's copy under that address, once, as an adapter with a file
         announces its file when it starts. Nothing to do without a given address, or when the copy already has it."""
         own = self._given_endpoint

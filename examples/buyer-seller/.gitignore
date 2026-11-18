@@ -1,0 +1,4 @@
+# The agent folders ekl add writes for the network run: they hold the agents' keys.
+seller-agent/
+buyer-agent/
+.venv/

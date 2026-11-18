@@ -23,17 +23,16 @@ import pytest
 import uvicorn
 from starlette.testclient import TestClient
 
-from ekl_provider_adapter import attach
 from ekl_provider_adapter.agent import Agent
 from ekl_provider_adapter.agent_journal import AgentJournal
 from ekl_provider_adapter.callbacks import local_api
 from ekl_provider_adapter.config import load_agent_file
-from ekl_provider_adapter.connector import _free_or
+from ekl_provider_adapter.connector import _free_or, connector_app
 from ekl_provider_adapter.jcs import MAX_DEPTH, InputTooDeepError, canonical, too_deep
 from ekl_provider_adapter.local_guard import LocalGuard, announce_when_listening
 from ekl_provider_adapter.testing import FakeNetwork
 
-from .test_attach_and_connector import AGENT, CREDENTIAL, confirmed, homes_server, mcp, network_client, served
+from .test_connector import AGENT, CREDENTIAL, InProcess, confirmed, homes_server, mcp, network_client, served
 
 LOCAL = "http://127.0.0.1:8765"
 TEMPLATES = Path(__file__).resolve().parents[2] / "devtools" / "templates" / "python"
@@ -181,53 +180,6 @@ def test_ac259_with_8765_busy_the_app_reaches_the_connector_through_local_api_js
         module.act("find", {"query": "x"})
 
 
-def test_ac261_a_generated_server_keeps_its_own_mcp_private_while_eukollab_calls_work(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    network = confirmed(AGENT)
-    token = network.token("agt_consumer")
-    app = attach(homes_server(), AGENT, credential=CREDENTIAL, api=network_client(network), expose_mcp=False)
-
-    async def go() -> None:
-        async with from_outside(app, token) as http:
-            assert (
-                await http.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "initialize"})
-            ).status_code == 404
-            async with mcp(http, "/ekl") as adapter:
-                assert [t.name for t in (await adapter.list_tools()).tools] == ["search_active_listings"]
-        again = attach(
-            homes_server(), AGENT, credential=CREDENTIAL, api=network_client(network), expose_mcp=False, host="0.0.0.0"
-        )
-        async with served(again, token) as local, mcp(local, "/mcp") as own:
-            # On the same machine (ekl agent sync, the publisher's tests) the server's endpoint still answers.
-            assert "internal_admin" in {t.name for t in (await own.list_tools()).tools}
-
-    asyncio.run(go())
-
-
-def test_ac327_an_existing_deployment_keeps_mcp_with_a_warning_until_the_default_changes(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    network = confirmed(AGENT)
-    monkeypatch.setenv("EKL_EXPOSE_MCP_DEFAULT_OFF_FROM", (dt.date.today() + dt.timedelta(days=30)).isoformat())
-    app = attach(homes_server(), AGENT, credential=CREDENTIAL, api=network_client(network))
-    assert "is private unless attach() passes expose_mcp=True" in caplog.text
-
-    async def status(made: Any) -> int:
-        async with from_outside(made) as http:
-            answer = await http.post(
-                "/mcp",
-                json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
-                headers={"Accept": "application/json, text/event-stream"},
-            )
-            return answer.status_code
-
-    assert asyncio.run(status(app)) != 404
-    monkeypatch.setenv("EKL_EXPOSE_MCP_DEFAULT_OFF_FROM", dt.date.today().isoformat())
-    later = attach(homes_server(), AGENT, credential=CREDENTIAL, api=network_client(network))
-    assert asyncio.run(status(later)) == 404
-
-
 def test_ac274_a_reference_in_an_announced_field_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SECRET", "s3cret")
     with pytest.raises(ValueError, match="SECRET"):
@@ -253,7 +205,7 @@ def test_ac280_a_tool_only_the_network_lists_cannot_be_called() -> None:
         AGENT | {"capabilities": [*AGENT["capabilities"], {"tool": "internal_admin", "class": "read_only"}]}
     )
     token = network.token("agt_consumer")
-    app = attach(homes_server(), AGENT, credential=CREDENTIAL, api=network_client(network), expose_mcp=False)
+    app = connector_app(AGENT, credential=CREDENTIAL, api=network_client(network), upstream=InProcess(homes_server()))
 
     async def go() -> None:
         async with served(app, token) as http, mcp(http, "/ekl") as adapter:
@@ -279,7 +231,7 @@ def test_ac293_input_nested_65_deep_is_refused_and_the_adapter_keeps_serving() -
         canonical(_nested(MAX_DEPTH + 1))
     network = confirmed(AGENT)
     token = network.token("agt_consumer")
-    app = attach(homes_server(), AGENT, credential=CREDENTIAL, api=network_client(network), expose_mcp=False)
+    app = connector_app(AGENT, credential=CREDENTIAL, api=network_client(network), upstream=InProcess(homes_server()))
 
     async def go() -> None:
         async with served(app, token) as http, mcp(http, "/ekl") as adapter:

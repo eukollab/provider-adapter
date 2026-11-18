@@ -1,24 +1,31 @@
-# The buyer-and-seller example on the network, both agents in testing. Fill seller.env and buyer.env as the README
-# says, then: docker compose up --build
+# The buyer-and-seller example on the network, both agents in testing: the seller's MCP server, the connector in front
+# of it (relay mode, so nothing needs a public address) and the buyer's connector (use-only mode), each connector
+# running its agent's eukollab_callbacks.py. Write seller-agent/ and buyer-agent/ with ekl add as the README says,
+# then: docker compose up --build
 services:
+  server:
+    build: .
+    command: ["python", "server.py"]
+    environment:
+      HOST: 0.0.0.0
   seller:
     build: .
-    command: ["uvicorn", "seller:app", "--host", "0.0.0.0", "--port", "8000"]
-    env_file: seller.env
+    command: ["ekl-provider-connector", "--relay"]
+    env_file: seller-agent/.env
     environment:
+      EKL_AGENT_FILE: /agent/agent.json
+      EKL_UPSTREAM_MCP_URL: http://server:8000/mcp
       EKL_JOURNAL: /data/seller.db
-    # The agent.json `ekl agent init` wrote: the adapter announces it at start.
-    volumes: ["seller-journal:/data", "./agent.json:/app/agent.json:ro"]
-    ports: ["8000:8000"]
+    volumes: ["./seller-agent:/agent", "seller-journal:/data"]
+    depends_on: [server]
   buyer:
     build: .
-    command: ["python", "buyer.py"]
-    env_file: buyer.env
+    command: ["ekl-provider-connector", "--use-only"]
+    env_file: buyer-agent/.env
     environment:
+      EKL_AGENT_FILE: /agent/agent.json
       EKL_JOURNAL: /data/buyer.db
-      # The profile `ekl new agent buyer --does use` wrote: the buyer announces it before its first action.
-      EKL_AGENT_FILE: /app/buyer-agent.json
-    volumes: ["buyer-journal:/data", "./buyer/agent.json:/app/buyer-agent.json:ro"]
+    volumes: ["./buyer-agent:/agent", "buyer-journal:/data"]
     depends_on: [seller]
 volumes:
   seller-journal:

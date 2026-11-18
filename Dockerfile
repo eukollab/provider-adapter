@@ -8,7 +8,7 @@
 #   EKL_NETWORK_URL          the network
 #   EKL_UPSTREAM_MCP_URL     the existing server's MCP address, which may carry the server's own token
 #   EKL_ADAPTER_ENDPOINT     this container's public address of /ekl, announced and proved to the network
-#   EKL_AGENT_CREDENTIAL, EKL_CALLBACK_URL  optional: the agent's own side and the publisher's callback route
+#   EKL_AGENT_CREDENTIAL     optional: the agent's own side, with its eukollab_callbacks.py (EKL_CALLBACKS_PY)
 #   EKL_ADAPTER_STORAGE      durable mode's journal store: a postgresql:// URL, or a SQLite file on a volume (/data)
 #   PORT                     default 8000
 # GET /healthz answers 200 for load balancers and container health checks.

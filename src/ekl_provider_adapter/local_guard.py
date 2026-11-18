@@ -5,8 +5,8 @@
 It acts with the agent credential, so a web page the publisher happens to open must never reach it. Browsers send
 `Origin` on cross-site requests and can't send a JSON body cross-site without a preflight, which is refused; a page
 that rebinds its own name to 127.0.0.1 arrives with a foreign Host. Every request therefore needs a loopback Host,
-no Origin, a JSON body of at most 1 MB and, once set, the local token (EKL_LOCAL_TOKEN, which `ekl agent run` and
-`ekl agent deploy` write to .env). No CORS header is ever sent.
+no Origin, a JSON body of at most 1 MB and, once set, the local token (EKL_LOCAL_TOKEN, which `ekl add` writes to
+.env, and `ekl deploy` when it is missing). No CORS header is ever sent.
 
 A connector set up with EKL_LOCAL_TOKEN requires it from the start. One set up before it existed keeps answering
 without it until LOCAL_TOKEN_REQUIRED_FROM, then refuses everything until the token is set.
@@ -73,12 +73,10 @@ class LocalGuard:
     def _token_problem(self, headers: dict[bytes, bytes]) -> str | None:
         if not self.token:
             if self._today() >= required_from():
-                return (
-                    f"the local API needs {TOKEN_VARIABLE} from {required_from()}: run ekl agent run once to write it"
-                )
+                return f"the local API needs {TOKEN_VARIABLE} from {required_from()}: run ekl deploy once to write it"
             if not self._warned:
                 log.warning(
-                    "the local API answers without a token until %s; run ekl agent run once to write %s to .env",
+                    "the local API answers without a token until %s; run ekl deploy once to write %s to .env",
                     required_from(),
                     TOKEN_VARIABLE,
                 )

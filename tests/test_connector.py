@@ -1,7 +1,7 @@
 # Copyright © 2026 EuKreate, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""attach and the connector, end to end over HTTP: a consumer's MCP client, the adapter's endpoint, the server's
-own endpoint, and the fake network served over HTTP so the Provider API client is exercised too."""
+"""The connector, end to end over HTTP: a consumer's MCP client, the connector's endpoint, the existing server
+reached over MCP, and the fake network served over HTTP so the Provider API client is exercised too."""
 
 import asyncio
 import base64
@@ -9,32 +9,28 @@ import contextlib
 import gzip
 import hashlib
 import hmac
-import importlib
 import json
-import os
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
 import httpx2
+import mcp_types as types
 import pytest
 from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server.mcpserver import MCPServer
 from starlette.applications import Starlette
 
-from ekl_provider_adapter import attach, connector
+from ekl_provider_adapter import connector
 from ekl_provider_adapter.api import HttpProviderApi
-from ekl_provider_adapter.attach import local_file
 from ekl_provider_adapter.config import strip_local
 from ekl_provider_adapter.conformance.network import FakeNetwork, ToolRules, http_app
-from ekl_provider_adapter.connector import Upstream, connector_app, upstream_headers
+from ekl_provider_adapter.connector import Upstream, connector_app, local_file, upstream_headers
 from ekl_provider_adapter.core import Settings
 from ekl_provider_adapter.fingerprint import fingerprint, new_salt
 
 pytestmark = pytest.mark.anyio
-# The module, not the function the package exports under the same name.
-ATTACH_MODULE = importlib.import_module("ekl_provider_adapter.attach")
 
 CREDENTIAL = "eklp_test"
 ENDPOINT = "http://127.0.0.1/ekl"
@@ -87,21 +83,46 @@ async def served(app: Starlette, token: str | None) -> AsyncIterator[httpx2.Asyn
             yield http
 
 
+class InProcess(Upstream):
+    """The existing server called in this process, with no transport, for tests that need no MCP session."""
+
+    def __init__(self, server: MCPServer) -> None:
+        super().__init__("http://127.0.0.1/mcp")
+        self.server = server
+
+    async def call(self, tool: str, arguments: dict[str, Any]) -> types.CallToolResult:
+        result = await self.server.call_tool(tool, arguments)
+        assert isinstance(result, types.CallToolResult)
+        return result
+
+    async def tools(self) -> list[types.Tool]:
+        return list(await self.server.list_tools())
+
+
+@contextlib.asynccontextmanager
+async def upstream_of(server: MCPServer) -> AsyncIterator[Upstream]:
+    """The existing server, served over MCP in this process, as the connector reaches it."""
+    app = server.streamable_http_app(host="0.0.0.0", stateless_http=True, json_response=True)
+    async with app.router.lifespan_context(app):
+        http = httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url="http://127.0.0.1")
+        try:
+            yield Upstream("http://127.0.0.1/mcp", http=http)
+        finally:
+            await http.aclose()
+
+
 @contextlib.asynccontextmanager
 async def mcp(http: httpx2.AsyncClient, path: str) -> AsyncIterator[Client]:
     async with Client(streamable_http_client(f"http://127.0.0.1{path}", http_client=http)) as client:
         yield client
 
 
-async def test_attach_serves_the_adapter_beside_the_existing_endpoint() -> None:
+async def test_the_connector_serves_only_what_agent_json_offers_and_proves_its_endpoint() -> None:
     network = confirmed(AGENT)
     token = network.token("agt_consumer")
-    app = attach(homes_server(), AGENT, credential=CREDENTIAL, api=network_client(network), host="0.0.0.0")
-    async with served(app, token) as http:
-        async with mcp(http, "/mcp") as existing:
-            names = {t.name for t in (await existing.list_tools()).tools}
-            assert names == {"search_active_listings", "internal_admin"}  # existing clients see no change
-        async with mcp(http, "/ekl") as adapter:
+    async with upstream_of(homes_server()) as up:
+        app = connector_app(AGENT, credential=CREDENTIAL, api=network_client(network), upstream=up)
+        async with served(app, token) as http, mcp(http, "/ekl") as adapter:
             listed = (await adapter.list_tools()).tools
             assert [t.name for t in listed] == ["search_active_listings"]  # only what agent.json offers
             salt = new_salt()
@@ -118,15 +139,14 @@ async def test_attach_serves_the_adapter_beside_the_existing_endpoint() -> None:
             expected = hmac.new(key, (challenge + ENDPOINT).encode(), hashlib.sha256)
             assert (proven.meta or {})["ekl"]["proof"] == expected.hexdigest()
             assert "proof" not in ((await adapter.list_tools()).meta or {}).get("ekl", {})
-        core = app.state.ekl_core
-        await core.drain()
+            await app.state.ekl_core.drain()
     execution = network.executions[("agt_consumer", "e1")]
     assert execution.state == "completed" and execution.input_fingerprint == fingerprint(salt, arguments)
 
 
 async def test_without_a_token_nothing_reaches_the_network() -> None:
     network = confirmed(AGENT)
-    app = attach(homes_server(), AGENT, credential=CREDENTIAL, api=network_client(network))
+    app = connector_app(AGENT, credential=CREDENTIAL, api=network_client(network), upstream=InProcess(homes_server()))
     async with served(app, None) as http, mcp(http, "/ekl") as adapter:
         meta = {"ekl": {"execution_id": "e1", "salt": new_salt()}}
         result = await adapter.call_tool("search_active_listings", {"area_ref": "x"}, meta=meta)
@@ -135,7 +155,7 @@ async def test_without_a_token_nothing_reaches_the_network() -> None:
 
 async def test_metrics() -> None:
     network = confirmed(AGENT)
-    app = attach(homes_server(), AGENT, credential=CREDENTIAL, api=network_client(network))
+    app = connector_app(AGENT, credential=CREDENTIAL, api=network_client(network), upstream=InProcess(homes_server()))
     async with served(app, None) as http:
         assert (await http.get("/ekl/metrics")).status_code == 401
         found = await http.get("/ekl/metrics", headers={"Authorization": f"Bearer {CREDENTIAL}"})
@@ -155,7 +175,9 @@ async def test_the_adapter_announces_its_file_and_serves_once_confirmed(
     monkeypatch.setenv("EKL_AGENT_FILE", str(file))
     monkeypatch.setenv("PUBLIC_MCP", ENDPOINT)
     fast = Settings(announce_backoff=0.01)
-    app = attach(homes_server(), credential=CREDENTIAL, api=network_client(network), settings=fast, host="0.0.0.0")
+    app = connector_app(
+        credential=CREDENTIAL, api=network_client(network), settings=fast, upstream=InProcess(homes_server())
+    )
     async with served(app, token) as http, mcp(http, "/ekl") as adapter:
         for _ in range(100):
             if network.announcements:
@@ -177,23 +199,10 @@ async def test_the_adapter_announces_its_file_and_serves_once_confirmed(
         await app.state.ekl_core.drain()
 
 
-async def test_without_the_agent_key_attach_is_the_servers_own_app(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Tests, local runs and environments without the key keep the server exactly as it is: no /ekl, nothing
-    announced, and the agent's actions say it isn't enabled."""
-    monkeypatch.delenv("EKL_PROVIDER_CREDENTIAL", raising=False)
-    app = attach(homes_server(), host="0.0.0.0")
-    assert not app.agent.enabled
-    async with served(app, None) as http:
-        async with mcp(http, "/mcp") as own:
-            assert "internal_admin" in [t.name for t in (await own.list_tools()).tools]
-        assert (await http.get("/ekl/metrics")).status_code == 404
-    assert not hasattr(app.state, "ekl_core")
-
-
 async def test_without_agent_json_the_adapter_lists_what_ekl_announced(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """ekl agent sync announced the file from the publisher's machine; the deployed adapter has none. The review's
+    """ekl sync announced the file from the publisher's machine; the deployed adapter has none. The review's
     challenge finds the announced tools and the proof binds the announced endpoint; once confirmed, calls run."""
     for name in ("EKL_AGENT_FILE", "EKL_AGENT_JSON", "EKL_ADAPTER_ENDPOINT"):
         monkeypatch.delenv(name, raising=False)
@@ -201,7 +210,7 @@ async def test_without_agent_json_the_adapter_lists_what_ekl_announced(
     network = FakeNetwork()
     token = network.token("agt_consumer")
     await network.announce(ENDPOINT, strip_local(AGENT))
-    app = attach(homes_server(), credential=CREDENTIAL, api=network_client(network))
+    app = connector_app(credential=CREDENTIAL, api=network_client(network), upstream=InProcess(homes_server()))
     core = app.state.ekl_core
     async with served(app, token) as http, mcp(http, "/ekl") as adapter:
         challenge = "cd" * 32
@@ -218,14 +227,14 @@ async def test_without_agent_json_the_adapter_lists_what_ekl_announced(
 
 
 async def test_a_run_without_its_own_address_never_announces(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A local run with EKL_ADAPTER_ENDPOINT empty, as ekl new agent writes it, announces nothing, even after
-    agent.json changes and though the network knows the deployed address: that address isn't this process's."""
+    """A local run with EKL_ADAPTER_ENDPOINT empty announces nothing, even after agent.json changes and though the
+    network knows the deployed address: that address isn't this process's."""
     network = confirmed(AGENT)
     file = tmp_path / "agent.json"
     file.write_text(json.dumps(AGENT | {"adapter": {"endpoint": "${EKL_ADAPTER_ENDPOINT}"}}))
     monkeypatch.setenv("EKL_AGENT_FILE", str(file))
     monkeypatch.setenv("EKL_ADAPTER_ENDPOINT", "")
-    app = attach(homes_server(), credential=CREDENTIAL, api=network_client(network))
+    app = connector_app(credential=CREDENTIAL, api=network_client(network), upstream=InProcess(homes_server()))
     core = app.state.ekl_core
     await core.load_config()
     assert core.endpoint == ENDPOINT  # the confirmed address still serves the challenge and the path
@@ -237,10 +246,10 @@ async def test_a_run_without_its_own_address_never_announces(tmp_path: Path, mon
     assert network.calls["announce"] == 0 and not network.announcements
 
 
-async def test_an_attached_server_deployed_at_its_own_address_announces_it(
+async def test_a_connector_deployed_at_its_own_address_announces_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A server with the adapter attached from its agent package has no agent.json where it runs. Deployed with
+    """A connector given no agent.json where it runs (ekl sync announced it). Deployed with
     EKL_ADAPTER_ENDPOINT, it announces the network's copy under that address once, for the publisher to review; a
     copy that already has the address, or a run without one, announces nothing."""
     monkeypatch.chdir(tmp_path)
@@ -249,7 +258,9 @@ async def test_an_attached_server_deployed_at_its_own_address_announces_it(
     hosted = "https://unit-converter.example.com/ekl"
     network = confirmed(AGENT)
     monkeypatch.setenv("EKL_ADAPTER_ENDPOINT", hosted)
-    core = attach(homes_server(), credential=CREDENTIAL, api=network_client(network)).state.ekl_core
+    core = connector_app(
+        credential=CREDENTIAL, api=network_client(network), upstream=InProcess(homes_server())
+    ).state.ekl_core
     assert await core.announce_if_changed()
     assert await core.announce_if_changed()
     assert [a["endpoint"] for a in network.announcements] == [hosted]
@@ -257,13 +268,17 @@ async def test_an_attached_server_deployed_at_its_own_address_announces_it(
     assert announced["adapter"]["endpoint"] == hosted
     assert announced["capabilities"] == strip_local(AGENT)["capabilities"]
 
-    again = attach(homes_server(), credential=CREDENTIAL, api=network_client(network)).state.ekl_core
+    again = connector_app(
+        credential=CREDENTIAL, api=network_client(network), upstream=InProcess(homes_server())
+    ).state.ekl_core
     network.confirm()
     assert await again.announce_if_changed()
     assert len(network.announcements) == 1  # the confirmed copy has this address already
 
     monkeypatch.setenv("EKL_ADAPTER_ENDPOINT", "")
-    local = attach(homes_server(), credential=CREDENTIAL, api=network_client(confirmed(AGENT))).state.ekl_core
+    local = connector_app(
+        credential=CREDENTIAL, api=network_client(confirmed(AGENT)), upstream=InProcess(homes_server())
+    ).state.ekl_core
     assert await local.announce_if_changed()
     assert network.calls["announce"] == 1
 
@@ -272,7 +287,9 @@ async def test_announcing_retries_while_the_network_is_unreachable() -> None:
     network = FakeNetwork()
     network.faults.unavailable = True
     fast = Settings(announce_backoff=0.01)
-    app = attach(homes_server(), AGENT, credential=CREDENTIAL, api=network_client(network), settings=fast)
+    app = connector_app(
+        AGENT, credential=CREDENTIAL, api=network_client(network), settings=fast, upstream=InProcess(homes_server())
+    )
     async with served(app, None):
         await asyncio.sleep(0.05)
         assert network.calls["announce"] >= 2 and not network.announcements
@@ -445,36 +462,34 @@ def widget_server() -> MCPServer:
 
 async def test_offered_tools_keep_their_widget_and_only_those_widgets_are_served() -> None:
     """Apps SDK and MCP Apps metadata reaches consumers unchanged, the template a listed tool names can be read, and
-    nothing else of the server's resources can, whether the adapter is attached or a connector."""
+    nothing else of the server's resources can."""
     network = confirmed(AGENT)
     token = network.token("agt_consumer")
-    attached = attach(widget_server(), AGENT, credential=CREDENTIAL, api=network_client(network), host="0.0.0.0")
     upstream_app = widget_server().streamable_http_app(host="0.0.0.0", stateless_http=True, json_response=True)
     async with upstream_app.router.lifespan_context(upstream_app):
         upstream_http = httpx2.AsyncClient(
             transport=httpx2.ASGITransport(app=upstream_app), base_url="http://127.0.0.1"
         )
-        connected = connector_app(
+        app = connector_app(
             AGENT | {"upstream": {"mcp_url": "http://127.0.0.1/mcp"}},
             credential=CREDENTIAL,
             api=network_client(network),
             upstream=Upstream("http://127.0.0.1/mcp", http=upstream_http),
         )
-        for app in (attached, connected):
-            async with served(app, token) as http, mcp(http, "/ekl") as adapter:
-                (tool,) = (await adapter.list_tools()).tools
-                assert tool.meta == {
-                    "openai/outputTemplate": "ui://widget/listings.html",
-                    "openai/widgetAccessible": True,
-                }
-                listed = [str(r.uri) for r in (await adapter.list_resources()).resources]
-                assert listed == ["ui://widget/listings.html"]
-                read = await adapter.read_resource("ui://widget/listings.html")
-                assert read.contents[0].text == "<div id=root></div>"  # type: ignore[union-attr]
-                assert read.contents[0].mime_type == "text/html+skybridge"
-                for hidden in ("ui://widget/admin.html", "file://secrets.txt"):
-                    with pytest.raises(Exception, match="resource not found"):
-                        await adapter.read_resource(hidden)
+        async with served(app, token) as http, mcp(http, "/ekl") as adapter:
+            (tool,) = (await adapter.list_tools()).tools
+            assert tool.meta == {
+                "openai/outputTemplate": "ui://widget/listings.html",
+                "openai/widgetAccessible": True,
+            }
+            listed = [str(r.uri) for r in (await adapter.list_resources()).resources]
+            assert listed == ["ui://widget/listings.html"]
+            read = await adapter.read_resource("ui://widget/listings.html")
+            assert read.contents[0].text == "<div id=root></div>"  # type: ignore[union-attr]
+            assert read.contents[0].mime_type == "text/html+skybridge"
+            for hidden in ("ui://widget/admin.html", "file://secrets.txt"):
+                with pytest.raises(Exception, match="resource not found"):
+                    await adapter.read_resource(hidden)
         await upstream_http.aclose()
 
 
@@ -557,39 +572,16 @@ def test_the_connector_image_needs_no_build_per_agent() -> None:
         "EKL_UPSTREAM_MCP_URL",
         "EKL_ADAPTER_ENDPOINT",
         "EKL_AGENT_CREDENTIAL",
-        "EKL_CALLBACK_URL",
         "EKL_ADAPTER_STORAGE",
         "PORT",
     ):
         assert variable in dockerfile
 
 
-async def test_a_server_whose_agent_json_doesnt_validate_still_serves_its_own_endpoint(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """ekl agent sync reads the running server to fix agent.json, so a bad file must not stop it."""
-    monkeypatch.chdir(tmp_path)
-    for name in ("EKL_AGENT_FILE", "EKL_AGENT_JSON"):
-        monkeypatch.delenv(name, raising=False)
-    paid = {**AGENT["capabilities"][0], "plans": [{"type": "per_call", "currency": "USD", "price": "0.01"}]}
-    (tmp_path / "agent.json").write_text(json.dumps(AGENT | {"capabilities": [paid]}))  # storage_free_accepted missing
-    app = attach(homes_server(), credential=CREDENTIAL, network_url="https://network")
-    assert "agent.json doesn't validate" in caplog.text and "storage_free_accepted" in caplog.text
-    async with app.router.lifespan_context(app):
-        transport = httpx2.ASGITransport(app=app)
-        async with (
-            httpx2.AsyncClient(transport=transport, base_url="http://localhost:8000") as http,
-            Client(streamable_http_client("http://localhost:8000/mcp", http_client=http)) as client,
-        ):
-            assert [t.name for t in (await client.list_tools()).tools]
-
-
 def test_the_connector_runs_the_callbacks_itself(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A deployed connector needs no second service for its callbacks: it runs eukollab_callbacks.py beside itself,
-    sent by ekl agent deploy or found beside agent.json, and only when the agent takes part and no other address is
-    set."""
+    sent by ekl deploy or found beside agent.json, and only when the agent takes part. Events go only to it."""
     script = "import sys, pathlib; pathlib.Path('ran').write_text(' '.join(sys.argv[1:]))\n"
-    monkeypatch.delenv("EKL_CALLBACK_URL", raising=False)
     monkeypatch.delenv("EKL_CALLBACKS_PY", raising=False)
     monkeypatch.delenv("EKL_CALLBACKS_PORT", raising=False)
     (tmp_path / "agent.json").write_text("{}")
@@ -597,27 +589,25 @@ def test_the_connector_runs_the_callbacks_itself(tmp_path: Path, monkeypatch: py
     monkeypatch.delenv("EKL_AGENT_CREDENTIAL", raising=False)
     assert connector.start_callbacks(str(tmp_path / "agent.json")) is None
     monkeypatch.setenv("EKL_AGENT_CREDENTIAL", "ekla_test")
-    child = connector.start_callbacks(str(tmp_path / "agent.json"))
-    assert child is not None and child.wait(timeout=30) == 0
+    started = connector.start_callbacks(str(tmp_path / "agent.json"))
+    assert started is not None and started[0].wait(timeout=30) == 0
     # 8002, or a free port when another agent's callbacks already listen there.
     port = (tmp_path / "ran").read_text().removeprefix("--port ")
-    assert port.isdigit() and os.environ["EKL_CALLBACK_URL"] == f"http://127.0.0.1:{port}/"
-    # Already pointed at the publisher's own app: the file is left alone.
-    assert connector.start_callbacks(str(tmp_path / "agent.json")) is None
-    monkeypatch.delenv("EKL_CALLBACK_URL")
+    assert port.isdigit() and started[1] == f"http://127.0.0.1:{port}/"
+    # A route left in the environment by an earlier version changes nothing: events go only to the file.
+    monkeypatch.setenv("EKL_CALLBACK_URL", "https://app.example.com/ekl-events")
     sent = base64.b64encode(gzip.compress(script.replace("'ran'", "'sent'").encode())).decode()
     monkeypatch.setenv("EKL_CALLBACKS_PY", sent)
-    child = connector.start_callbacks(None)
-    assert child is not None and child.wait(timeout=30) == 0
-    assert (Path(str(child.args[1])).parent / "sent").read_text().startswith("--port ")
+    started = connector.start_callbacks(None)
+    assert started is not None and started[0].wait(timeout=30) == 0
+    assert (Path(str(started[0].args[3])).parent / "sent").read_text().startswith("--port ")
 
 
 def test_callbacks_sent_inline_find_agent_json_beside_them_and_keep_their_store(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`ekl agent run` and every deploy send the callbacks inline: they are unpacked into a fresh folder, with
-    agent.json beside them, as the generated callbacks read it to accept connections and answer needs for the services
-    offered.
+    """`ekl deploy` on this machine sends the callbacks inline: they are unpacked into a fresh folder, with agent.json
+    beside them, as the generated callbacks read it to accept connections and answer needs for the services offered.
     Their record of handled events stays where the connector runs, so a restart doesn't handle an event twice."""
     script = (
         "import json, os, pathlib\n"
@@ -628,13 +618,12 @@ def test_callbacks_sent_inline_find_agent_json_beside_them_and_keep_their_store(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("OUT", str(tmp_path / "seen.json"))
     monkeypatch.setenv("EKL_AGENT_CREDENTIAL", "ekla_test")
-    monkeypatch.delenv("EKL_CALLBACK_URL", raising=False)
     monkeypatch.delenv("EKL_AGENT_FILE", raising=False)
     monkeypatch.delenv("EKL_CALLBACKS_DB", raising=False)
     monkeypatch.setenv("EKL_AGENT_JSON", json.dumps({"capabilities": [{"tool": "convert_length"}]}))
     monkeypatch.setenv("EKL_CALLBACKS_PY", base64.b64encode(gzip.compress(script.encode())).decode())
-    child = connector.start_callbacks(None)
-    assert child is not None and child.wait(timeout=30) == 0
+    started = connector.start_callbacks(None)
+    assert started is not None and started[0].wait(timeout=30) == 0
     caps, db = json.loads((tmp_path / "seen.json").read_text())
     assert caps == [{"tool": "convert_length"}]
     assert Path(db) == tmp_path.resolve() / ".ekl" / "callbacks.db"
@@ -643,16 +632,15 @@ def test_callbacks_sent_inline_find_agent_json_beside_them_and_keep_their_store(
 def test_the_callbacks_child_has_its_own_process_group_so_ctrl_c_reaches_only_the_connector(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Ctrl-C in `ekl agent run` goes to the terminal's process group: the connector stops the callbacks itself, so
-    the child prints no KeyboardInterrupt traceback."""
+    """Ctrl-C in a terminal running the connector goes to its process group: the connector stops the callbacks
+    itself, so the child prints no KeyboardInterrupt traceback."""
     (tmp_path / "agent.json").write_text("{}")
     (tmp_path / connector.CALLBACKS_FILE).write_text(
         "import os, sys\nsys.exit(0 if os.getpgid(0) == os.getpid() else 3)\n"
     )
     monkeypatch.setenv("EKL_AGENT_CREDENTIAL", "ekla_test")
-    monkeypatch.delenv("EKL_CALLBACK_URL", raising=False)
-    child = connector.start_callbacks(str(tmp_path / "agent.json"))
-    assert child is not None and child.wait(timeout=30) == 0
+    started = connector.start_callbacks(str(tmp_path / "agent.json"))
+    assert started is not None and started[0].wait(timeout=30) == 0
 
 
 @pytest.mark.parametrize(
@@ -672,16 +660,3 @@ def test_on_a_host_that_names_its_domain_the_connector_knows_its_address_in_the_
     for name, value in variables.items():
         monkeypatch.setenv(name, value)
     assert connector.hosted_endpoint() == expected
-
-
-async def test_with_ekl_relay_an_attached_server_takes_its_relay_address(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`ekl agent run` in a new agent's folder starts its server with EKL_RELAY=1: no public address, and the
-    endpoint it announces is the relay address the network keeps for it."""
-    relay_url = "https://network.test/v1/relay/agt_homes/mcp"
-    monkeypatch.setenv("EKL_RELAY", "1")
-    monkeypatch.setattr(ATTACH_MODULE, "relay_address_now", lambda *_: relay_url)
-    app = attach(homes_server(), AGENT, credential=CREDENTIAL, api=network_client(confirmed(AGENT)))
-    assert app.state.ekl_core.endpoint == relay_url
-    monkeypatch.delenv("EKL_RELAY")
-    plain = attach(homes_server(), AGENT, credential=CREDENTIAL, api=network_client(confirmed(AGENT)))
-    assert plain.state.ekl_core.endpoint != relay_url

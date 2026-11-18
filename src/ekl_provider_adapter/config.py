@@ -156,13 +156,6 @@ class Defaults(_Open):
     data: CapabilityData | None = None
 
 
-class Payment(_Open):
-    """Where consumers pay the provider for its paid services: its own page, never EuKollab's."""
-
-    link: str
-    note: str | None = None
-
-
 class AgentFile(_Open):
     """agent.json as the adapter reads it. Loading applies the file's defaults to each capability and
     refuses a file whose capabilities miss their requirements, so the adapter never serves one that would."""
@@ -174,7 +167,6 @@ class AgentFile(_Open):
     upstream: Upstream | None = None
     network: Network = Field(default_factory=Network)
     defaults: Defaults = Field(default_factory=Defaults)
-    payment: Payment | None = None
     capabilities: list[Capability]
 
     @model_validator(mode="after")
@@ -208,13 +200,31 @@ def default_repeat(cap: Capability, mode: str) -> Repeat:
     return "refresh"
 
 
+def plan_problem(plan: dict[str, Any]) -> str | None:
+    """What is wrong with one declared plan, or None. Every paid plan is a pack bought from the buyer's wallet."""
+    kind = str(plan.get("type", "free"))
+    if kind in ("per_call", "subscription"):
+        return (
+            f'{kind} plans were removed: use a pack, {{"type": "pack", "price": "…", "calls": 1}} for a price per call '
+            "or more calls for a bundle"
+        )
+    if kind not in ("free", "pack"):
+        return f"plan type {kind} is unknown: use free or pack"
+    if kind == "pack" and not plan.get("price"):
+        return 'a pack needs a price, e.g. {"type": "pack", "price": "8.00", "calls": 500}'
+    return None
+
+
 def _problems(file: AgentFile) -> list[str]:
     found = []
+    if file.model_extra and "payment" in file.model_extra:
+        found.append("payment was removed: buyers pay from their EuKollab wallet, so delete it from agent.json")
     tools = [c.tool for c in file.capabilities]
     if len(tools) != len(set(tools)):
         found.append("each tool may be listed once")
     for cap in file.offered:
         where = f"capability {cap.tool}"
+        found.extend(f"{where}: {problem}" for p in cap.plans or [] if (problem := plan_problem(p)))
         if cap.class_ == "external_action" and file.execution_mode != "durable":
             found.append(f"{where}: external actions need execution_mode durable")
         if cap.class_ == "external_action" and cap.repeat == "refresh":
@@ -328,7 +338,7 @@ class LocalFile:
 
 
 def _inline_terms(config: dict[str, Any], folder: Path) -> dict[str, Any]:
-    """Terms kept in a text file beside agent.json are announced with their text, as `ekl agent sync` announces them:
+    """Terms kept in a text file beside agent.json are announced with their text, as `ekl sync` announces them:
     the network never reads the publisher's files, and an announcement without the text would differ from the
     confirmed version and wait for review again on every start."""
     terms = config.get("terms") or {}

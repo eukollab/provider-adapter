@@ -13,16 +13,12 @@ EuKollab, and, in durable mode, its journal store. It announces agent.json and s
 confirmed. With EKL_AGENT_JSON, one published image runs any agent from environment variables alone. GET /healthz
 answers 200 for load balancers and container services.
 
-With EKL_AGENT_CREDENTIAL the connector also lets the agent take part: events go to EKL_CALLBACK_URL in
-the publisher's app, or, without one, to the publisher's eukollab_callbacks.py, which the connector runs itself
-(start_callbacks), and the agent's actions are served on 127.0.0.1 (EKL_AGENT_API_PORT, default 8765) only.
-`POST /agent/service` there calls a declared service for an app in any language, from its stand-ins until the
-credential is set; `--use-only` runs only that loopback API and the callbacks, for an agent that offers nothing.
-With EKL_STRIPE_WEBHOOK_SECRET, runs paid on the publisher's own Stripe account are approved from its webhook at
-`<path>/stripe` (stripe_webhook); with EKL_STRIPE_KEY instead, from Stripe's Events API, which needs no public address
-(stripe_events).
+With EKL_AGENT_CREDENTIAL the connector also lets the agent take part: it runs the agent's eukollab_callbacks.py
+itself (start_callbacks) and posts the agent's events only to it, and serves the actions the callbacks start on
+127.0.0.1 (EKL_AGENT_API_PORT, default 8765) only, `POST /agent/service` among them for a service the agent plans to
+use. `--use-only` runs only that loopback API and the callbacks, for an agent that offers nothing.
 
-`--relay` (what `ekl agent run` starts) listens on nothing public: the network relays the agent's calls down a stream
+`--relay` (what `ekl deploy` starts) listens on nothing public: the network relays the agent's calls down a stream
 this process keeps open (relay), so the machine needs no public address.
 """
 
@@ -54,30 +50,86 @@ from starlette.requests import Request
 from starlette.responses import PlainTextResponse, Response
 from starlette.routing import Route
 
+from ekl_provider_adapter.agent import Agent
 from ekl_provider_adapter.agent_journal import AgentJournal
 from ekl_provider_adapter.api import HttpProviderApi, ProviderApi
-from ekl_provider_adapter.attach import (
-    AdapterApp,
-    AgentFileSource,
-    agent_for,
-    local_file,
-    runs_for,
-    settings_from_environment,
-    storage_for,
-)
 from ekl_provider_adapter.callback_signing import callback_key
-from ekl_provider_adapter.callbacks import CallbackChannel, bridge, bridge_runs, callback_url, local_api
-from ekl_provider_adapter.config import DEFAULT_NETWORK_URL, inline_agent_file, require_https
+from ekl_provider_adapter.callbacks import CallbackChannel, bridge, local_api
+from ekl_provider_adapter.config import DEFAULT_NETWORK_URL, AgentFile, LocalFile, inline_agent_file, require_https
 from ekl_provider_adapter.core import AdapterCore, Hooks, Settings
 from ekl_provider_adapter.local_guard import announce_when_listening, local_api_file
+from ekl_provider_adapter.network_client import McpNetwork, Network
 from ekl_provider_adapter.relay import Relay, relay_address
 from ekl_provider_adapter.server import adapter_routes
-from ekl_provider_adapter.storage import Storage
-from ekl_provider_adapter.stripe_events import StripeEvents
-from ekl_provider_adapter.stripe_webhook import stripe_routes
+from ekl_provider_adapter.storage import Storage, open_storage
 
 log = logging.getLogger(__name__)
 CALLBACKS_FILE = "eukollab_callbacks.py"
+# Removed: a route in the publisher's own app that events went to instead of the callbacks file.
+RETIRED_CALLBACK_URL = "EKL_CALLBACK_URL"
+
+AgentFileSource = str | Path | dict[str, Any] | AgentFile
+
+
+def settings_from_environment(
+    local: LocalFile | None, credential: str | None, network_url: str | None
+) -> tuple[str, str]:
+    """The provider credential and network URL: given, else from the environment; the URL falls back to agent.json's
+    `network.url`. Without a credential the connector cannot ask the network to admit anything, so it refuses to
+    start."""
+    found = credential or os.environ.get("EKL_PROVIDER_CREDENTIAL")
+    if not found:
+        raise ValueError("set EKL_PROVIDER_CREDENTIAL to the agent key `ekl add` wrote to .env")
+    network = (
+        network_url or os.environ.get("EKL_NETWORK_URL") or (local.agent.network.url if local else DEFAULT_NETWORK_URL)
+    )
+    return found, require_https(network, "EKL_NETWORK_URL")
+
+
+def local_file(agent_file: AgentFileSource | None) -> LocalFile | None:
+    """The agent.json the connector serves: given, named by EKL_AGENT_FILE, held by EKL_AGENT_JSON, or ./agent.json.
+    One given, named or held must load; without any there is nothing to announce, and the connector serves the
+    confirmed configuration only.
+
+    EKL_AGENT_JSON lets one published connector image serve any agent with no build. It is not watched for changes,
+    unlike a file: a new value arrives only with a redeploy, which starts the connector again."""
+    if agent_file is not None:
+        return LocalFile.read(agent_file)
+    named = os.environ.get("EKL_AGENT_FILE")
+    if named:
+        return LocalFile.read(named)
+    inline = os.environ.get("EKL_AGENT_JSON")
+    if inline:
+        return LocalFile.read(inline_agent_file(inline))
+    if Path("agent.json").is_file():
+        return LocalFile.read("agent.json")
+    log.warning("no agent.json here, and neither EKL_AGENT_FILE nor EKL_AGENT_JSON is set: nothing to announce")
+    return None
+
+
+def storage_for(local: LocalFile | None, storage: Storage | None) -> Storage | None:
+    """A store given, or named by agent.json or EKL_ADAPTER_STORAGE; durable mode needs one."""
+    if storage is not None:
+        return storage
+    url = (local.agent.adapter.storage if local else None) or os.environ.get("EKL_ADAPTER_STORAGE")
+    return open_storage(url) if url else None
+
+
+def agent_for(network_url: str, network: Network | None, storage_url: str | None) -> Agent:
+    """The agent's own side, turned on only by the agent-operation credential. The provider credential is never used
+    for it, so a leaked provider credential still cannot post, connect or spend."""
+    credential = os.environ.get("EKL_AGENT_CREDENTIAL")
+    if network is None and not credential:
+        return Agent(None)
+    # A durable Postgres store is shared by every copy, so the agent's journal lives there too.
+    shared = storage_url if storage_url and storage_url.startswith(("postgresql://", "postgres://")) else None
+    return Agent(network or McpNetwork(network_url, str(credential)), AgentJournal(shared))
+
+
+class AdapterApp(Starlette):
+    """The connector's public app. `agent` is the agent's own side."""
+
+    agent: Agent
 
 
 UPSTREAM_HEADERS = "EKL_UPSTREAM_HEADERS"
@@ -167,10 +219,6 @@ class Upstream:
             return await client.read_resource(uri)
 
 
-def _shared(storage_url: str | None) -> bool:
-    return bool(storage_url and storage_url.startswith(("postgresql://", "postgres://")))
-
-
 def connector_app(
     agent_file: AgentFileSource | None = None,
     *,
@@ -182,12 +230,13 @@ def connector_app(
     upstream: Upstream | None = None,
     upstream_url: str | None = None,
     settings: Settings | None = None,
-    callback_url: str | None = None,
-    runs_api: Any | None = None,
+    callbacks: str | None = None,
+    agent_network: Network | None = None,
 ) -> AdapterApp:
     """The connector's public app: the adapter endpoint in front of the upstream server, plus /healthz. With
-    EKL_AGENT_CREDENTIAL and a callback URL it also runs the agent's own side, posting events to the publisher's
-    app. Arguments override the environment; tests pass their own api, upstream and storage."""
+    EKL_AGENT_CREDENTIAL it also runs the agent's own side, posting events to the callbacks file it runs at
+    `callbacks` (start_callbacks). Arguments override the environment; tests pass their own api, upstream, storage
+    and network."""
     local = local_file(agent_file)
     url = (
         upstream_url
@@ -216,23 +265,16 @@ def connector_app(
 
     routes = [Route("/healthz", healthz, methods=["GET"]), *routes]
     storage_url = (local.agent.adapter.storage if local else None) or os.environ.get("EKL_ADAPTER_STORAGE")
-    own = agent_for(found_network, None, None, storage_url)
-    callback = callback_url or os.environ.get("EKL_CALLBACK_URL")
-    runs = runs_for(core, local, runs_api, found_network, found_credential)
+    own = agent_for(found_network, agent_network, storage_url)
     channel: CallbackChannel | None = None
-    if callback:
-        # One channel for the agent's events and the paid runs: one journal of decisions, one v2 negotiation.
+    if callbacks and own.enabled:
         channel = CallbackChannel(
-            callback,
+            callbacks,
             os.environ.get("EKL_AGENT_CREDENTIAL") or found_credential,
-            own.journal if own.enabled else AgentJournal(storage_url if _shared(storage_url) else None),
+            own.journal,
             agent_id=lambda: os.environ.get("EKL_AGENT_ID") or own.agent_id,
         )
-        if own.enabled:
-            bridge(own, callback, "", channel=channel)
-        # Paid runs are approved by the publisher's app, in any language, before the run's approval expiry; an empty
-        # answer sends the consumer to agent.json's payment page, and no answer leaves the run waiting.
-        bridge_runs(runs, callback, "", channel=channel)
+        bridge(own, callbacks, "", channel=channel)
 
     @contextlib.asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
@@ -242,37 +284,28 @@ def connector_app(
             await own.start()
             if channel is not None:
                 await channel.start()
-            watching = asyncio.ensure_future(runs.watch()) if found_credential or runs_api else None
-            stripe_key = os.environ.get("EKL_STRIPE_KEY")
-            paying = asyncio.ensure_future(StripeEvents(runs, stripe_key).watch()) if stripe_key else None
             try:
                 yield
             finally:
-                for task in (watching, paying):
-                    if task is not None:
-                        task.cancel()
                 if channel is not None:
                     await channel.stop()
                 await own.stop()
 
-    stripe = stripe_routes(core.path, runs, os.environ.get("EKL_STRIPE_WEBHOOK_SECRET"))
-    app = AdapterApp(routes=[*routes, *stripe], lifespan=lifespan)
+    app = AdapterApp(routes=routes, lifespan=lifespan)
     app.state.ekl_core = core
     app.agent = own
-    app.runs = runs
     return app
 
 
-def use_only_app(callback_url: str | None = None) -> Starlette:
-    """The connector for an agent that offers nothing: no upstream and no public endpoint, only the
-    agent's events posted to the app and its actions on the loopback API. Without EKL_AGENT_CREDENTIAL the declared
-    services answer from their stand-ins."""
+def use_only_app(callbacks: str | None = None, agent_network: Network | None = None) -> Starlette:
+    """The connector for an agent that offers nothing: no upstream and no public endpoint, only the agent's events
+    posted to the callbacks file it runs at `callbacks` and their actions on the loopback API. Without
+    EKL_AGENT_CREDENTIAL every action is refused with AGENT_NOT_ENABLED."""
     network = require_https(os.environ.get("EKL_NETWORK_URL") or DEFAULT_NETWORK_URL, "EKL_NETWORK_URL")
-    own = agent_for(network, None, None, os.environ.get("EKL_ADAPTER_STORAGE"))
-    if own.enabled:
+    own = agent_for(network, agent_network, os.environ.get("EKL_ADAPTER_STORAGE"))
+    if own.enabled and agent_network is None:
         own.announce_itself(network)
-    callback = callback_url or os.environ.get("EKL_CALLBACK_URL")
-    channel = bridge(own, callback, os.environ.get("EKL_AGENT_CREDENTIAL", "")) if own.enabled and callback else None
+    channel = bridge(own, callbacks, os.environ.get("EKL_AGENT_CREDENTIAL", "")) if own.enabled and callbacks else None
     app = local_api(own)
     app.state.ekl_agent = own
 
@@ -302,14 +335,13 @@ def _free_or(port: str) -> str:
         return str(probe.getsockname()[1])
 
 
-def start_callbacks(agent_file: str | None) -> subprocess.Popen[bytes] | None:
-    """The publisher's eukollab_callbacks.py, run beside the connector on 127.0.0.1, so a deployed connector needs
-    no second service for its callbacks. It comes from EKL_CALLBACKS_PY (gzipped and base64-encoded, as
-    `ekl agent deploy` sends it) or is the file beside agent.json. It runs when EKL_CALLBACK_URL names no other
-    place: with the agent credential it answers the agent's events, and with the provider credential alone it still
-    answers paid runs waiting for approval. Its address then becomes EKL_CALLBACK_URL."""
-    credential = os.environ.get("EKL_AGENT_CREDENTIAL") or os.environ.get("EKL_PROVIDER_CREDENTIAL")
-    if os.environ.get("EKL_CALLBACK_URL") or not credential:
+def start_callbacks(agent_file: str | None) -> tuple[subprocess.Popen[bytes], str] | None:
+    """The agent's eukollab_callbacks.py, run beside the connector on 127.0.0.1, so the agent needs no second service
+    anywhere, and the address its events are posted to. It comes from EKL_CALLBACKS_PY (gzipped and base64-encoded,
+    as `ekl deploy` sends it) or is the file beside agent.json. It runs when the agent credential is set: it answers
+    the agent's events."""
+    credential = os.environ.get("EKL_AGENT_CREDENTIAL")
+    if not credential:
         return None
     sent = os.environ.get("EKL_CALLBACKS_PY")
     child_db = os.environ.get("EKL_CALLBACKS_DB")
@@ -328,7 +360,6 @@ def start_callbacks(agent_file: str | None) -> subprocess.Popen[bytes] | None:
         if not path.is_file():
             return None
     port = os.environ.get("EKL_CALLBACKS_PORT") or _free_or("8002")
-    os.environ["EKL_CALLBACK_URL"] = f"http://127.0.0.1:{port}/"
     log.info("running the agent's callbacks (%s) on 127.0.0.1:%s", path.name, port)
     # The callbacks get the key that checks and signs events, never the credentials: code that only answers events
     # can't act as the agent.
@@ -340,8 +371,9 @@ def start_callbacks(agent_file: str | None) -> subprocess.Popen[bytes] | None:
     # Loopback only, its default: the events it receives are signed, but nothing outside needs to reach it. Its own
     # process group: Ctrl-C in the terminal reaches the connector, which stops it quietly on the way out, rather than
     # the child, which would print a KeyboardInterrupt traceback.
-    argv = [sys.executable, str(path), "--port", port]
-    return subprocess.Popen(argv, cwd=path.parent, env=child, process_group=0)
+    # Through callbacks_child, so the callbacks end with this connector however it stops.
+    argv = [sys.executable, "-m", "ekl_provider_adapter.callbacks_child", str(path), "--port", port]
+    return subprocess.Popen(argv, cwd=path.parent, env=child, process_group=0), f"http://127.0.0.1:{port}/"
 
 
 def _agent_text(agent_file: str | None) -> str | None:
@@ -390,16 +422,14 @@ def main() -> None:
     parser.add_argument(
         "--relay",
         action="store_true",
-        help="no public address: the network relays the agent's calls to this process (ekl agent run)",
+        help="no public address: the network relays the agent's calls to this process (ekl deploy)",
     )
     options = parser.parse_args()
     # What the network says about the announced agent.json is logged here, where the publisher deploying it looks.
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    try:
-        if os.environ.get("EKL_CALLBACK_URL"):
-            callback_url(os.environ["EKL_CALLBACK_URL"])
-    except ValueError as problem:
-        sys.exit(f"ekl-provider-connector can't start: {problem}")
+    if os.environ.get(RETIRED_CALLBACK_URL):
+        # A route in the publisher's own app is no longer a place for events: they go only to the callbacks file.
+        log.warning("%s is ignored: events go only to eukollab_callbacks.py; remove it from .env", RETIRED_CALLBACK_URL)
     if not (options.relay or options.use_only or os.environ.get("EKL_ADAPTER_ENDPOINT")) and (
         found := hosted_endpoint()
     ):
@@ -410,31 +440,31 @@ def main() -> None:
     # .ekl/local-api.json.
     private_port = int(_free_or(os.environ.get("EKL_AGENT_API_PORT", "8765")))
     os.environ["EKL_AGENT_API_PORT"] = str(private_port)  # the callbacks this starts call it there
-    callbacks = start_callbacks(options.config)
+    started = start_callbacks(options.config)
     try:
-        serve(options, private_port)
+        serve(options, private_port, started[1] if started else None)
     except ValueError as problem:
         # A setting missing or malformed at start (agent.json naming an unset variable, say): one line saying which,
         # where a host's log shows it, rather than a traceback.
         sys.exit(f"ekl-provider-connector can't start: {problem}")
     finally:
-        if callbacks is not None:
-            callbacks.terminate()
+        if started is not None:
+            started[0].terminate()
 
 
 def quiet_for_a_terminal() -> None:
-    """`ekl agent run` shows the connector in the publisher's terminal: the lines that matter are the announcement and
-    one per relayed call, so the libraries' startup and request lines stay out of it."""
+    """The publisher reads a connector run on their machine (`ekl deploy`) in its log: the lines that matter are the
+    announcement and one per relayed call, so the libraries' startup and request lines stay out of it."""
     for name in ("httpx2", "mcp", "uvicorn.error"):
         logging.getLogger(name).setLevel(logging.WARNING)
 
 
-def serve(options: argparse.Namespace, private_port: int) -> None:
+def serve(options: argparse.Namespace, private_port: int, callbacks: str | None) -> None:
     if options.use_only:
         quiet_for_a_terminal()
         log.info("serving the agent's actions and events on 127.0.0.1:%d (it offers nothing to call)", private_port)
         server = uvicorn.Server(
-            uvicorn.Config(use_only_app(), host="127.0.0.1", port=private_port, log_level="warning")
+            uvicorn.Config(use_only_app(callbacks), host="127.0.0.1", port=private_port, log_level="warning")
         )
 
         async def only() -> None:
@@ -445,14 +475,13 @@ def serve(options: argparse.Namespace, private_port: int) -> None:
         asyncio.run(only())
         return
     if options.relay:
-        asyncio.run(serve_relayed(options, private_port))
+        asyncio.run(serve_relayed(options, private_port, callbacks))
         return
-    app = connector_app(options.config, upstream_url=options.upstream)
+    app = connector_app(options.config, upstream_url=options.upstream, callbacks=callbacks)
     # The agent's actions are served beside the public endpoint, on the loopback interface only.
-    # Without the credential they still run, so declared services answer from their stand-ins.
     public = uvicorn.Server(uvicorn.Config(app, host=options.host, port=options.port, log_level="info"))
     private = uvicorn.Server(
-        uvicorn.Config(local_api(app.agent, app.runs), host="127.0.0.1", port=private_port, log_level="info")
+        uvicorn.Config(local_api(app.agent), host="127.0.0.1", port=private_port, log_level="info")
     )
 
     async def both() -> None:
@@ -465,16 +494,16 @@ def serve(options: argparse.Namespace, private_port: int) -> None:
     asyncio.run(both())
 
 
-async def serve_relayed(options: argparse.Namespace, private_port: int) -> None:
+async def serve_relayed(options: argparse.Namespace, private_port: int, callbacks: str | None) -> None:
     """The connector in relay mode: the agent's relay address is its endpoint, and the app serves the calls the
     network relays instead of listening for them. The loopback API runs as usual; stopping it stops the relay."""
     quiet_for_a_terminal()
     credential, network = settings_from_environment(local_file(options.config), None, None)
     endpoint = await relay_address(network, credential)
     os.environ["EKL_ADAPTER_ENDPOINT"] = endpoint
-    app = connector_app(options.config, upstream_url=options.upstream)
+    app = connector_app(options.config, upstream_url=options.upstream, callbacks=callbacks)
     private = uvicorn.Server(
-        uvicorn.Config(local_api(app.agent, app.runs), host="127.0.0.1", port=private_port, log_level="warning")
+        uvicorn.Config(local_api(app.agent), host="127.0.0.1", port=private_port, log_level="warning")
     )
     log.info("serving the agent's calls through the network's relay at %s", endpoint)
     async with app.router.lifespan_context(app):

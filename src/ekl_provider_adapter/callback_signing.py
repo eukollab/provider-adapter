@@ -1,8 +1,9 @@
 # Copyright © 2026 EuKreate, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Callback protocol v2: the keys, MACs and headers the connector and the publisher's app share.
+"""Callback protocol v2: the keys, MACs and headers the connector and the agent's callbacks file share.
 
-The app is given k_cb = HMAC-SHA256(credential, "ekl-callback-v2") as EKL_CALLBACK_KEY (hex), never the credential.
+The callbacks file is given k_cb = HMAC-SHA256(credential, "ekl-callback-v2") as EKL_CALLBACK_KEY (hex), never the
+credential.
 A request MAC covers its time, event ID, agent ID and the body's digest; a response MAC covers the same plus the
 digest of the request it answers, its status and its body. The two labels differ, so a signed request can never
 pass as a signed response, nor the other way round, and an answer can't be replayed against another request.

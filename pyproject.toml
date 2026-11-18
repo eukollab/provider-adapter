@@ -1,6 +1,6 @@
 [project]
 name = "ekl-provider-adapter"
-version = "0.6.5"
+version = "0.8.0"
 description = "Provider adapter for EuKollab: put an existing MCP server on the network"
 readme = "README.md"
 requires-python = ">=3.13"
@@ -17,7 +17,7 @@ Issues = "https://github.com/eukollab/provider-adapter/issues"
 
 [project.optional-dependencies]
 postgres = ["psycopg[binary]>=3.2"]
-# python-dotenv: projects written by `ekl new` load their .env with it, and their tests run against this package.
+# python-dotenv: the guide's code loads its .env with it, so the dev environment can run it against this package.
 dev = ["pytest>=8.3", "ruff>=0.8", "mypy>=1.13", "vulture>=2.13", "types-jsonschema", "psycopg[binary]>=3.2", "python-dotenv>=1.0"]
 
 [project.scripts]

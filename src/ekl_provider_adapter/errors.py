@@ -27,18 +27,6 @@ class AgentNotEnabled(AgentError):
         )
 
 
-class NotConfirmed(AgentError):
-    """`run_once` for an agent its publisher has not confirmed yet: nothing was read. Confirm it, then run again."""
-
-    def __init__(self, handle: str, state: str):
-        super().__init__(
-            f"{handle} is {state or 'not active'}, so it can't act yet.",
-            code="NOT_CONFIRMED",
-            fix=f"Review and confirm it: ekl agent review {handle}, then ekl agent confirm {handle}.",
-            detail={"state": state},
-        )
-
-
 class CredentialInvalid(AgentError):
     """The agent-operation credential is unknown, revoked, or lacks the scope the action needs."""
 
@@ -51,28 +39,32 @@ class NotAllowed(AgentError):
         return str(self.detail.get("rule", ""))
 
 
-class PaymentNeeded(AgentError):
-    """The provider asked for payment before approving the run, and the run's deadline passed unpaid. Nothing ran and
-    nothing counts against your limits; `payment_link` is the provider's own page, which your publisher was also told
-    about."""
+class BalanceLow(AgentError):
+    """Your wallet can't cover the pack this run would buy. Nothing ran and nothing was held; `needed` is the pack's
+    price and `currency` its currency. A person adds money in Account → Money → Buying, then the call can be made
+    again with the same idempotency_key."""
 
     @property
-    def payment_link(self) -> str:
-        return str((self.detail.get("payment") or {}).get("url") or "")
+    def needed(self) -> str:
+        return str(self.detail.get("needed", ""))
 
-
-class ProviderNotFunded(AgentError):
-    """The provider can't take paid runs right now (its commission wallet is empty). The run didn't start; try later
-    or choose another provider."""
-
-
-class RunNotApproved(AgentError):
-    """The provider declined the run, or did not answer in time. Nothing ran and nothing counts against your limits."""
+    @property
+    def currency(self) -> str:
+        return str(self.detail.get("currency", ""))
 
 
 class OutcomeUnknown(AgentError):
     """The provider has not said how the call ended. Nothing more is charged; call again with the same
     idempotency_key to learn the outcome."""
+
+
+class CallFinished(AgentError):
+    """This idempotency_key's paid call already ran to its end, as `outcome` says, and it is never run again: the
+    provider was paid for it at most once. Its result isn't kept; a new call needs a new idempotency_key."""
+
+    @property
+    def outcome(self) -> str:
+        return str(self.detail.get("outcome", ""))
 
 
 class ProviderUnavailable(AgentError):
@@ -89,25 +81,6 @@ class NoProvider(AgentError):
     def __init__(self, message: str, trials: list[Any]):
         super().__init__(message, code="NO_PROVIDER", fix="Post a need and wait for answers, or widen your rules.")
         self.trials = trials
-
-
-class StandInMissing(AgentError):
-    """No agent-operation credential, and no recorded answer for the declared service."""
-
-    def __init__(self, ref: str | None):
-        if ref is None:
-            super().__init__(
-                "Without an agent-operation credential, a service answers from its stand-in, and none is preferred.",
-                code="STAND_IN_MISSING",
-                fix='Name the service: agent.service("…", prefer="@handle/service"), then record it with ekl try.',
-            )
-            return
-        handle, _, name = ref.partition("/")
-        super().__init__(
-            f"No recorded answer for {ref} in eukollab/fixtures.",
-            code="STAND_IN_MISSING",
-            fix=f"Record one: ekl try {handle} {name} --record (or set EKL_AGENT_CREDENTIAL to call it for real).",
-        )
 
 
 class ChoiceWaiting(AgentError):
@@ -144,15 +117,16 @@ class InputRefused(AgentError):
     """The input or the answer was larger or deeper than the protocol allows (INPUT_TOO_DEEP, RESPONSE_TOO_LARGE)."""
 
 
+# What to do about a refusal whose detail names no fix.
+FIXES = {"BALANCE_LOW": "A person adds money to the wallet in Account → Money → Buying; then call again."}
+
 # The network's error codes, as the exceptions the agent raises.
 BY_CODE: dict[str, type[AgentError]] = {
     "POLICY_DENIED": NotAllowed,
     "FORBIDDEN": NotAllowed,
     "BUDGET_EXCEEDED": NotAllowed,
     "RATE_LIMITED": NotAllowed,
-    "PAYMENT_NEEDED": PaymentNeeded,
-    "PROVIDER_NOT_FUNDED": ProviderNotFunded,
-    "PROVIDER_NO_ANSWER": RunNotApproved,
+    "BALANCE_LOW": BalanceLow,
     "UNAUTHORIZED": CredentialInvalid,
     "SERVICE_UNAVAILABLE": ProviderUnavailable,
     "CONTENT_REFUSED": ContentRefused,
@@ -167,5 +141,5 @@ BY_CODE: dict[str, type[AgentError]] = {
 def from_network(code: str, message: str, detail: dict[str, Any] | None = None) -> AgentError:
     """The exception for a network refusal; a code with no exception of its own raises AgentError with it."""
     kind = BY_CODE.get(code, AgentError)
-    fix = str((detail or {}).get("fix", ""))
+    fix = str((detail or {}).get("fix", "")) or FIXES.get(code, "")
     return kind(message, code=code, fix=fix, detail=detail)

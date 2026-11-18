@@ -23,8 +23,7 @@ from starlette.routing import Route
 from ekl_provider_adapter import callback_signing as cb
 from ekl_provider_adapter.agent import Agent
 from ekl_provider_adapter.agent_journal import AgentJournal
-from ekl_provider_adapter.callbacks import CallbackChannel, bridge, bridge_runs, callback_url
-from ekl_provider_adapter.runs import RunDecision, RunRequest, Runs
+from ekl_provider_adapter.callbacks import CallbackChannel, bridge
 from ekl_provider_adapter.testing import FakeNetwork
 
 CREDENTIAL = "ekla_secret"
@@ -104,35 +103,17 @@ async def _forever(_: float) -> None:
     await asyncio.Event().wait()
 
 
-class FakeRunsApi:
-    def __init__(self) -> None:
-        self.decided: list[tuple[str, str]] = []
-
-    async def decide(self, reservation_id: str, decision: RunDecision) -> dict[str, Any]:
-        self.decided.append((reservation_id, decision.decision))
-        return {}
-
-
-def _run(**fields: Any) -> RunRequest:
-    deadline = (dt.datetime.now(dt.UTC) + dt.timedelta(minutes=15)).isoformat()
-    return RunRequest.model_validate(
-        {
-            "reservation_id": "res_1",
-            "execution_id": "ex_1",
-            "consumer": {"agent_id": "agt_buyer"},
-            "capability_id": "cap_x",
-            "approval_deadline": deadline,
-        }
-        | fields
-    )
-
-
-def _runs(app: App, tmp_path: Path, **options: Any) -> tuple[Runs, FakeRunsApi, CallbackChannel]:
-    api = FakeRunsApi()
-    runs = Runs(api, lambda: None)
+def _decisions(app: App, tmp_path: Path, **options: Any) -> tuple[CallbackChannel, list[str]]:
+    """A channel whose connection requests record the connection each applied answer accepts."""
     channel = _channel(app, tmp_path, **options)
-    bridge_runs(runs, URL, CREDENTIAL, channel=channel)
-    return runs, api, channel
+    accepted: list[str] = []
+
+    async def perform(request: dict[str, Any], answer: dict[str, Any]) -> None:
+        if answer.get("accept"):
+            accepted.append(str(request["connection_id"]))
+
+    channel.performers["connection_request"] = perform
+    return channel, accepted
 
 
 # --- the connector -------------------------------------------------------------------------------------------------
@@ -152,18 +133,18 @@ def test_a_request_carries_a_v2_signature_over_its_exact_body(tmp_path: Path) ->
     assert channel.negotiated
 
 
-def test_ac265_once_negotiated_an_unsigned_approve_leaves_the_run_unapproved(tmp_path: Path) -> None:
-    app = App("signed", "unsigned", answer={"decision": "approve"})
-    runs, api, channel = _runs(app, tmp_path, sleep=_no_sleep)
+def test_ac265_once_negotiated_an_unsigned_accept_leaves_the_request_undecided(tmp_path: Path) -> None:
+    app = App("signed", "unsigned")
+    channel, accepted = _decisions(app, tmp_path, sleep=_no_sleep)
 
     async def go() -> None:
-        await runs.answer(_run(reservation_id="res_first"))  # a signed answer: v2 negotiated
-        await runs.answer(_run(reservation_id="res_second"))  # unsigned now: a failed delivery
+        await channel.decide("connection_request", {"connection_id": "con_first"}, "evt_first")  # v2 negotiated
+        await channel.decide("connection_request", {"connection_id": "con_second"}, "evt_second")  # unsigned: failed
         await channel.stop()
 
     asyncio.run(go())
-    assert api.decided == [("res_first", "approve")]
-    second = channel.journal.decision("run:res_second")
+    assert accepted == ["con_first"]
+    second = channel.journal.decision("evt_second")
     assert second is not None and second.state == "pending"
     assert cb.LEGACY_HEADER.lower() not in app.headers[1]  # no v1 header once negotiated
 
@@ -171,23 +152,20 @@ def test_ac265_once_negotiated_an_unsigned_approve_leaves_the_run_unapproved(tmp
 def test_ac265_a_legacy_peers_unsigned_answer_counts_only_until_the_cutoff(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    before = _runs(App("unsigned", answer={"decision": "approve"}), tmp_path / "a")
-    asyncio.run(before[0].answer(_run()))
-    assert before[1].decided == [("res_1", "approve")]
+    before, accepted_before = _decisions(App("unsigned"), tmp_path / "a")
+    asyncio.run(before.decide("connection_request", {"connection_id": "con_1"}, "evt_1"))
+    assert accepted_before == ["con_1"]
     assert "without a callback v2 signature" in caplog.text
-    after = _runs(
-        App("unsigned", answer={"decision": "approve"}),
-        tmp_path / "b",
-        legacy_until=dt.datetime(2020, 1, 1, tzinfo=dt.UTC),
-        sleep=_no_sleep,
+    after, accepted_after = _decisions(
+        App("unsigned"), tmp_path / "b", legacy_until=dt.datetime(2020, 1, 1, tzinfo=dt.UTC), sleep=_no_sleep
     )
 
     async def go() -> None:
-        await after[0].answer(_run())
-        await after[2].stop()
+        await after.decide("connection_request", {"connection_id": "con_1"}, "evt_1")
+        await after.stop()
 
     asyncio.run(go())
-    assert after[1].decided == []
+    assert accepted_after == []
 
 
 def test_ac266_a_valid_signature_for_another_request_digest_is_not_applied(tmp_path: Path) -> None:
@@ -220,20 +198,20 @@ def test_ac267_two_concurrent_answers_to_one_decision_apply_it_once(tmp_path: Pa
     assert row is not None and row.state == "applied"
 
 
-def test_ac328_a_retry_after_a_timed_out_delivery_gets_the_stored_approve(tmp_path: Path) -> None:
-    app = App("timeout", "signed", answer={"decision": "approve"})
-    runs, api, channel = _runs(app, tmp_path, sleep=_no_sleep)
+def test_ac328_a_retry_after_a_timed_out_delivery_gets_the_stored_answer(tmp_path: Path) -> None:
+    app = App("timeout", "signed")
+    channel, accepted = _decisions(app, tmp_path, sleep=_no_sleep)
 
     async def go() -> None:
-        await runs.answer(_run())
+        await channel.decide("connection_request", {"connection_id": "con_1"}, "evt_1")
         for _ in range(50):
-            if api.decided:
+            if accepted:
                 break
             await asyncio.sleep(0.01)
         await channel.stop()
 
     asyncio.run(go())
-    assert api.decided == [("res_1", "approve")]
+    assert accepted == ["con_1"]
     assert app.bodies[0] == app.bodies[1]  # the retry sends the same bytes under the same event ID
 
 
@@ -297,10 +275,12 @@ def test_the_journal_survives_a_restart_and_picks_up_what_is_pending(tmp_path: P
     assert applied == [{"accept": True}]
 
 
-def test_a_callback_url_off_this_machine_must_be_https() -> None:
-    assert callback_url("http://127.0.0.1:8002/") and callback_url("https://app.example/ekl-events")
-    with pytest.raises(ValueError, match="https"):
-        callback_url("http://app.example/ekl-events")
+def test_events_go_only_to_callbacks_on_this_machine() -> None:
+    journal = AgentJournal(":memory:")
+    assert CallbackChannel("http://127.0.0.1:8002/", "ekla_x", journal).url == "http://127.0.0.1:8002/"
+    for elsewhere in ("https://app.example/ekl-events", "http://app.example/ekl-events"):
+        with pytest.raises(ValueError, match="this machine"):
+            CallbackChannel(elsewhere, "ekla_x", journal)
 
 
 # --- the Python template's receiver ----------------------------------------------------------------------------------
@@ -337,7 +317,7 @@ def _counting(module: ModuleType, answer: dict[str, Any] | None = None) -> list[
         seen.append(event)
         return answer or {"reply": f"answer {len(seen)}"}
 
-    module.CALLBACKS["message"] = on_message
+    module.on_message = on_message
     return seen
 
 
@@ -417,7 +397,7 @@ def test_ac330_two_simultaneous_deliveries_run_the_handler_once(
         release.wait(5)
         return {"reply": "once"}
 
-    module.CALLBACKS["message"] = on_message
+    module.on_message = on_message
     body, headers = _request("evt_1", {"text": "hi"})
     results: list[tuple[int, dict[str, str], bytes]] = []
     first = threading.Thread(target=lambda: results.append(module.receive(body, headers)))
@@ -449,7 +429,7 @@ def test_ac340_a_handler_paused_past_its_lease_is_taken_over_and_commits_nothing
         module.remember("who", "second")
         return {"reply": "second"}
 
-    module.CALLBACKS["message"] = on_message
+    module.on_message = on_message
     body, headers = _request("evt_1", {"text": "hi"})
     results: list[tuple[int, dict[str, str], bytes]] = []
     first = threading.Thread(target=lambda: results.append(module.receive(body, headers)))

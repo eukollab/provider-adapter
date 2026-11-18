@@ -1,24 +1,14 @@
 # Copyright © 2026 EuKreate, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""The agent side of the adapter: the same package that serves other agents' calls lets the agent take
-part itself. It posts needs, answers other agents' needs, chooses a provider by trial, and connects to and calls it.
+"""The agent's own side, run by the connector: it reads the agent's events and hands each to the agent's callbacks
+(callbacks.bridge), and carries out the actions the callbacks start on the local API (callbacks.local_api): post a
+need, find, choose a provider by trial, connect to it and call it, message, close an agreement.
 
-    app = attach(server)                  # serves calls, as before
-    @app.agent.on_need(matching="my_services")
-    def answer(need):
-        need.reply(f"I can do this with {need.matched_service.name}.")
-
-An agent without a server uses `Agent.from_env()`, and runs from any machine that reaches the network, a laptop
-included: kept running with `agent.run()`, as a script whose actions need nothing else, or on a schedule with
-`agent.run_once()`.
-
-Everything runs where the publisher runs it; nothing runs on EuKollab. Events are long-polled from the network in a
-background task, so no inbound route, port or webhook is needed. The adapter never decides what is allowed: every
-action goes through the network, which applies the console's rules and answers a refusal as `NotAllowed`
-. Text written by other agents arrives as `Untrusted` and is never acted on by the adapter itself.
-
-Actions can be called from plain callbacks (which run in a worker thread) and from scripts. Inside an `async`
-callback, await the same action under `agent.aio`, for example `await app.agent.aio.choose(...)`.
+Nothing here is for the publisher's own code: the agent's code is its eukollab_callbacks.py, which the connector
+runs beside itself. Events are long-polled from the network in a background task, so no inbound route, port or
+webhook is needed. The connector never decides what is allowed: every action goes through the network, which applies
+the console's rules and answers a refusal as `NotAllowed`. Text written by other agents arrives as `Untrusted` and is
+never acted on here.
 """
 
 import asyncio
@@ -41,43 +31,33 @@ from typing import Any, TypeVar
 
 import jsonschema
 
-from ekl_provider_adapter import stand_ins
 from ekl_provider_adapter.agent_journal import AgentJournal, OutgoingCall
 from ekl_provider_adapter.api import HttpProviderApi, ProviderApiError
-from ekl_provider_adapter.config import DEFAULT_NETWORK_URL, LocalFile, require_https
+from ekl_provider_adapter.config import LocalFile
 from ekl_provider_adapter.errors import (
     AgentError,
     AgentNotEnabled,
     AgreementPending,
+    CallFinished,
     ChoiceWaiting,
     ConnectionPending,
     ContractChanged,
     CredentialInvalid,
     NoProvider,
-    NotConfirmed,
     OutcomeUnknown,
-    PaymentNeeded,
     ProviderUnavailable,
-    RunNotApproved,
 )
 from ekl_provider_adapter.fingerprint import fingerprint, new_salt
-from ekl_provider_adapter.network_client import McpNetwork, Network, ProviderAnswer
+from ekl_provider_adapter.network_client import Network, ProviderAnswer
 from ekl_provider_adapter.receipts import CallMade, KeySet, ReceiptInvalid, receipt_digest
 from ekl_provider_adapter.receipts import verify as verify_receipt
 from ekl_provider_adapter.screening import Screener
 
 log = logging.getLogger("ekl_provider_adapter.agent")
 ANNOUNCE_RETRY_SECONDS = 10.0
+# The EKP version this package speaks, as world_get_contract names it.
+EKP_PROTOCOL = "ekp/2.0"
 ACTIVE_POLL_SECONDS = 10.0
-
-
-def _log_to_terminal() -> None:
-    """A program run from a terminal shows what the agent is waiting for, not every request the HTTP clients make."""
-    if logging.getLogger().handlers:
-        return
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
-    for name in ("httpx", "httpx2", "httpcore"):
-        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def _own_announcement(network: str) -> tuple[HttpProviderApi, dict[str, Any]] | None:
@@ -458,8 +438,6 @@ class Result:
     # The receipt's salted fingerprints match the arguments sent and the answer received, so the receipt is for
     # this exact work.
     receipt_checked: bool
-    # Answered from a recorded stand-in, without the network.
-    stand_in: bool = False
     # What local screening found in the result: {category, rules_version} each, never the matched text.
     safety_flags: list[dict[str, str]] = field(default_factory=list)
 
@@ -480,8 +458,6 @@ class Agent:
         self.handle = ""
         self.agent_id = ""
         self.config: dict[str, Any] = {}
-        # How long a paid run may wait for its provider's approval, seconds (at most 900).
-        self.approval_wait_seconds = int(os.environ.get("EKL_APPROVAL_WAIT_SECONDS", "300"))
         self._callbacks: dict[str, list[tuple[Callback, dict[str, Any]]]] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._task: asyncio.Task[None] | None = None
@@ -492,7 +468,7 @@ class Agent:
         # for the network it was made with. A test that swaps in a FakeNetwork has nothing to announce.
         self._announcement: tuple[HttpProviderApi, dict[str, Any]] | None = None
         self._announced_on: Network | None = None
-        # Announced (when it announces itself) and active: a script's first action makes it so, as run() does.
+        # Announced (when it announces itself) and active: the first action makes it so.
         self._ready = False
         # Receipts are checked against the network's keys, and results screened here, where they arrive.
         base = getattr(network, "base_url", None)
@@ -503,23 +479,10 @@ class Agent:
             else Screener(None, None)
         )
 
-    @classmethod
-    def from_env(cls) -> "Agent":
-        """An agent without a server: EKL_AGENT_CREDENTIAL, EKL_NETWORK_URL and, optionally, EKL_JOURNAL. Without
-        the credential it is not enabled: services declared with `service(...)` answer from their stand-ins, and
-        every other action raises AgentNotEnabled."""
-        credential = os.environ.get("EKL_AGENT_CREDENTIAL", "")
-        if not credential:
-            return cls(None)
-        network = require_https(os.environ.get("EKL_NETWORK_URL") or DEFAULT_NETWORK_URL, "EKL_NETWORK_URL")
-        agent = cls(McpNetwork(network, credential), AgentJournal())
-        agent.announce_itself(network)
-        return agent
-
     def announce_itself(self, network_url: str) -> None:
         """Without a server, nothing else announces the agent: it announces its own agent.json (EKL_AGENT_FILE, else
         ./agent.json, when that offers no services) with its agent key, before its first action, and waits for its
-        publisher to confirm it. Agent.from_env does this, and so does the connector for an app that offers nothing."""
+        publisher to confirm it. The connector does this for an agent that offers nothing (--use-only)."""
         self._announcement, self._announced_on = _own_announcement(network_url), self.network
 
     @property
@@ -592,7 +555,7 @@ class Agent:
     # --- running ----------------------------------------------------------------------------------------------
 
     def _sync(self, coro: Coroutine[Any, Any, T]) -> T:
-        """Run an action from a plain callback, a worker thread or a script."""
+        """Run an action from a plain callback or a worker thread."""
         try:
             asyncio.get_running_loop()
         except RuntimeError:
@@ -600,14 +563,14 @@ class Agent:
         else:
             coro.close()
             raise AgentError(
-                "Inside an async callback, await the action instead: for example `await app.agent.aio.choose(...)`."
+                "Inside an async callback, await the action instead: for example `await agent.aio.choose(...)`."
             )
         if self._loop is not None and self._loop.is_running():
             return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
         return asyncio.run(coro)
 
     async def start(self) -> None:
-        """Start the event loop in the background (attach's lifespan does this). Without a credential, nothing
+        """Start the event loop in the background (the connector's lifespan does this). Without a credential, nothing
         starts and the adapter behaves exactly as before."""
         if self.network is None or self._task is not None:
             return
@@ -624,60 +587,6 @@ class Agent:
                 await self._task
             self._task = None
 
-    def run(self) -> None:
-        """Run until interrupted: for an agent without a server (`Agent.from_env()`)."""
-        if self.network is None:
-            raise AgentNotEnabled
-        _log_to_terminal()
-
-        async def main() -> None:
-            await self.start()
-            assert self._task is not None
-            await self._task
-
-        with contextlib.suppress(KeyboardInterrupt):
-            asyncio.run(main())
-
-    def run_once(self, check_in_seconds: int | None = None) -> int:
-        """Read what waits, run its callbacks, acknowledge them and return how many were handled: for cron, a CI job or
-        a serverless function. `check_in_seconds` says how often the schedule runs (60 to 86400), which other agents
-        see as this agent's presence. An agent not yet confirmed raises NotConfirmed and reads nothing."""
-        if self.network is None:
-            raise AgentNotEnabled
-        _log_to_terminal()
-        return asyncio.run(self._once(check_in_seconds))
-
-    async def _once(self, check_in_seconds: int | None) -> int:
-        self._loop = asyncio.get_running_loop()
-        await self._ensure_ready(wait=False)
-        await self._subscribe()
-        await self._started()
-        holder = "once-" + secrets.token_hex(8)
-        attempts: dict[str, int] = {}
-        handled = 0
-        while True:
-            page = await self._call(
-                "events_next",
-                limit=50,
-                wait_seconds=0,
-                lease={"holder": holder},
-                handlers=self.handler_names(),
-                check_in_seconds=check_in_seconds,
-            )
-            if not (page.get("lease") or {"held": True}).get("held"):
-                log.info("another copy of the agent is reading its events; nothing read")
-                return handled
-            events = page.get("events") or []
-            if not events:
-                return handled
-            acked, failed, retry = await self._handle_page(events, attempts)
-            if acked is not None:
-                await self._call("events_ack", cursor=acked, failed=failed or None)
-                handled += sum(1 for e in events if int(e["seq"]) <= acked)
-            if retry:
-                # Retried within the run, so one failing event never holds back the rest until the next run.
-                await asyncio.sleep(min(RETRY_SECONDS * max(attempts.values(), default=1), 30))
-
     async def _invoke(self, callback: Callback, *args: Any) -> Any:
         if inspect.iscoroutinefunction(callback):
             return await callback(*args)
@@ -687,30 +596,29 @@ class Agent:
     async def _call(self, tool: str, **arguments: Any) -> dict[str, Any]:
         if self.network is None:
             raise AgentNotEnabled
-        if not self._ready and tool != "agent_get_self":
-            # A script's first action: the agent announces itself and waits to be confirmed, as run() would.
+        if not self._ready and tool not in ("agent_get_self", "world_get_contract"):
+            # The first action: the agent announces itself and waits to be confirmed.
             await self._ensure_ready()
         return await self.network.call(tool, arguments)
 
-    async def _ensure_ready(self, *, wait: bool = True) -> None:
-        """Once per process: an agent that only uses services has no adapter to announce it, so it announces its
-        agent.json itself, with no address, and acts once its publisher confirms it and its checks pass. With `wait`
-        it waits for that; without, a run on a schedule ends at once with NotConfirmed."""
+    async def _ensure_ready(self) -> None:
+        """Once per process: an agent that only uses services has nothing serving calls to announce it, so it
+        announces its agent.json itself, with no address, and acts once its publisher confirms it and its checks
+        pass, waiting for that."""
         if self._ready:
             return
+        await self._check_protocol()
         if self._announcement is None or self.network is not self._announced_on:
-            # Announced by the adapter it is attached to (or not at all): wait here until its publisher confirms it,
+            # Announced by the connector serving it (or not at all): wait here until its publisher confirms it,
             # since an agent waiting for review may read itself but not subscribe, post or read its events.
             state = await self._identify()
             told = False
-            while state != "active" and wait and not self._stopping.is_set():
+            while state != "active" and not self._stopping.is_set():
                 if not told:
-                    log.info("waiting until %s is confirmed: ekl agent confirm %s", self.handle, self.handle)
+                    log.info("waiting until %s is confirmed: ekl status %s --confirm", self.handle, self.handle)
                     told = True
                 await asyncio.sleep(ACTIVE_POLL_SECONDS)
                 state = await self._identify()
-            if not wait and state != "active":
-                raise NotConfirmed(self.handle or "the agent", state)
             self._ready = True
             return
         api, config = self._announcement
@@ -719,8 +627,6 @@ class Agent:
             try:
                 answer = await api.announce("", config)
             except ProviderApiError as exc:
-                if not wait:
-                    raise ProviderUnavailable(f"Could not announce agent.json: {exc}", code="UNAVAILABLE") from exc
                 log.warning("could not announce agent.json yet: %s", exc)
                 await asyncio.sleep(ANNOUNCE_RETRY_SECONDS)
                 continue
@@ -733,17 +639,27 @@ class Agent:
             if state == "active":
                 self._ready = True
                 return
-            if not wait:
-                raise NotConfirmed(handle, state)
             if not told:
-                log.info(
-                    "waiting until %s is confirmed: ekl agent review %s, then ekl agent confirm %s",
-                    handle,
-                    handle,
-                    handle,
-                )
+                log.info("waiting until %s is confirmed: ekl status %s --confirm", handle, handle)
                 told = True
             await asyncio.sleep(ACTIVE_POLL_SECONDS)
+
+    async def _check_protocol(self) -> None:
+        """Refuse to act on a network that no longer speaks this package's protocol: 2.0 replaced 1.x outright, and
+        a paid run under another version's rules would be refused anyway, one call at a time."""
+        try:
+            contract = await self._call("world_get_contract")
+        except AgentError:
+            return  # not answered now: identifying the agent next reports an unreachable network
+        spoken = {contract.get("protocol")} | {
+            str(p.get("protocol")) for p in contract.get("accepted_protocols") or [] if isinstance(p, dict)
+        }
+        if contract.get("protocol") and EKP_PROTOCOL not in spoken:
+            raise AgentError(
+                f"The network speaks {contract.get('protocol')}, not {EKP_PROTOCOL}.",
+                code="PROFILE_UNSUPPORTED",
+                fix="Install the provider adapter version that speaks it, from EuKollab's Downloads.",
+            )
 
     async def _identify(self) -> str:
         me = await self._call("agent_get_self")
@@ -864,7 +780,7 @@ class Agent:
 
     async def _dispatch(self, event: dict[str, Any]) -> None:
         kind, data = str(event["type"]), dict(event.get("data") or {})
-        # The callbacks run under this event's ID, so a bridge to the publisher's app can journal and sign by it.
+        # The callbacks run under this event's ID, so the bridge to the callbacks file can journal and sign by it.
         CURRENT_EVENT.set(str(event["event_id"]))
         for callback, _ in self._callbacks.get(f"event:{kind}", []):
             await self._invoke(callback, Event(kind, str(event["event_id"]), str(event.get("resource_id", "")), data))
@@ -972,7 +888,7 @@ class Agent:
                 raise
             log.info("review of %s (%s) not submitted: %s", due.collaboration_id, due.period, exc.code)
 
-    # --- actions, for plain callbacks and scripts --------------------------------------------------------------
+    # --- actions, for plain callbacks --------------------------------------------------------------------------
 
     def post_need(
         self, text: str, topics: Iterable[str] = (), budget: str | None = None, expires_days: int = 14
@@ -1014,55 +930,15 @@ class Agent:
         check: Callable[[Any], bool] | None = None,
         data_class: str = "public",
     ) -> "PlannedService":
-        """Declare a service the agent will use. With the agent-operation credential, the first call
-        chooses a provider with trials, trying `prefer` ("@handle/service") first when it is eligible and taking it
-        when it passes, and later calls reuse the choice. Without it, calls answer from the stand-in
-        `ekl try --record` saved for `prefer`, marked as such. `ekl agent sync` writes the declaration into agent.json
-        as `uses`."""
+        """A service the agent plans to use. The first call chooses a provider with trials, trying `prefer`
+        ("@handle/service") first when it is eligible and taking it when it passes, and later calls reuse the
+        choice."""
         return PlannedService(self, need, prefer, sample, check, _data_class(data_class))
-
-    def use(
-        self, service: Candidate, criteria: Callable[[Any], bool] | None = None, data_class: str = "public"
-    ) -> "ServiceHandle":
-        """A handle on another agent's service. Connecting and agreeing terms happen on the first call. `criteria`
-        judges every call's result for its report; without criteria a call is reported not assessed."""
-        if self.network is None:
-            raise AgentNotEnabled
-        return ServiceHandle(self, service, criteria, _data_class(data_class))
-
-
-class ServiceHandle:
-    """Another agent's service, ready to call."""
-
-    def __init__(
-        self,
-        agent: Agent,
-        service: Candidate,
-        criteria: Callable[[Any], bool] | None = None,
-        data_class: str = "public",
-    ):
-        self.agent, self.service, self.criteria, self.data_class = agent, service, criteria, data_class
-
-    def call(
-        self,
-        arguments: dict[str, Any],
-        criteria: Callable[[Any], bool] | None = None,
-        idempotency_key: str | None = None,
-    ) -> Result:
-        judge = criteria if criteria is not None else self.criteria
-        return self.agent._sync(
-            self.agent.aio.call(self.service, arguments, judge, idempotency_key, data_class=self.data_class)
-        )
-
-    def close(self, outcome: str = "completed") -> dict[str, Any]:
-        """Close the agreement for this service as completed or cancelled. Closing opens its review period: both
-        sides receive review.requested (on_review_due). The connection stays; a later call agrees terms again."""
-        return self.agent._sync(self.agent.aio.close_agreement(self.service, outcome))
 
 
 class PlannedService:
-    """A service the agent declared with `agent.service(...)`: chosen on its first call, reused after, and answered
-    from its stand-in while the agent has no credential."""
+    """A service the agent plans to use (`uses` in eukollab.json), called with the local API's `service`: chosen on
+    its first call and reused after."""
 
     def __init__(
         self,
@@ -1110,7 +986,7 @@ def _plan(agreement: dict[str, Any], terms: dict[str, Any]) -> dict[str, Any]:
 
 
 def _paid(agreement: dict[str, Any], terms: dict[str, Any]) -> bool:
-    """Whether the agreement's runs are paid: its plan is not free. Every paid run waits for the provider's approval."""
+    """Whether the agreement's runs are paid from the wallet: its plan is not free."""
     plan = _plan(agreement, terms)
     if plan.get("type"):
         return str(plan["type"]) != "free"
@@ -1120,14 +996,12 @@ def _paid(agreement: dict[str, Any], terms: dict[str, Any]) -> bool:
 ATOMS = Decimal(1_000_000)
 
 
-def _most_atoms(agreement: dict[str, Any], terms: dict[str, Any]) -> int:
-    """The most one run under the plan can cost, in atoms: its unit price, or the overage price where higher."""
+def _pack_atoms(agreement: dict[str, Any], terms: dict[str, Any]) -> int:
+    """What one run may hold, in atoms: the agreed pack's whole price, since a run with no call left buys the next
+    pack. A price_per_call agreement is a pack of one call at that price."""
     plan = _plan(agreement, terms)
     price = _amount(str(plan.get("price") or agreement.get("price_per_call") or terms.get("price_per_call") or "0"))
-    calls = plan.get("calls") if plan.get("type") == "pack" else plan.get("included_calls")
-    unit = price / Decimal(int(calls)) if plan.get("type") in ("pack", "subscription") and calls else price
-    overage = _amount(str(plan.get("overage_price") or "0"))
-    return int((max(unit, overage) * ATOMS).to_integral_value(rounding="ROUND_CEILING"))
+    return int((price * ATOMS).to_integral_value(rounding="ROUND_CEILING"))
 
 
 def _amount(text: str) -> Decimal:
@@ -1186,9 +1060,17 @@ class _Actions:
     # connections and messages
 
     async def respond(self, connection_id: str, accept: bool, note: str) -> dict[str, Any]:
-        return await self._call(
-            "connection_respond", connection_id=connection_id, decision="accept" if accept else "decline", note=note
-        )
+        """Accept or decline a connection request. One already answered (by a console rule, say, while the callbacks
+        were starting) is settled, not a failure: retrying it would only fail again."""
+        try:
+            return await self._call(
+                "connection_respond", connection_id=connection_id, decision="accept" if accept else "decline", note=note
+            )
+        except AgentError as exc:
+            if exc.code != "INVALID_STATE":
+                raise
+            log.info("connection %s was answered already: %s", connection_id, exc)
+            return {"connection_id": connection_id, "already_answered": True}
 
     async def message(self, connection_id: str, text: str) -> dict[str, Any]:
         return await self._call("message_send", connection_id=connection_id, body=text, kind="message")
@@ -1528,9 +1410,9 @@ class _Actions:
         }
         if terms.get("hash"):
             ekl["terms_hash"] = terms["hash"]
-        unit_price = None
+        held_price = None
         if _paid(agreement, terms):
-            ekl["execution_grant"], unit_price = await self._grant(
+            ekl["execution_grant"], held_price = await self._grant(
                 recorded, candidate, version, agreement, terms, arguments
             )
             ekl["execution_id"] = recorded.execution_id
@@ -1567,8 +1449,8 @@ class _Actions:
         checked, flags = await self._report(
             key, recorded, candidate, agreement, arguments, answer, outcome, receipt, criteria, (sent_at, answered_at)
         )
-        # A paid run costs its reservation's unit price: a pack's or subscription's agreement records no per-call price.
-        price = unit_price or agreement.get("price_per_call")
+        # A run that bought a pack costs the pack's price, one that took a call of a bought pack nothing more.
+        price = held_price or agreement.get("price_per_call")
         charged = str(receipt.get("amount") or (price if outcome == "succeeded" else "0"))
         self.agent.journal.finish_call(key, {"status": outcome, "charged": charged, "receipt_checked": checked})
         if answer.is_error:
@@ -1649,14 +1531,13 @@ class _Actions:
     async def call_planned(
         self, planned: PlannedService, arguments: dict[str, Any], idempotency_key: str | None = None
     ) -> Result:
-        """A declared service's call: its stand-in without a credential, else the chosen provider. When the provider
+        """A planned service's call, to the chosen provider. When the provider
         is unavailable, failover follows the service's side-effect class: read-only or safely
         repeatable work goes to the backup once, as a new execution linked to the same key; work that acts outside
         goes to the backup only when the first call is known to have had no effect, and otherwise ends with its
         outcome unknown, to be learnt with the same idempotency_key."""
         if self.agent.network is None:
-            value = stand_ins.answer(planned.prefer, arguments)
-            return Result(value, "stand-in", "0", receipt_checked=False, stand_in=True)
+            raise AgentNotEnabled
         if planned.main is None:
             choice = await self._choose(planned.need, planned.sample, planned.check, None, prefer=planned.prefer)
             if choice.waiting:
@@ -1715,10 +1596,10 @@ class _Actions:
         terms: dict[str, Any],
         arguments: dict[str, Any],
     ) -> tuple[str, str]:
-        """Reserve the paid run and wait for its grant; returns the grant and the run's unit price. A grant that
-        lapsed unredeemed, most often because this machine slept between the approval and the call, ran nothing and
-        charged nothing, so the run is reserved once more as a new execution linked to the same logical intent, under
-        the same idempotency key."""
+        """Reserve the paid run, offering the agreed pack's whole price; returns the grant and what the reservation
+        holds. A grant that lapsed unredeemed, most often because this machine slept between the reservation and the
+        call, ran nothing and charged nothing, so the run is reserved once more as a new execution linked to the same
+        logical intent, under the same idempotency key."""
         intent = ""
         for attempt in range(2):
             reserved = await self._call(
@@ -1733,17 +1614,17 @@ class _Actions:
                     "digest": fingerprint(recorded.salt, arguments),
                 },
                 terms_hash=str(terms.get("hash", "")),
-                requested_max_amount_atoms=str(_most_atoms(agreement, terms)),
+                requested_max_amount_atoms=str(_pack_atoms(agreement, terms)),
                 idempotency_key=recorded.execution_id,
                 logical_intent_id=intent or None,
-                approval_wait_seconds=self.agent.approval_wait_seconds,
             )
+            _not_reserved_again(recorded, reserved)
             try:
-                held = await self._approved(reserved)
-                return str(held["execution_grant"]), _unit_price(held)
+                held = _held(reserved)
+                return str(held["execution_grant"]), _held_price(held)
             except _GrantLapsedError as lapsed:
                 if attempt:
-                    raise RunNotApproved(
+                    raise AgentError(
                         "The run's grant expired again before it was used; nothing ran or was charged.",
                         code="GRANT_EXPIRED",
                         fix=f"Call again with idempotency_key={recorded.idempotency_key!r}.",
@@ -1754,38 +1635,6 @@ class _Actions:
                 self.agent.journal.replace_execution(recorded.idempotency_key, recorded.execution_id)
                 log.info("the grant for %s lapsed unused; reserving the run again as %s", intent, recorded.execution_id)
         raise AssertionError("unreachable")  # the second attempt returns or raises
-
-    async def _approved(self, reserved: dict[str, Any], poll: float = 2.0) -> dict[str, Any]:
-        """The held reservation with the run's execution grant, once its provider approved it. A paid run waits for
-        that approval; when the provider asks for payment first, the network tells this agent's publisher with the
-        provider's link, and the run keeps waiting until it is paid or its deadline passes. Nothing runs or is charged
-        before."""
-        record = reserved
-        while record.get("state") == "awaiting_approval":
-            await asyncio.sleep(poll)
-            record = await self._call("execution_reservation_get", reservation_id=str(reserved["reservation_id"]))
-        if record.get("state") == "held" and record.get("execution_grant") and not _expired(record):
-            return record
-        detail = {"reservation_id": record.get("reservation_id"), "payment": record.get("payment")}
-        # Held with no usable grant, or expired with no decision against it: the grant lapsed before it was used. An
-        # approval deadline that passed always says why, and a payment request names its link.
-        if record.get("state") == "held" or (
-            record.get("state") == "expired" and not record.get("decision_reason") and not record.get("payment")
-        ):
-            raise _GrantLapsedError("the grant lapsed unused", code="GRANT_EXPIRED", detail=detail)
-        reason = str(record.get("decision_reason") or record.get("state") or "")
-        if record.get("payment") and record.get("state") == "expired":
-            raise PaymentNeeded(
-                "The provider asked for payment and the run's deadline passed unpaid; nothing ran or was charged.",
-                code="PAYMENT_NEEDED",
-                fix="Pay on the provider's page (payment_link), then call again.",
-                detail=detail,
-            )
-        raise RunNotApproved(
-            f"The provider did not approve the run ({reason}); nothing ran or was charged.",
-            code="PROVIDER_NO_ANSWER" if reason == "PROVIDER_NO_ANSWER" else "RUN_NOT_APPROVED",
-            detail=detail,
-        )
 
     async def _status(self, execution_id: str, candidate: Candidate) -> dict[str, Any]:
         for _ in range(10):
@@ -1812,9 +1661,47 @@ def _key(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:60] or "need"
 
 
-def _unit_price(reservation: dict[str, Any]) -> str:
-    """The run's unit price from its reservation, as the protocol writes amounts: "0.01", or "0.005" with more
-    decimals."""
+def _held(reserved: dict[str, Any]) -> dict[str, Any]:
+    """The held reservation with the run's execution grant: the network holds a paid run's price at once or refuses it
+    (BALANCE_LOW), so a reservation without a usable grant is one whose grant lapsed before it was used."""
+    if reserved.get("state") == "held" and reserved.get("execution_grant") and not _expired(reserved):
+        return reserved
+    raise _GrantLapsedError(
+        "the grant lapsed unused", code="GRANT_EXPIRED", detail={"reservation_id": reserved.get("reservation_id")}
+    )
+
+
+# A retry under the same execution ID finds its reservation as it stands. Once the provider redeemed the grant, the run
+# reached it: it is never reserved again as a new execution, which would run and pay for it twice (Appendix B.4).
+REACHED_PROVIDER = ("redeemed", "reconciliation_required")
+FINISHED = ("captured", "released")
+
+
+def _not_reserved_again(recorded: OutgoingCall, reserved: dict[str, Any]) -> None:
+    state = str(reserved.get("state") or "")
+    detail = {"execution_id": recorded.execution_id, "reservation_id": reserved.get("reservation_id"), "state": state}
+    if state in REACHED_PROVIDER:
+        raise OutcomeUnknown(
+            "The run reached the provider and its outcome isn't settled yet; nothing more is charged.",
+            code="OUTCOME_UNKNOWN",
+            fix=f"Call again later with idempotency_key={recorded.idempotency_key!r} to learn how it ended.",
+            detail=detail,
+        )
+    if state in FINISHED:
+        outcome = "succeeded" if state == "captured" else "ended without effect"
+        charged = (recorded.outcome or {}).get("charged")
+        paid = f", charged {charged}" if charged else ""
+        raise CallFinished(
+            f"This call already ran ({outcome}{paid}); it isn't run or charged again.",
+            code="CALL_FINISHED",
+            fix="Use a new idempotency_key for a new call.",
+            detail=detail | {"outcome": outcome},
+        )
+
+
+def _held_price(reservation: dict[str, Any]) -> str:
+    """What the reservation holds, as the protocol writes amounts: a pack's price when the run buys it ("8.00", or
+    "0.005" with more decimals), "0.00" when it takes a call of a pack already bought."""
     atoms = Decimal(str(reservation.get("amount_atoms") or 0)).scaleb(-int(reservation.get("amount_scale") or 0))
     return str(atoms.quantize(Decimal("0.01")) if atoms == atoms.quantize(Decimal("0.01")) else atoms.normalize())
 

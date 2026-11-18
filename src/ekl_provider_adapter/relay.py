@@ -1,6 +1,6 @@
 # Copyright © 2026 EuKreate, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Relay mode: the connector with no public address, for `ekl agent run`.
+"""Relay mode: the connector with no public address, for `ekl deploy` on this machine.
 
 The network gives the agent a relay address and announces it as the endpoint. Calls to that address come down a
 stream of server-sent events this process keeps open, each one a whole HTTP request, which is served by the
@@ -12,7 +12,6 @@ import asyncio
 import base64
 import json
 import logging
-import os
 import secrets
 import time
 from collections.abc import AsyncIterator
@@ -42,19 +41,6 @@ async def relay_address(network_url: str, credential: str, http: httpx2.AsyncCli
     if response.status_code != 200:
         raise RuntimeError(f"the network refused the agent key ({response.status_code}): {response.text[:200]}")
     return str(response.json()["endpoint"])
-
-
-def relay_address_now(network_url: str, credential: str) -> str:
-    """relay_address, for an app built before any event loop runs (attach is called at import)."""
-    response = httpx2.post(f"{network_url.rstrip('/')}/v1/provider/relay", headers=_auth(credential), timeout=30)
-    if response.status_code != 200:
-        raise RuntimeError(f"the network refused the agent key ({response.status_code}): {response.text[:200]}")
-    return str(response.json()["endpoint"])
-
-
-def relayed() -> bool:
-    """Whether this process serves the agent through the network's relay (EKL_RELAY=1, which `ekl agent run` sets)."""
-    return os.environ.get("EKL_RELAY") == "1"
 
 
 def _auth(credential: str) -> dict[str, str]:

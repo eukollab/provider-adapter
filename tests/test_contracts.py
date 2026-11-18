@@ -1,8 +1,7 @@
 # Copyright © 2026 EuKreate, Inc.
 # SPDX-License-Identifier: Apache-2.0
 """The adapter speaks the Provider API exactly as the contracts define it: every request it sends validates against
-the protocol's ekp/<version>/http/provider_*.input.json, for every version present (1.1, and 1.2 where the checkout has
-it), and the fake network answers with what the output schemas allow."""
+the protocol's ekp/2.0/http/provider_*.input.json, and the fake network answers with what the output schemas allow."""
 
 import inspect
 import json
@@ -15,19 +14,18 @@ import pytest
 from referencing import Registry, Resource
 
 from ekl_provider_adapter.agent import Agent
+from ekl_provider_adapter.agent_journal import AgentJournal
 from ekl_provider_adapter.api import HttpProviderApi
 from ekl_provider_adapter.conformance.harness import Call, Harness
 from ekl_provider_adapter.conformance.network import http_app
 from ekl_provider_adapter.conformance.toolbox import Crash
-from tests.conftest import CONTRACTS
+from ekl_provider_adapter.testing import FakeNetwork
+from tests.conftest import CONTRACTS, use
 
 pytestmark = pytest.mark.anyio
 
-EKP = CONTRACTS / "ekp" / "1.1"
-# 1.2 adds only optional fields to what the adapter sends and receives, so one adapter speaks both until 1.1 retires;
-# the announcement carries 1.2's proof_key, which 1.1's closed schema doesn't know.
-EKPS = [CONTRACTS / "ekp" / v for v in ("1.1", "1.2") if (CONTRACTS / "ekp" / v).is_dir()]
-ONLY_1_2 = {"provider_announce"}
+# The network speaks ekp/2.0 and accepts no 1.x.
+EKP = CONTRACTS / "ekp" / "2.0"
 
 
 def registry(ekp: Path = EKP) -> Registry:
@@ -83,22 +81,15 @@ async def test_requests_and_answers_follow_the_contracts() -> None:
         "/v1/provider/announce": "provider_announce",
         "/v1/provider/config": "provider_config",
     }
-    for ekp in EKPS:
-        for path, body in sent:
-            name = operations[path]
-            if name in ONLY_1_2 and ekp.name == "1.1":
-                continue
-            if (ekp / "http" / f"{name}.input.json").exists():  # announce's contract may not be published yet
-                validator(f"{name}.input", ekp).validate(body)
-        for path, body in answered:
-            name = operations[path]
-            if not (ekp / "http" / f"{name}.output.json").exists() or (name in ONLY_1_2 and ekp.name == "1.1"):
-                continue
-            if "code" in body and "decision" not in body:
-                continue  # an error envelope, defined by errors.json
-            if name == "provider_complete" or "receipt" in body:
-                continue  # receipts come from the network; the fake's are simplified
-            validator(f"{name}.output", ekp).validate(body)
+    for path, body in sent:
+        validator(f"{operations[path]}.input").validate(body)
+    for path, body in answered:
+        name = operations[path]
+        if "code" in body and "decision" not in body:
+            continue  # an error envelope, defined by errors.json
+        if name == "provider_complete" or "receipt" in body:
+            continue  # receipts come from the network; the fake's are simplified
+        validator(f"{name}.output").validate(body)
     paths = {p for p, _ in sent}
     assert {"/v1/provider/announce", "/v1/provider/admit", "/v1/provider/complete", "/v1/provider/reconcile"} <= paths
 
@@ -111,7 +102,20 @@ def test_every_callback_is_a_handler_the_network_accepts() -> None:
         if name.startswith("on_") and name != "on_start":
             takes_callback = "callback" in inspect.signature(register).parameters
             (register if takes_callback else register())(lambda *_: None)
-    for ekp in EKPS:
-        schema = json.loads((ekp / "tools" / "events_next.input.json").read_text(encoding="utf-8"))
-        jsonschema.Draft202012Validator(schema, registry=registry(ekp)).validate({"handlers": agent.handler_names()})
+    schema = json.loads((EKP / "tools" / "events_next.input.json").read_text(encoding="utf-8"))
+    jsonschema.Draft202012Validator(schema, registry=registry()).validate({"handlers": agent.handler_names()})
     assert "on_review_due" in agent.handler_names()
+
+
+def test_a_paid_run_reserves_as_the_contract_says(tmp_path: Path) -> None:
+    # The reservation offers the pack's whole price and asks nothing else: no approval wait, which 2.0 refuses.
+    fake = FakeNetwork()
+    pack = {"plan_id": "pack-500", "type": "pack", "price": "8.00", "calls": 500}
+    fake.provider("@fx", "cap_convert", lambda _: {"converted": 1.1}, summary="convert currency", plan=pack)
+    agent = Agent(fake, AgentJournal(str(tmp_path / "journal.db")))
+    [candidate] = agent.find("convert currency")
+    use(agent, candidate).call({"amount": 1})
+    schema = json.loads((EKP / "tools" / "execution_reserve.input.json").read_text(encoding="utf-8"))
+    [reserved] = fake.reserved
+    jsonschema.Draft202012Validator(schema, registry=registry()).validate(reserved)
+    assert reserved["requested_max_amount_atoms"] == "8000000"

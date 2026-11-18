@@ -1,19 +1,19 @@
 # Copyright © 2026 EuKreate, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Test an agent's behaviour with no network and no credential.
+"""The network, in memory, for testing the connector's agent side with no network and no credential.
 
     from ekl_provider_adapter.testing import FakeNetwork
 
     fake = FakeNetwork(handle="@my-agent")
     fake.provider("@vat-check", "cap_vat_validate", lambda args: {"valid": True}, price="0.05")
     fake.need("Validate EU VAT numbers", author="@buyer", matched="cap_my_service")
-    agent = Agent(fake, AgentJournal(":memory:"))   # or attach(server, agent_network=fake).agent
-    fake.run(agent)                                  # delivers every scripted event to the callbacks
+    app = use_only_app(callbacks_address, agent_network=fake)   # the connector, its events to the callbacks file
+    fake.run(app.state.ekl_agent)                               # delivers every scripted event to the callbacks
     assert fake.replies[0]["body"].startswith("I can")
 
 The fake answers the network's tools the way EuKollab does, in memory: needs, replies, connections, trials, choices,
-agreements, calls with receipts and reports, review periods and reviews. Console rules are scripted with
-`rules(...)`.
+agreements, paid calls from a wallet and its packs, calls with receipts and reports, review periods and reviews.
+Console rules are scripted with `rules(...)`.
 """
 
 # ruff: noqa: ARG002 - the fake answers each network tool with its real argument names, whether it uses them or not
@@ -25,12 +25,10 @@ import secrets
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from decimal import Decimal
-from pathlib import Path
 from typing import Any
 
-from ekl_provider_adapter import stand_ins
 from ekl_provider_adapter.agent import Agent
-from ekl_provider_adapter.errors import AgentError, NotAllowed, ProviderUnavailable
+from ekl_provider_adapter.errors import AgentError, BalanceLow, NotAllowed, ProviderUnavailable
 from ekl_provider_adapter.fingerprint import fingerprint
 from ekl_provider_adapter.network_client import ProviderAnswer
 
@@ -60,8 +58,8 @@ class FakeProvider:
     side_effect_class: str = "read_only"
     # How calls fail, to test failover: "unreachable" (nothing reaches it) or "timeout" (it ran, no answer came).
     fails: str = ""
-    # A plan other than per call, as agent.json publishes it: {"type": "pack", "price": "5.00", "calls": 500}. Its
-    # agreements record no per-call price, as the network's do; each run's reservation carries its unit price.
+    # A pack of more than one call, as agent.json publishes it: {"type": "pack", "price": "5.00", "calls": 500}. Its
+    # agreements record no per-call price, as the network's do; the agreement's plan carries the pack's price.
     plan: dict[str, Any] | None = None
     calls: int = 0
 
@@ -91,10 +89,13 @@ class FakeNetwork:
         self.connections: dict[str, dict[str, Any]] = {}
         self.agreements: dict[str, dict[str, Any]] = {}
         self.executions: dict[str, dict[str, Any]] = {}
-        # Paid runs wait for the provider's approval: "approve" after one read, "payment" (asked, then expired) or
-        # "decline". None approves at once, as a standing approval would. "lapse" approves, but the first grant
-        # expires unused, as when the machine sleeps before the call.
-        self.approval: str | None = None
+        # The organization's wallet, in USD: None never runs out; an amount that can't buy the next pack is refused
+        # with BALANCE_LOW, as the network does.
+        self.wallet: Decimal | None = None
+        # The calls left of each pack bought, by provider handle and capability.
+        self.packs: dict[tuple[str, str], int] = {}
+        # True: the next reservation's grant expires unused, as when the machine sleeps before the call.
+        self.lapse = False
         # The agent's state, as agent_get_self reports it: "review" or "added" test an agent not yet confirmed.
         self.state = "active"
         # Every reservation asked for, and what each events_next read declared, to check against.
@@ -137,7 +138,7 @@ class FakeNetwork:
         plan: dict[str, Any] | None = None,
     ) -> FakeProvider:
         """Another agent's service: `work` turns arguments into a result. `excluded_by` names the console rule that
-        excludes it; `plan` is a pack or subscription it sells instead of a per-call price."""
+        excludes it; `plan` is a pack of several calls it sells instead of a per-call price."""
         found = FakeProvider(
             handle,
             capability_id,
@@ -154,30 +155,6 @@ class FakeNetwork:
         )
         self.providers[f"{handle}/{capability_id}"] = found
         return found
-
-    def stand_ins(self, where: Path | None = None) -> list[FakeProvider]:
-        """The project's recorded stand-ins (eukollab/fixtures/, or EKL_FIXTURES) as providers, so tests use
-        real-shaped answers: each answers with its recorded output for the same input, or its first."""
-        added = []
-        for fixture in stand_ins.every(where):
-            handle, _, name = str(fixture["service"]).partition("/")
-            examples = list(fixture.get("examples") or [])
-
-            def work(arguments: dict[str, Any], examples: list[dict[str, Any]] = examples) -> Any:
-                return next((e for e in examples if e.get("input") == arguments), examples[0]).get("output")
-
-            added.append(
-                self.provider(
-                    handle,
-                    name if name.startswith("cap_") else f"cap_{name}",
-                    work,
-                    summary=str(fixture.get("service")),
-                    input_schema=fixture.get("input_schema"),
-                    output_schema=fixture.get("output_schema"),
-                    example={"input": examples[0].get("input")} if examples else None,
-                )
-            )
-        return added
 
     def _emit(self, kind: str, data: dict[str, Any], resource_id: str = "") -> None:
         self._seq += 1
@@ -377,6 +354,9 @@ class FakeNetwork:
         result: dict[str, Any] = handler(**{k: v for k, v in arguments.items() if v is not None})
         return result
 
+    def _tool_world_get_contract(self) -> dict[str, Any]:
+        return {"protocol": "ekp/2.0", "profile": "ekp/2.0", "accepted_protocols": []}
+
     def _tool_agent_get_profile(self, handle: str) -> dict[str, Any]:
         """A peer's profile with its availability (EKP 1.2 §6.12), as set in `availability`."""
         return {"handle": handle, "availability": list(self.availability.get(handle, []))}
@@ -434,6 +414,9 @@ class FakeNetwork:
         return {"replies": [], **self.posts[post_id]}
 
     def _tool_connection_respond(self, connection_id: str, decision: str, note: str = "") -> dict[str, Any]:
+        if self.connections.get(connection_id, {}).get("state") in ("active", "declined"):
+            # As the network answers: a request already answered can't be answered again.
+            raise AgentError("no pending request for this agent to answer", code="INVALID_STATE")
         self.responses.append({"connection_id": connection_id, "decision": decision, "note": note})
         self.connections.setdefault(connection_id, {"connection_id": connection_id})["state"] = (
             "active" if decision == "accept" else "declined"
@@ -453,12 +436,12 @@ class FakeNetwork:
             "version": "1.0.0",
             "summary": p.summary,
             "price_per_call": p.price,
-            "plans": [
-                {
-                    "plan_id": "per_call" if p.price not in ("0", "0.00") else "free",
-                    "type": "per_call" if p.price not in ("0", "0.00") else "free",
-                    "price": p.price,
-                }
+            "plans": [p.plan]
+            if p.plan
+            else [
+                {"plan_id": "per_call", "type": "pack", "price": p.price, "calls": 1}
+                if Decimal(p.price)
+                else {"plan_id": "free", "type": "free"}
             ],
             "currency": "USD",
             "accepts_trials": p.accepts_trials,
@@ -566,7 +549,17 @@ class FakeNetwork:
         return made
 
     def _tool_engagement_get(self, collaboration_id: str) -> dict[str, Any]:
-        return dict(self.agreements[collaboration_id])
+        found = self.agreements[collaboration_id]
+        left = self.packs.get((str(found["provider"]), str(found["terms"]["capability_id"])))
+        return dict(found) | {"packs": [{"calls_left": left}] if left is not None else []}
+
+    def _tool_packs_list(self) -> dict[str, Any]:
+        return {
+            "packs": [
+                {"provider": handle, "capability_id": capability_id, "calls_left": left}
+                for (handle, capability_id), left in self.packs.items()
+            ]
+        }
 
     def _tool_engagement_close(self, collaboration_id: str, outcome: str = "completed") -> dict[str, Any]:
         self.agreements[collaboration_id]["engagement_state"] = outcome
@@ -590,35 +583,40 @@ class FakeNetwork:
         return str(json.dumps({"input": p.input_schema, "output": p.output_schema}, sort_keys=True))
 
     def _tool_execution_reserve(self, execution_id: str, **request: Any) -> dict[str, Any]:
+        """A paid run takes a call of a pack already bought, or buys the next pack from the wallet; it never waits.
+        The fake pays the pack at once, where the network pays it when the run's succeeded receipt is reported."""
         self.reserved.append({"execution_id": execution_id} | request)
-        record = {"reservation_id": _id("rsv"), "execution_id": execution_id, "state": "held"} | self._unit(request)
-        if self.approval == "lapse":
-            self.approval = None  # the next reservation is granted at once
-            return record | {"state": "expired", "reconciliation_reason": "grant expired before redemption"}
-        if self.approval is None:
-            return record | {"execution_grant": "fake-grant"}
-        record["state"] = "awaiting_approval"
-        self.reservations[record["reservation_id"]] = record
-        return dict(record)
-
-    def _unit(self, request: dict[str, Any]) -> dict[str, Any]:
-        """The run's unit price as the network reserves it: the per-call price, or a pack's price over its calls."""
+        earlier = next((r for r in self.reservations.values() if r["execution_id"] == execution_id), None)
+        if earlier is not None:
+            # A retry under the same execution ID returns the reservation as it stands, as the network does.
+            return {k: v for k, v in earlier.items() if k != "execution_grant" or earlier["state"] == "held"}
+        record: dict[str, Any] = {"reservation_id": _id("rsv"), "execution_id": execution_id, "amount_scale": 6}
+        if self.lapse:
+            self.lapse = False  # the next reservation is granted at once
+            return record | {"state": "expired", "amount_atoms": "0"}
         agreement = self.agreements.get(str(request.get("collaboration_id")), {})
-        p = self.providers.get(f"{agreement.get('provider', '')}/{request.get('capability_id', '')}")
-        if p is None:
-            return {}
-        plan = p.plan or {}
-        price = Decimal(str(plan.get("price") or p.price)) / Decimal(int(plan.get("calls") or 1))
-        return {"amount_atoms": str(int(price * 1_000_000)), "amount_scale": 6}
-
-    def _tool_execution_reservation_get(self, reservation_id: str) -> dict[str, Any]:
-        record = self.reservations[reservation_id]
-        if self.approval == "approve":
-            record |= {"state": "held", "execution_grant": "fake-grant"}
-        elif self.approval == "payment":
-            record |= {"state": "expired", "payment": {"url": "https://buy.stripe.com/fake", "amount": "8.00"}}
+        key = (str(agreement.get("provider", "")), str(request.get("capability_id", "")))
+        p = self.providers.get(f"{key[0]}/{key[1]}")
+        plan = (p.plan if p else None) or {"price": p.price if p else "0", "calls": 1}
+        price = Decimal(str(plan.get("price") or "0"))
+        if self.packs.get(key, 0) > 0:
+            self.packs[key] -= 1
+            held = {"funding": "pack", "amount_atoms": "0"}
         else:
-            record |= {"state": "released", "decision_reason": "no pack bought"}
+            if price > Decimal(int(request.get("requested_max_amount_atoms") or 0)) / 1_000_000:
+                raise AgentError("The run would cost more than offered.", code="INVALID_REQUEST")
+            if self.wallet is not None and self.wallet < price:
+                raise BalanceLow(
+                    "Your wallet can't cover this run's pack.",
+                    code="BALANCE_LOW",
+                    detail={"needed": f"{price:.2f}", "currency": "USD"},
+                )
+            if self.wallet is not None:
+                self.wallet -= price
+            self.packs[key] = int(plan.get("calls") or 1) - 1
+            held = {"funding": "purchase", "amount_atoms": str(int(price * 1_000_000))}
+        record |= {"state": "held", "execution_grant": "fake-grant"} | held
+        self.reservations[record["reservation_id"]] = record
         return dict(record)
 
     def _tool_execution_get(self, execution_id: str, provider_agent_id: str = "") -> dict[str, Any]:
@@ -671,4 +669,7 @@ class FakeNetwork:
                 },
             }
             self.executions[execution_id] = kept
+            for reservation in self.reservations.values():
+                if reservation["execution_id"] == execution_id:
+                    reservation["state"] = "captured"  # the succeeded receipt pays the run
         return ProviderAnswer(kept["value"], False, {}, "", kept["value"])

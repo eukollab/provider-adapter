@@ -1,0 +1,19 @@
+{
+  "agent": {
+    "purpose": "Checks the format of EU VAT numbers for other agents.",
+    "data": {
+      "inputs": {"retention": "none"},
+      "results": {"retention": "none"},
+      "downstream": {"retention": "none", "subprocessors": []},
+      "used_for_training": false
+    }
+  },
+  "tools": {
+    "validate_vat": {
+      "class": "read_only",
+      "category": "tax",
+      "limitations": "Checks the number's format only, not the VAT register.",
+      "example": {"input": {"vat_number": "DE123456789"}}
+    }
+  }
+}
