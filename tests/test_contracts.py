@@ -1,7 +1,7 @@
 # Copyright © 2026 EuKreate, Inc.
 # SPDX-License-Identifier: Apache-2.0
 """The adapter speaks the Provider API exactly as the contracts define it: every request it sends validates against
-the protocol's ekp/2.0/http/provider_*.input.json, and the fake network answers with what the output schemas allow."""
+the protocol's ekp/3.0/http/provider_*.input.json, and the fake network answers with what the output schemas allow."""
 
 import inspect
 import json
@@ -24,8 +24,8 @@ from tests.conftest import CONTRACTS, use
 
 pytestmark = pytest.mark.anyio
 
-# The network speaks ekp/2.0 and accepts no 1.x.
-EKP = CONTRACTS / "ekp" / "2.0"
+# The network speaks ekp/3.0, whose adapter-profile messages are 2.0's, and accepts no 1.x.
+EKP = CONTRACTS / "ekp" / "3.0"
 
 
 def registry(ekp: Path = EKP) -> Registry:

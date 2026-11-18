@@ -17,7 +17,7 @@ from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from ekl_provider_adapter import callback_signing as cb
-from ekl_provider_adapter.agent import Agent, Choice, Need, ReviewDue, Untrusted
+from ekl_provider_adapter.agent import Agent, Choice, Need, ReviewDue, Untrusted, expectation
 from ekl_provider_adapter.agent_journal import AgentJournal
 from ekl_provider_adapter.callbacks import bridge, local_api
 from ekl_provider_adapter.connector import use_only_app
@@ -144,7 +144,11 @@ def test_post_a_need_choose_by_trial_and_call(tmp_path: Path) -> None:
 
     @agent.on_need_answered
     def use_it(answer: Any) -> None:
-        choice = agent.choose(answer.need, sample={"vat_number": "DE123456789"}, check=lambda out: out["valid"] is True)
+        choice = agent.choose(
+            answer.need,
+            sample={"vat_number": "DE123456789"},
+            expect={"checks": [{"id": "valid", "path": "$.valid", "equals": True}]},
+        )
         results.append(choice)
         vat = use(agent, choice.main)
         results.append(vat.call({"vat_number": "DE987654321"}, criteria=lambda out: out["valid"]))
@@ -186,7 +190,13 @@ def test_a_reply_to_a_need_posted_in_this_run_carries_the_need_s_words(tmp_path:
     @agent.on_need_answered
     def use_it(answer: Any) -> None:
         seen.append(answer.need)
-        seen.append(agent.choose(answer.need, sample={"day": "2026-11-26"}, check=lambda out: out["holiday"] is True))
+        seen.append(
+            agent.choose(
+                answer.need,
+                sample={"day": "2026-11-26"},
+                expect={"checks": [{"id": "holiday", "path": "$.holiday", "equals": True}]},
+            )
+        )
 
     fake.run(agent)
     need, choice = seen
@@ -382,9 +392,89 @@ def test_an_answer_to_a_decision_the_code_cannot_take_is_not_retried(tmp_path: P
     assert not fake.failed
 
 
-def test_criteria_judge_every_call_and_choose_s_check_is_passed_on_only_explicitly(tmp_path: Path) -> None:
+def test_agent_code_talks_in_outreach_threads_before_connecting(tmp_path: Path) -> None:
+    # A first contact reaches on_outreach with its intent and refs; the agent answers in the thread, and hears the
+    # replies to a thread it opened itself.
+    fake = FakeNetwork(handle="@seller")
+    agent = _agent(fake, tmp_path)
+    seen: list[tuple[str, str, str]] = []
+
+    @agent.on_outreach
+    def talk(o: Any) -> None:
+        seen.append((o.state, o.sender, str(o.text)))
+        if o.state == "received":
+            o.reply(f"Yes, up to 10,000 a day. Ask about {o.refs['capability_id']} when you connect.")
+        elif o.state == "replied":
+            o.reply("Thanks, I'll request a connection.")
+
+    asked = fake.outreach("@buyer", "Volume?", intent="request_service", refs={"capability_id": "cap_vat"})
+    opened = agent.outreach("@other", "introduction", "Hello from @seller.")["thread_id"]
+    fake.outreach("@other", "Hello back.", state="replied", thread_id=opened)
+    fake.run(agent)
+    assert seen == [("received", "@buyer", "Volume?"), ("replied", "@other", "Hello back.")]
+    assert agent.handler_names().count("on_outreach") == 1
+    assert [(m["thread_id"], m.get("action")) for m in fake.outreach_sent] == [
+        (opened, None),
+        (asked, "reply"),
+        (opened, "reply"),
+    ]
+
+
+def test_the_callbacks_file_answers_outreach_and_a_closed_thread_is_not_retried(tmp_path: Path) -> None:
+    received: list[dict[str, Any]] = []
+
+    async def callbacks_route(request: Request) -> JSONResponse:
+        event = json.loads(await request.body())
+        received.append(event)
+        if event["state"] == "received":
+            return JSONResponse({"decline": "We don't take introductions."})
+        return JSONResponse({"reply": "Noted."})
+
+    callbacks_file = Starlette(routes=[Route("/ekl-events", callbacks_route, methods=["POST"])])
+    fake = FakeNetwork(handle="@seller")
+    agent = _agent(fake, tmp_path)
+    bridge(
+        agent,
+        "http://127.0.0.1/ekl-events",
+        "ekla_secret",
+        http=httpx2.AsyncClient(transport=httpx2.ASGITransport(app=callbacks_file), base_url="http://127.0.0.1"),
+    )
+    declined = fake.outreach("@stranger", "Hi, can we talk?", intent="introduction")
+    expired = fake.outreach("@buyer", "Still there?", state="replied")
+    fake.threads[expired]["state"] = "expired"  # closed before the callbacks answered
+    fake.run(agent)
+    assert [(e["event"], e["state"], e["from"], e["text"]) for e in received] == [
+        ("outreach", "received", "@stranger", "Hi, can we talk?"),
+        ("outreach", "replied", "@buyer", "Still there?"),
+    ]
+    assert received[0]["intent"] == "introduction" and received[0]["thread_id"] == declined
+    assert fake.threads[declined]["state"] == "declined" and not fake.failed
+    assert fake.outreach_sent == [{"thread_id": declined, "action": "decline", "body": "We don't take introductions."}]
+
+
+def test_the_local_api_opens_an_outreach_thread_and_replies_in_it(tmp_path: Path) -> None:
+    fake = FakeNetwork(handle="@buyer")
+    agent = _agent(fake, tmp_path)
+    with TestClient(local_api(agent), base_url="http://127.0.0.1:8765") as client:
+        opened = client.post(
+            "/agent/outreach",
+            json={"to": "@seller", "intent": "request_service", "capability_id": "cap_vat", "text": "Volume?"},
+        ).json()
+        replied = client.post("/agent/outreach", json={"thread_id": opened["thread_id"], "text": "And price?"})
+        wrong = client.post("/agent/outreach", json={"to": "@seller", "intent": "chat", "text": "Hi"})
+    assert fake.outreach_sent[0] == {
+        "thread_id": opened["thread_id"],
+        "recipient": "@seller",
+        "intent": "request_service",
+        "refs": {"capability_id": "cap_vat"},
+        "body": "Volume?",
+    }
+    assert replied.json()["state"] == "replied" and wrong.status_code == 409
+
+
+def test_criteria_judge_every_call_and_choose_s_expectation_never_does(tmp_path: Path) -> None:
     # Criteria given to use(...) apply to every call's report; a call without criteria is not assessed, and
-    # choose's check, which may hold only for the trial's sample, applies only as criteria=choice.check.
+    # choose's expectation, scored by the network on the trial's sample, judges no later call.
     fake = FakeNetwork(handle="@buyer")
     fake.provider("@vat", "cap_vat_check", lambda a: {"valid": a["vat_number"].startswith("DE")}, summary="vat check")
     agent = _agent(fake, tmp_path)
@@ -393,10 +483,11 @@ def test_criteria_judge_every_call_and_choose_s_check_is_passed_on_only_explicit
     by_use.call({"vat_number": "DE1"})
     by_use.call({"vat_number": "FR1"})
     by_use.call({"vat_number": "FR2"}, criteria=lambda out: out["valid"] is False)  # the call's own criteria win
-    choice = agent.choose("vat check", sample={"vat_number": "DE9"}, check=lambda out: out["valid"] is True)
-    assert choice.main is not None and choice.check is not None
-    use(agent, choice.main).call({"vat_number": "FR3"})  # not judged by the check
-    use(agent, choice.main, criteria=choice.check).call({"vat_number": "FR4"})
+    expect = {"checks": [{"id": "valid", "path": "$.valid", "equals": True}]}
+    choice = agent.choose("vat check", sample={"vat_number": "DE9"}, expect=expect)
+    assert choice.main is not None and choice.trials[0].score == 1.0
+    use(agent, choice.main).call({"vat_number": "FR3"})  # not judged by the expectation
+    use(agent, choice.main, criteria=lambda out: out["valid"]).call({"vat_number": "FR4"})
     assert [r["result"] for r in fake.reports] == ["useful", "not_useful", "useful", "not_assessed", "not_useful"]
     assert [r.get("criteria_met") for r in fake.reports] == ["yes", "no", "yes", None, "no"]
 
@@ -517,6 +608,54 @@ def test_the_local_api_starts_the_agents_own_actions(tmp_path: Path) -> None:
     assert made["need_id"].startswith("post_") and called["value"] == {"valid": True}
     assert closed["engagement_state"] == "completed"
     assert missing.status_code == 404
+
+
+def test_callbacks_find_try_and_choose_with_their_own_logic(tmp_path: Path) -> None:
+    # A callback picks a provider by its own rules, so find lists what they may weigh, trial tries the one it picked
+    # on its own sample, never charged, and choose reports every trial it ran.
+    fake = FakeNetwork()
+    fake.provider("@fx", "cap_convert", lambda a: {"converted": a["amount"] * 2}, price="0.20", summary="convert")
+    fake.provider("@keeper", "cap_convert", lambda _: {"converted": 1}, summary="convert", excluded_by=["retention"])
+    with TestClient(local_api(_agent(fake, tmp_path)), base_url="http://127.0.0.1:8765") as client:
+        found = client.post("/agent/find", json={"query": "convert"}).json()["candidates"]
+        tried = client.post(
+            "/agent/trial",
+            json={
+                "handle": "@fx",
+                "capability_id": "cap_convert",
+                "sample": {"amount": 5},
+                "expect": {"checks": [{"id": "converted", "path": "$.converted", "approx": 10, "tolerance": 0.01}]},
+            },
+        ).json()
+        kept_out = client.post(
+            "/agent/trial", json={"handle": "@keeper", "capability_id": "cap_convert", "sample": {"amount": 5}}
+        ).json()
+        chosen = client.post("/agent/choose", json={"query": "convert", "sample": {"amount": 5}}).json()
+    fx = next(c for c in found if c["handle"] == "@fx")
+    assert fx["eligible"] and fx["currency"] == "USD" and "reviews" in fx and "plans" in fx
+    assert next(c for c in found if c["handle"] == "@keeper")["excluded_by"] == ["retention"]
+    # The score against the callbacks' own expectation, never the output.
+    assert tried["passed"] and tried["score"] == 1.0 and "output" not in tried
+    assert [c["id"] for c in tried["checks"]] == ["schema", "converted"]
+    assert fake.trials[0]["expect"]["checks"][0]["approx"] == 10
+    assert kept_out["skipped"] and "retention" in kept_out["reason"]
+    assert chosen["main"]["handle"] == "@fx"
+    assert {t["handle"]: t["passed"] or t["skipped"] for t in chosen["trials"]} == {"@fx": True, "@keeper": True}
+
+
+def test_no_provider_tells_the_callbacks_every_trial_and_why(tmp_path: Path) -> None:
+    # Spec 13.15.7.4: choose is refused with NO_PROVIDER, the trials attached, so the callbacks can post a need.
+    fake = FakeNetwork()
+    fake.provider("@keeper", "cap_convert", lambda _: {"converted": 1}, summary="convert", excluded_by=["retention"])
+    fake.provider("@wrong", "cap_convert", lambda _: {"converted": 3}, summary="convert")
+    expect = {"checks": [{"id": "converted", "path": "$.converted", "equals": 10}], "threshold": 1.0}
+    with TestClient(local_api(_agent(fake, tmp_path)), base_url="http://127.0.0.1:8765") as client:
+        refused = client.post("/agent/choose", json={"query": "convert", "sample": {"amount": 5}, "expect": expect})
+    assert refused.status_code == 409 and refused.json()["error"] == "NO_PROVIDER"
+    trials = {t["handle"]: t for t in refused.json()["detail"]["trials"]}
+    assert trials["@keeper"]["skipped"] and "retention" in trials["@keeper"]["reason"]
+    assert trials["@wrong"]["passed"] is False and trials["@wrong"]["score"] is not None
+    assert "output" not in str(refused.json())
 
 
 def test_the_local_api_answers_a_low_wallet_with_what_the_pack_needs(tmp_path: Path) -> None:
@@ -768,12 +907,26 @@ def test_a_grant_that_lapses_twice_is_not_retried_again(tmp_path: Path) -> None:
     assert lapsed.value.code == "GRANT_EXPIRED" and len(fake.reserved) == 2 and vat.calls == 0
 
 
-def test_a_network_that_no_longer_speaks_ekp_2_is_refused_before_anything_is_done(tmp_path: Path) -> None:
+def test_a_network_that_no_longer_speaks_ekp_3_is_refused_before_anything_is_done(tmp_path: Path) -> None:
     fake = FakeNetwork()
-    fake._tool_world_get_contract = lambda: {"protocol": "ekp/3.0", "accepted_protocols": []}  # type: ignore[method-assign]
+    fake._tool_world_get_contract = lambda: {"protocol": "ekp/2.0", "accepted_protocols": []}  # type: ignore[method-assign]
     with pytest.raises(AgentError) as refused:
         _agent(fake, tmp_path).post_need("Validate EU VAT numbers")
     assert refused.value.code == "PROFILE_UNSUPPORTED" and fake.posts == {}
+
+
+def test_on_a_network_that_speaks_only_ekp_3_0_everything_works_but_trials(tmp_path: Path) -> None:
+    # The connector can be upgraded before the network: trials, which 3.1 changed, are refused here, never sent.
+    fake = FakeNetwork()
+    fake._tool_world_get_contract = lambda: {"protocol": "ekp/3.0", "accepted_protocols": []}  # type: ignore[method-assign]
+    fake.provider("@vat-checker", "cap_vat", lambda _: {"valid": True}, summary="vat")
+    agent = _agent(fake, tmp_path)
+    agent.post_need("Validate EU VAT numbers")
+    assert fake.posts
+    candidate = agent.find("vat")[0]
+    with pytest.raises(AgentError) as refused:
+        candidate.trial({"vat_number": "DE1"}, {"checks": [{"id": "ok", "path": "$.valid", "equals": True}]})
+    assert refused.value.code == "UPGRADE_REQUIRED" and fake.trials == []
 
 
 def test_a_retry_of_a_paid_call_that_ran_is_never_run_or_paid_again(tmp_path: Path) -> None:
@@ -799,3 +952,84 @@ def test_a_retry_of_a_paid_call_that_ran_is_never_run_or_paid_again(tmp_path: Pa
     # The pack's second call is still there for the next call.
     second = use(Agent(fake, AgentJournal(journal)), candidate).call({"vat_number": "DE2"}, idempotency_key="sup-8")
     assert second.charged == "0.00" and vat.calls == 2 and fake.wallet == Decimal("4")
+
+
+def test_a_trial_is_scored_against_the_expectation_and_never_returns_the_output(tmp_path: Path) -> None:
+    # EKP 3.1: the connector sends an expectation with every trial, the default being the output schema alone; a JSON
+    # Schema given as `expect` becomes one check; words go as they are, for the network to compile.
+    fake = FakeNetwork()
+    fake.provider(
+        "@vat",
+        "cap_vat_check",
+        lambda a: {"valid": a["vat_number"].startswith("DE")},
+        summary="vat check",
+        output_schema={"type": "object", "required": ["valid"]},
+    )
+    agent = _agent(fake, tmp_path)
+    service = agent.find("vat check")[0]
+    plain = agent.aio.try_service(service, {"vat_number": "DE1"})
+    schema = agent.aio.try_service(service, {"vat_number": "FR1"}, {"properties": {"valid": {"const": True}}})
+    trials = [agent._sync(t) for t in (plain, schema)]
+    assert [f["expect"] for f in fake.trials] == [
+        {"checks": []},
+        {"checks": [{"id": "expect", "schema": {"properties": {"valid": {"const": True}}}}], "threshold": 1.0},
+    ]
+    assert trials[0].passed and trials[0].score == 1.0 and not hasattr(trials[0], "output")
+    assert not trials[1].passed and "short on expect" in trials[1].reason
+    # Words go as they are, for the network's model to compile; without one, the network refuses them.
+    with pytest.raises(AgentError) as words:
+        agent._sync(agent.aio.try_service(service, {"vat_number": "DE1"}, "says the number is valid"))
+    assert words.value.code == "MODEL_UNAVAILABLE"
+    with pytest.raises(AgentError) as refused:
+        fake._tool_capability_trial("@vat", "cap_vat_check", {"vat_number": "DE1"})
+    assert refused.value.code == "UPGRADE_REQUIRED"
+
+
+def test_a_misspelled_expectation_is_refused_never_read_as_a_schema_every_output_passes() -> None:
+    with pytest.raises(ValueError, match="treshold"):
+        expectation({"checks": [{"id": "total", "path": "$.total", "equals": 120}], "treshold": 0.9})
+    with pytest.raises(ValueError, match="totl"):
+        expectation({"totl": 120})
+    with pytest.raises(ValueError, match="threshold"):
+        expectation({"checks": [], "threshold": 2})
+    assert expectation({"type": "object", "required": ["total"]})["checks"][0]["id"] == "expect"
+
+
+def test_an_expectation_the_network_refuses_stops_choose_instead_of_failing_every_candidate(tmp_path: Path) -> None:
+    fake = FakeNetwork()
+    fake.provider("@a", "cap_count", lambda _: {"n": 1}, summary="count things")
+    fake.provider("@b", "cap_count", lambda _: {"n": 1}, summary="count things")
+    agent = _agent(fake, tmp_path)
+    bad = {"checks": [{"id": "n", "path": "$..n", "equals": 1}]}
+    with pytest.raises(AgentError) as refused:
+        agent.choose("count things", sample={}, expect=bad)
+    assert refused.value.code == "INVALID_REQUEST" and not isinstance(refused.value, NoProvider)
+
+
+def test_a_service_that_takes_no_trials_never_passes_one_and_ranks_after_those_that_did(tmp_path: Path) -> None:
+    fake = FakeNetwork()
+    fake.provider("@untried", "cap_count", lambda _: {"n": 1}, summary="count things", accepts_trials=False)
+    fake.provider("@tried", "cap_count", lambda _: {"n": 1}, summary="count things")
+    agent = _agent(fake, tmp_path)
+    untried = next(c for c in agent.find("count things") if c.handle == "@untried")
+    alone = agent._sync(agent.aio.try_service(untried, {}))
+    assert not alone.passed and alone.untried and alone.reason == "takes no trials"
+    choice = agent.choose("count things", sample={})
+    assert choice.main is not None and choice.backup is not None
+    assert (choice.main.handle, choice.backup.handle) == ("@tried", "@untried")
+
+
+def test_most_accurate_ranks_by_score_then_tested_quality(tmp_path: Path) -> None:
+    fake = FakeNetwork()
+    expect = {"checks": [{"id": "n", "path": "$.n", "approx": 10, "tolerance": 1}], "threshold": 0.5}
+    fake.provider("@near", "cap_count", lambda _: {"n": 11.5}, summary="count things")
+    fake.provider("@exact", "cap_count", lambda _: {"n": 10}, summary="count things")
+    tested = fake.provider("@tested", "cap_count", lambda _: {"n": 10}, summary="count things")
+    tested.tested_quality = {"significant": True, "t": 0.9}
+    agent = _agent(fake, tmp_path)
+    choice = agent.choose("count things", sample={}, expect=expect)
+    assert choice.main is not None and choice.backup is not None
+    assert (choice.main.handle, choice.backup.handle) == ("@tested", "@exact")
+    assert (
+        next(t for t in choice.trials if t.candidate.handle == "@near").score == 0.75
+    )  # the schema 1, the near miss 0.5

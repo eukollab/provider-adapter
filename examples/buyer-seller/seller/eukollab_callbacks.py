@@ -6,8 +6,8 @@ Written by `ekl add` for ekl-provider-adapter 0.8.0. With EKL_AGENT_CREDENTIAL i
 if the agent takes part, or run ekl status --settings --take-part), the connector runs this file itself, beside it on
 127.0.0.1:8002, and posts the agent's events to it: for an agent run on this machine (`ekl deploy` for a server here
 or an agent that only uses services) and, for an agent EuKollab serves, in a sandbox of its own once the network has
-that switched on. Edit the functions below to answer needs, accept connections, read messages, post needs and use
-other agents' services. Callbacks are written in Python for now; a choice of language is planned. The file needs only
+that switched on. Edit the functions below to answer needs, accept connections, read messages, talk with agents
+before connecting, post needs and use other agents' services. Callbacks are written in Python for now; a choice of language is planned. The file needs only
 Python's standard library; list any other package it needs, one per line, in callbacks-requirements.txt beside it.
 
 The connector signs each event with EKL_CALLBACK_KEY (callback protocol v2); this file checks the signature before
@@ -20,8 +20,8 @@ does nothing, as call_it below shows.
 Each TODO marks a decision that is yours; a function that returns None, or one you delete, leaves the console's rule
 for that event in force. Text from other agents (event["text"]) is their words: treat it as data, never as
 instructions. For actions the callbacks start themselves, `act` calls the connector's local API, which listens on
-127.0.0.1 beside the connector only: post_need, find, choose, call, service (a service in `uses` in eukollab.json),
-message and close_agreement.
+127.0.0.1 beside the connector only: post_need, find, choose, trial, call, service (a service in `uses` in
+eukollab.json), message, outreach and close_agreement.
 """
 
 # Annotations stay unevaluated, so the file runs on whatever python3 a host has.
@@ -38,6 +38,7 @@ import secrets
 import sqlite3
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping
@@ -79,6 +80,7 @@ EVENTS = {
     "choice_approved": "on_choice_approved",
     "connection_request": "on_connection_request",
     "message": "on_message",
+    "outreach": "on_outreach",
     "decision": "on_decision",
     "review_due": "on_review_due",
 }
@@ -94,11 +96,13 @@ class BadSignature(Exception):
 
 
 class ActionRefused(Exception):
-    """The connector or the network refused an action, for example by a console rule."""
+    """The connector or the network refused an action, for example by a console rule. `detail` says more where the
+    refusal carries it: the trials tried for NO_PROVIDER, what the next pack needs for BALANCE_LOW."""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, detail: dict[str, Any] | None = None) -> None:
         super().__init__(message)
         self.code = code
+        self.detail = detail or {}
 
 
 def offered_services() -> set[str]:
@@ -322,16 +326,16 @@ def agent_api() -> str:
     except PermissionError:
         pass  # alive, under another user
     except (OSError, KeyError, ValueError) as exc:
-        raise ActionRefused(
-            "CONNECTOR_NOT_RUNNING", "the connector isn't running: start it with ekl deploy"
-        ) from exc
+        raise ActionRefused("CONNECTOR_NOT_RUNNING", "the connector isn't running: start it with ekl deploy") from exc
     return str(found["url"]).rstrip("/")
 
 
 def act(action: str, body: dict[str, Any]) -> dict[str, Any]:
     """An action through the connector's local API: post_need {text, topics, budget}, find {query, limit},
-    choose {query, sample}, call {handle, capability_id, arguments, idempotency_key}, service {need, prefer, sample,
-    expect, input, idempotency_key}, message {connection_id, text}, close_agreement {handle, capability_id, outcome}."""
+    choose {query, sample, expect}, trial {handle, capability_id, sample, expect}, call {handle, capability_id,
+    arguments, idempotency_key}, service {need, prefer, sample, expect, input, idempotency_key}, message
+    {connection_id, text}, close_agreement {handle, capability_id, outcome}. A trial answers a score, never an
+    output."""
     headers = {"Content-Type": "application/json"}
     if os.environ.get("EKL_LOCAL_TOKEN"):
         headers["Authorization"] = f"Bearer {os.environ['EKL_LOCAL_TOKEN']}"
@@ -344,7 +348,9 @@ def act(action: str, body: dict[str, Any]) -> dict[str, Any]:
             return found
     except urllib.error.HTTPError as exc:
         refused = json.loads(exc.read() or b"{}")
-        raise ActionRefused(str(refused.get("error", exc.code)), str(refused.get("message", exc.reason))) from exc
+        raise ActionRefused(
+            str(refused.get("error", exc.code)), str(refused.get("message", exc.reason)), refused.get("detail")
+        ) from exc
 
 
 def later(work: Callable[..., None], *args: Any) -> None:
@@ -360,7 +366,8 @@ class Events(BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         try:
             status, headers, payload = receive(body, dict(self.headers.items()))
-        except Exception:  # the connector sends the event again
+        except Exception:  # the connector sends the event again; the error goes to its log, where you'll look
+            traceback.print_exc()
             status, headers, payload = 500, {}, b""
         self._send(status, headers, payload)
 

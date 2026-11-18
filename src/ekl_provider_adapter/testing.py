@@ -21,11 +21,17 @@ Console rules are scripted with `rules(...)`.
 import asyncio
 import datetime as dt
 import json
+import math
+import re
 import secrets
+import unicodedata
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
+
+import jsonschema
 
 from ekl_provider_adapter.agent import Agent
 from ekl_provider_adapter.errors import AgentError, BalanceLow, NotAllowed, ProviderUnavailable
@@ -62,6 +68,8 @@ class FakeProvider:
     # agreements record no per-call price, as the network's do; the agreement's plan carries the pack's price.
     plan: dict[str, Any] | None = None
     calls: int = 0
+    # EuKollab's tested quality of the service, as search results carry it; empty until the test sets it.
+    tested_quality: dict[str, Any] = field(default_factory=dict)
 
 
 class FakeNetwork:
@@ -75,11 +83,15 @@ class FakeNetwork:
         # A new agent's rules share public and synthetic data only, as the network's defaults do.
         self.data_classes = {"public", "synthetic"}
         self.providers: dict[str, FakeProvider] = {}
+        # Every trial asked for, with the expectation it was scored against (the network keeps it as a trial case).
+        self.trials: list[dict[str, Any]] = []
         self.posts: dict[str, dict[str, Any]] = {}
         self.replies: list[dict[str, Any]] = []
         self.needs: list[dict[str, Any]] = []
         self.responses: list[dict[str, Any]] = []
         self.messages: list[dict[str, Any]] = []
+        self.outreach_sent: list[dict[str, Any]] = []
+        self.threads: dict[str, dict[str, Any]] = {}
         self.choices: list[dict[str, Any]] = []
         self.reports: list[dict[str, Any]] = []
         self.reviews: list[dict[str, Any]] = []
@@ -256,6 +268,29 @@ class FakeNetwork:
             },
         )
 
+    def outreach(
+        self,
+        sender: str,
+        text: str,
+        *,
+        intent: str = "question",
+        refs: dict[str, Any] | None = None,
+        state: str = "received",
+        thread_id: str | None = None,
+    ) -> str:
+        """A message in an outreach thread: `received` opens one to this agent (which is then its recipient),
+        `replied` and `declined` answer one this agent opened."""
+        thread_id = thread_id or _id("thr")
+        if state == "received":
+            self.threads[thread_id] = {"state": "open", "recipient": self.handle, "sender": sender}
+        else:
+            self.threads.setdefault(thread_id, {"recipient": sender, "sender": self.handle})["state"] = state
+        data: dict[str, Any] = {"from": sender, "message_id": _id("msg"), "body": text}
+        if state == "received":
+            data |= {"intent": intent, "refs": refs or {}}
+        self._emit(f"outreach.{state}", data, thread_id)
+        return thread_id
+
     def approve(self, decision_id: str) -> None:
         """The publisher approves a shortlist that `choose` left waiting."""
         found = next(c for c in self.choices if c["decision_id"] == decision_id)
@@ -355,7 +390,7 @@ class FakeNetwork:
         return result
 
     def _tool_world_get_contract(self) -> dict[str, Any]:
-        return {"protocol": "ekp/2.0", "profile": "ekp/2.0", "accepted_protocols": []}
+        return {"protocol": "ekp/3.1", "profile": "ekp/3.1", "accepted_protocols": []}
 
     def _tool_agent_get_profile(self, handle: str) -> dict[str, Any]:
         """A peer's profile with its availability (EKP 1.2 §6.12), as set in `availability`."""
@@ -428,6 +463,27 @@ class FakeNetwork:
         self.messages.append(sent)
         return sent
 
+    def _tool_outreach_send(
+        self, recipient: str, intent: str, body: str, refs: dict[str, Any] | None = None, **_: Any
+    ) -> dict[str, Any]:
+        thread_id = _id("thr")
+        self.threads[thread_id] = {"state": "open", "recipient": recipient, "sender": self.handle}
+        self.outreach_sent.append(
+            {"thread_id": thread_id, "recipient": recipient, "intent": intent, "refs": refs or {}, "body": body}
+        )
+        return {"thread_id": thread_id, "state": "open"}
+
+    def _tool_outreach_respond(self, thread_id: str, action: str, body: str = "", **_: Any) -> dict[str, Any]:
+        # As the network answers: a closed thread takes no more messages, and only its recipient declines it.
+        thread = self.threads.setdefault(thread_id, {"state": "open", "recipient": self.handle, "sender": ""})
+        if thread["state"] not in ("open", "replied"):
+            raise AgentError(f"thread is {thread['state']}", code="INVALID_STATE")
+        if action == "decline" and thread["recipient"] != self.handle:
+            raise AgentError("only the recipient can decline", code="INVALID_REQUEST")
+        thread["state"] = "declined" if action == "decline" else "replied"
+        self.outreach_sent.append({"thread_id": thread_id, "action": action, "body": body})
+        return {"thread_id": thread_id, "state": thread["state"]}
+
     def _search_item(self, p: FakeProvider) -> dict[str, Any]:
         return {
             "agent_id": "agt_" + p.handle.strip("@").replace("-", "")[:12],
@@ -445,6 +501,7 @@ class FakeNetwork:
             ],
             "currency": "USD",
             "accepts_trials": p.accepts_trials,
+            "tested_quality": p.tested_quality,
             "side_effect_class": p.side_effect_class,
             "eligible": not p.excluded_by,
             "excluded_by": p.excluded_by,
@@ -473,15 +530,47 @@ class FakeNetwork:
         manifest = {"input_schema": p.input_schema, "output_schema": p.output_schema}
         return {"handle": handle, "manifest": manifest, "examples": examples}
 
-    def _tool_capability_trial(self, provider: str, capability_id: str, sample_input: dict[str, Any]) -> dict[str, Any]:
+    def _tool_capability_trial(
+        self, provider: str, capability_id: str, sample_input: dict[str, Any], expect: Any = None
+    ) -> dict[str, Any]:
+        """A trial as EKP 3.1 answers it: a score against `expect`, never the output. The fake scores as the network
+        does without a model: checks that need the model are cannot_tell, and words are MODEL_UNAVAILABLE."""
+        if expect is None:
+            raise AgentError("A trial needs an expectation (EKP 3.1).", code="UPGRADE_REQUIRED")
         p = self._provider(provider, capability_id)
         if p.excluded_by:
             raise NotAllowed("excluded by your rules", code="POLICY_DENIED", detail={"rule": p.excluded_by[0]})
+        expectation = validate_expectation(expect)
+        if p.input_schema:
+            try:
+                jsonschema.validate(sample_input, p.input_schema)
+            except jsonschema.ValidationError as exc:
+                raise AgentError(
+                    f"The sample doesn't fit the input schema: {exc.message}", code="INVALID_REQUEST"
+                ) from exc
+        self.trials.append({"provider": provider, "capability_id": capability_id, "expect": expect})
+        trial_id = _id("trl")
         try:
             result = p.work(sample_input)
-        except Exception as exc:  # the fake provider failed: a failed trial, as the network reports it
-            return {"trial_id": _id("trl"), "status": "failed", "result": None, "error": str(exc)}
-        return {"trial_id": _id("trl"), "status": "succeeded", "result": result, "error": None}
+        except Exception:  # the fake provider received the call and failed: counted, scoring 0
+            return {
+                "trial_id": trial_id,
+                "provider": provider,
+                "capability_id": capability_id,
+                "status": "failed",
+                "score": 0.0,
+                "passed": False,
+                "threshold": expectation["threshold"],
+                "checks": [],
+                "error_code": "FAILED_BEFORE_EFFECT",
+            }
+        scored = score_trial(expectation, result, p.output_schema)
+        return {
+            "trial_id": trial_id,
+            "provider": provider,
+            "capability_id": capability_id,
+            "status": "succeeded",
+        } | scored
 
     def _tool_sourcing_record(self, need_key: str, primary: str, **record: Any) -> dict[str, Any]:
         waiting = self.config["sourcing"]["mode"] == "approve_each"
@@ -673,3 +762,389 @@ class FakeNetwork:
                 if reservation["execution_id"] == execution_id:
                     reservation["state"] = "captured"  # the succeeded receipt pays the run
         return ProviderAnswer(kept["value"], False, {}, "", kept["value"])
+
+
+# --- the fake's scorer: the deterministic part of the network's (EKP 3.1 §9.4) ------------------------------------
+# It scores exactly as the network does without a model, so a test that passes here passes there; the protocol's
+# scoring vectors hold both to it. Checks that need the network's model are cannot_tell here.
+
+STEP = 0.05
+CHECK_STEP = 0.25
+MAX_CHECKS = 20
+MAX_EXPECT_BYTES = 64 * 1024
+KINDS = ("equals", "one_of", "set_equals", "schema", "approx", "range", "within", "length", "contains")
+MODEL_KINDS = ("similar_to", "criterion", "media")
+_CHECK_KEYS = frozenset({"id", "path", "weight", "tolerance", "min", *KINDS, *MODEL_KINDS})
+_ID = re.compile(r"^[A-Za-z0-9_.-]{1,40}$")
+_TOLERANCE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*(%?)\s*$")
+_TOKEN = re.compile(r"\.([A-Za-z_][\w-]*)|\[(\d+|\*|'[^']*'|\"[^\"]*\")\]")
+
+
+class _Missing:
+    pass
+
+
+_MISSING = _Missing()
+
+
+def _invalid(message: str) -> AgentError:
+    return AgentError(f"expect: {message}", code="INVALID_REQUEST")
+
+
+def validate_expectation(expect: Any) -> dict[str, Any]:
+    """The expectation as the network accepts it, or INVALID_REQUEST naming what is wrong; words need the network's
+    model, which the fake doesn't have (MODEL_UNAVAILABLE)."""
+    if isinstance(expect, str):
+        if not expect.strip() or len(expect.strip()) > 2000:
+            raise _invalid("an expectation in words is 1 to 2,000 characters")
+        raise AgentError(
+            "An expectation in words needs the network's model; give checks instead.", code="MODEL_UNAVAILABLE"
+        )
+    if not isinstance(expect, dict) or set(expect) - {"checks", "threshold"}:
+        raise _invalid("an object with checks and a threshold, or a sentence")
+    if len(json.dumps(expect, default=str)) > MAX_EXPECT_BYTES:
+        raise _invalid("an expectation is at most 64 KB")
+    threshold = expect.get("threshold", 0.8)
+    if not _number(threshold) or not 0 <= float(threshold) <= 1:
+        raise _invalid("threshold is a number from 0 to 1")
+    checks = expect.get("checks", [])
+    if not isinstance(checks, list) or len(checks) > MAX_CHECKS:
+        raise _invalid(f"checks is a list of at most {MAX_CHECKS}")
+    ids: set[str] = set()
+    for check in checks:
+        _validate_check(check, ids)
+    return {"checks": checks, "threshold": float(threshold)}
+
+
+def _validate_check(check: Any, ids: set[str]) -> None:  # noqa: PLR0912, PLR0915 - one rule per field
+    if not isinstance(check, dict):
+        raise _invalid("each check is an object")
+    cid = check.get("id")
+    if not isinstance(cid, str) or not _ID.match(cid) or cid == "schema" or cid in ids:
+        raise _invalid(f"check id {cid!r} must be unique, 1 to 40 of A-Z a-z 0-9 _ . -, and not `schema`")
+    ids.add(cid)
+    unknown = sorted(set(check) - _CHECK_KEYS)
+    if unknown:
+        raise _invalid(f"check {cid}: unknown {', '.join(unknown)}")
+    kinds = [k for k in (*KINDS, *MODEL_KINDS) if k in check and (k == "equals" or check[k] is not None)]
+    if len(kinds) != 1:
+        raise _invalid(f"check {cid} needs exactly one kind, not {', '.join(kinds) or 'none'}")
+    kind = kinds[0]
+    weight = check.get("weight", 1.0)
+    if not _number(weight) or not 0 < float(weight) <= 100:
+        raise _invalid(f"check {cid}: weight is above 0 and at most 100")
+    if "tolerance" in check and kind != "approx":
+        raise _invalid(f"check {cid}: tolerance goes with approx")
+    if "min" in check and kind != "similar_to":
+        raise _invalid(f"check {cid}: min goes with similar_to")
+    path = check.get("path")
+    if path is not None:
+        if not isinstance(path, str) or len(path) > 200:
+            raise _invalid(f"check {cid}: path is a JSONPath of at most 200 characters")
+        _tokens(path)
+    if kind == "approx":
+        if not _number(check["approx"]):
+            raise _invalid(f"check {cid}: approx is a finite number")
+        _tolerance(check.get("tolerance"), float(check["approx"]))
+    elif kind == "range":
+        bounds = check["range"]
+        if not isinstance(bounds, list) or len(bounds) != 2 or not all(_number(b) for b in bounds):
+            raise _invalid(f"check {cid}: range is [min, max], two finite numbers")
+    elif kind == "within":
+        window = check["within"]
+        if not isinstance(window, dict) or set(window) != {"of", "days"} or _moment(window["of"]) is None:
+            raise _invalid(f"check {cid}: within is {{of: an ISO date or time, days}}")
+        if not _number(window["days"]) or not 0 <= float(window["days"]) <= 36500:
+            raise _invalid(f"check {cid}: within.days is 0 to 36,500")
+    elif kind == "length":
+        bounds = check["length"]
+        if not isinstance(bounds, dict) or set(bounds) - {"min", "max"}:
+            raise _invalid(f"check {cid}: length is {{min, max}}")
+        if not all(v is None or (_number(v) and float(v) >= 0) for v in bounds.values()):
+            raise _invalid(f"check {cid}: length bounds are numbers of at least 0")
+    elif kind in ("one_of", "set_equals", "contains"):
+        if not isinstance(check[kind], list):
+            raise _invalid(f"check {cid}: {kind} is a list")
+        if kind == "contains" and not all(isinstance(w, str) for w in check[kind]):
+            raise _invalid(f"check {cid}: contains is a list of texts")
+    elif kind == "schema":
+        if not isinstance(check["schema"], dict):
+            raise _invalid(f"check {cid}: schema is a JSON Schema object")
+        try:
+            jsonschema.Draft202012Validator.check_schema(check["schema"])
+        except jsonschema.SchemaError as exc:
+            raise _invalid(f"check {cid}: schema is not a valid JSON Schema ({exc.message})") from exc
+        _within_itself(cid, check["schema"])
+
+
+# The share of the consumer's check weight that must be scored for a trial to pass.
+MIN_COVERAGE = 0.5
+
+
+def _within_itself(cid: str, schema: dict[str, Any]) -> None:
+    """As the network: a consumer's schema refers only within itself, and its patterns compile, so it can be applied
+    to any output; refused now otherwise, never after the provider has worked."""
+    stack: list[Any] = [schema]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, list):
+            stack.extend(node)
+            continue
+        if not isinstance(node, dict):
+            continue
+        for key, value in node.items():
+            if key in ("$ref", "$dynamicRef", "$recursiveRef") and not (
+                isinstance(value, str) and _resolves(schema, value)
+            ):
+                raise _invalid(f"check {cid}: its schema refers to {str(value)[:80]!r}, which is not within it")
+            patterns = [value] if key == "pattern" else list(value) if key == "patternProperties" else []
+            for pattern in patterns:
+                try:
+                    re.compile(str(pattern))
+                except re.error as exc:
+                    raise _invalid(
+                        f"check {cid}: its pattern {str(pattern)[:80]!r} is not a regular expression"
+                    ) from exc
+            stack.append(value)
+
+
+def _resolves(schema: dict[str, Any], ref: str) -> bool:
+    """Whether a local reference (`#`, `#/$defs/x`) points into the schema."""
+    if ref == "#":
+        return True
+    if not ref.startswith("#/"):
+        return False
+    node: Any = schema
+    for part in ref[2:].split("/"):
+        key = part.replace("~1", "/").replace("~0", "~")
+        if isinstance(node, dict) and key in node:
+            node = node[key]
+        elif isinstance(node, list) and key.isdigit() and int(key) < len(node):
+            node = node[int(key)]
+        else:
+            return False
+    return True
+
+
+def score_trial(expectation: dict[str, Any], result: Any, output_schema: dict[str, Any] | None) -> dict[str, Any]:
+    """Score, passed, threshold and each check as the network answers them, never a value of the output."""
+    own = _score_schema(result, output_schema or {})
+    given = [_score_check(result, c) for c in expectation.get("checks") or []]
+    threshold = float(expectation.get("threshold", 0.8))
+    checks = [own, *given]
+    if given and all(c["score"] is None for c in given):
+        # Nothing the consumer asked could be scored: no score, never a pass on the service's own schema alone.
+        score = None
+    else:
+        scored = [c for c in checks if c["score"] is not None]
+        total = sum(c["weight"] for c in scored)
+        score = _step(sum(c["weight"] * c["score"] for c in scored) / total, STEP) if total else None
+    return {
+        "score": score,
+        # As the network: a pass needs at least half the consumer's check weight scored.
+        "passed": score is not None
+        and score >= threshold
+        and (
+            not given
+            or sum(c["weight"] for c in given if c["score"] is not None)
+            >= MIN_COVERAGE * sum(c["weight"] for c in given)
+        ),
+        "threshold": threshold,
+        "checks": [
+            {
+                "id": c["id"],
+                "score": None if c["score"] is None else _step(c["score"], CHECK_STEP),
+                "reason": c["reason"],
+            }
+            for c in checks
+        ],
+    }
+
+
+def _step(value: float, step: float) -> float:
+    """Rounded down to the step: a score never claims more than it earned."""
+    return round(math.floor(max(0.0, min(1.0, value)) / step + 1e-9) * step, 2)
+
+
+def _tokens(path: str) -> list[tuple[str | None, str | None]]:
+    rest = path[1:] if path.startswith("$") else "." + path if not path.startswith((".", "[")) else path
+    found: list[tuple[str | None, str | None]] = []
+    pos = 0
+    while pos < len(rest):
+        match = _TOKEN.match(rest, pos)
+        if match is None:
+            raise _invalid(f"path {path!r} is not a JSONPath this network reads")
+        found.append((match.group(1), match.group(2)))
+        pos = match.end()
+    return found
+
+
+def _at(data: Any, path: str | None) -> Any:
+    """The value at a JSONPath (`$.a.b[0]`, `$['a b']`, `$.items[*]` for every item); _MISSING when it isn't there."""
+    if not path or path == "$":
+        return data
+    values: list[Any] = [data]
+    spread = False
+    for name, index in _tokens(path):
+        found: list[Any] = []
+        for value in values:
+            if name is not None or (index and index[0] in "'\""):
+                key = name if name is not None else str(index)[1:-1]
+                if isinstance(value, dict) and key in value:
+                    found.append(value[key])
+            elif index == "*":
+                spread = True
+                if isinstance(value, list):
+                    found.extend(value)
+                elif isinstance(value, dict):
+                    found.extend(value.values())
+            elif isinstance(value, list) and int(str(index)) < len(value):
+                found.append(value[int(str(index))])
+        values = found
+    if spread:
+        return values
+    return values[0] if values else _MISSING
+
+
+def _score_schema(result: Any, schema: dict[str, Any]) -> dict[str, Any]:
+    # No declared output schema is the empty schema, which every output satisfies.
+    if not schema:
+        return {"id": "schema", "weight": 1.0, "score": 1.0, "reason": "matched"}
+    try:
+        ok = not any(jsonschema.Draft202012Validator(schema).iter_errors(result))
+    except Exception:  # a schema the fake can't apply says nothing of the output
+        return {"id": "schema", "weight": 1.0, "score": None, "reason": "cannot_tell"}
+    return {"id": "schema", "weight": 1.0, "score": 1.0 if ok else 0.0, "reason": "matched" if ok else "mismatch"}
+
+
+def _score_check(result: Any, check: dict[str, Any]) -> dict[str, Any]:
+    found = {"id": str(check["id"]), "weight": float(check.get("weight", 1.0))}
+    kind = next(k for k in (*KINDS, *MODEL_KINDS) if k in check and (k == "equals" or check[k] is not None))
+    if kind == "media":
+        return found | {"score": None, "reason": "cannot_tell"}
+    value = _at(result, check.get("path"))
+    if value is _MISSING:
+        return found | {"score": 0.0, "reason": "missing"}
+    if kind in MODEL_KINDS:
+        return found | {"score": None, "reason": "cannot_tell"}
+    got, reason = _deterministic(kind, check, value)
+    return found | {"score": got, "reason": reason}
+
+
+def _deterministic(kind: str, check: dict[str, Any], value: Any) -> tuple[float, str]:  # noqa: PLR0911, PLR0912 - one branch per kind
+    if kind == "equals":
+        return (1.0, "matched") if _same(value, check["equals"]) else (0.0, "mismatch")
+    if kind == "one_of":
+        return (1.0, "matched") if any(_same(value, v) for v in check["one_of"]) else (0.0, "mismatch")
+    if kind == "set_equals":
+        if not isinstance(value, list):
+            return 0.0, "wrong_type"
+        return (1.0, "matched") if _as_set(value) == _as_set(check["set_equals"]) else (0.0, "mismatch")
+    if kind == "schema":
+        try:
+            ok = not any(jsonschema.Draft202012Validator(check["schema"]).iter_errors(value))
+        except Exception:  # as the network: a schema it can't apply is a mismatch
+            ok = False
+        return (1.0, "matched") if ok else (0.0, "mismatch")
+    if kind in ("approx", "range"):
+        if not _number(value):
+            return 0.0, "wrong_type"
+        if kind == "approx":
+            centre = float(check["approx"])
+            return _near(abs(float(value) - centre), _tolerance(check.get("tolerance"), centre))
+        low, high = sorted(float(b) for b in check["range"])
+        return _in_range(float(value), low, high)
+    if kind == "within":
+        when, of = _moment(value), _moment(check["within"]["of"])
+        if when is None or of is None:
+            return 0.0, "wrong_type"
+        return _near(abs((when - of).total_seconds()) / 86400, float(check["within"]["days"]))
+    if kind == "length":
+        if not isinstance(value, (str, list, dict)):
+            return 0.0, "wrong_type"
+        bounds = check["length"]
+        low = float(bounds.get("min") or 0.0)
+        high = float(bounds["max"]) if bounds.get("max") is not None else math.inf
+        low, high = min(low, high), max(low, high)
+        return _in_range(float(len(value)), low, high)
+    text = _norm(value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str))
+    return (1.0, "matched") if all(_norm(w) in text for w in check["contains"]) else (0.0, "mismatch")
+
+
+def _near(distance: float, tolerance: float) -> tuple[float, str]:
+    """1 within the tolerance; beyond it, falling linearly to 0 at twice the tolerance."""
+    if distance <= tolerance:
+        return 1.0, "matched"
+    if tolerance <= 0:
+        return 0.0, "out_of_range"
+    left = 1.0 - (distance - tolerance) / tolerance
+    return (left, "near") if left > 0 else (0.0, "out_of_range")
+
+
+def _in_range(value: float, low: float, high: float) -> tuple[float, str]:
+    """1 inside [low, high]; outside, falling linearly to 0 one range-width away (at least 1 for an open or
+    single-point range)."""
+    if low <= value <= high:
+        return 1.0, "matched"
+    width = high - low if math.isfinite(high) and high > low else max(abs(low), 1.0)
+    distance = low - value if value < low else value - high
+    left = 1.0 - distance / width
+    return (left, "near") if left > 0 else (0.0, "out_of_range")
+
+
+def _tolerance(tolerance: Any, approx: float) -> float:
+    if tolerance is None:
+        return 0.0
+    if _number(tolerance) and float(tolerance) >= 0:
+        return float(tolerance)
+    found = _TOLERANCE.match(tolerance) if isinstance(tolerance, str) else None
+    if found is None:
+        raise _invalid(f'tolerance {tolerance!r} is a number of at least 0, or a percentage such as "1%"')
+    amount = float(found.group(1))
+    return abs(approx) * amount / 100 if found.group(2) else amount
+
+
+def _number(value: Any) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except OverflowError:
+        return False
+
+
+def _norm(text: str) -> str:
+    return " ".join(unicodedata.normalize("NFC", text).casefold().split())
+
+
+def _canonical(value: Any) -> Any:
+    """A value compared as the network compares it, at every depth: text normalised, numbers as numbers."""
+    if isinstance(value, str):
+        return _norm(value)
+    if _number(value):
+        number = float(value)
+        return int(number) if number.is_integer() else number
+    if isinstance(value, dict):
+        return {str(k): _canonical(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_canonical(v) for v in value]
+    return value
+
+
+def _same(a: Any, b: Any) -> bool:
+    return bool(json.dumps(_canonical(a), sort_keys=True) == json.dumps(_canonical(b), sort_keys=True))
+
+
+def _as_set(values: list[Any]) -> Counter[str]:
+    """The members, order ignored and duplicates counted, as the network compares them."""
+    return Counter(json.dumps(_canonical(v), sort_keys=True) for v in values)
+
+
+def _moment(value: Any) -> dt.datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        moment = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return moment if moment.tzinfo else moment.replace(tzinfo=dt.UTC)

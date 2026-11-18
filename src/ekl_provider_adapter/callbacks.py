@@ -7,7 +7,7 @@ with callback protocol v2 (callback_signing): the file holds EKL_CALLBACK_KEY, d
 the credential itself. The file answers with what to do: `{"reply": "…"}`, `{"accept": true}`, `{"decline": "…"}`,
 `{"review": {…}}`, `{"skip": true}`, or nothing; the file signs its answer, bound to the request it answers.
 
-A decision the file owes (a connection request, a reply to a need or a message) is journaled
+A decision the file owes (a connection request, a reply to a need, a message or an outreach message) is journaled
 before it is first delivered, and applied at most once: a failed delivery (no connection, a timeout, a 5xx,
 IN_PROGRESS, or an answer that isn't signed once the file has answered with v2) leaves it pending and it is sent again,
 with the same event ID and the same body, after 2 s, 10 s, 1 min, 5 min and then every 15 min until its deadline. At the
@@ -30,7 +30,6 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx2
-import jsonschema
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.requests import Request
@@ -48,12 +47,14 @@ from ekl_provider_adapter.agent import (
     Decision,
     Message,
     Need,
+    Outreach,
     PlannedService,
     ReviewDue,
+    Trial,
 )
 from ekl_provider_adapter.agent_journal import AgentJournal, PendingDecision
 from ekl_provider_adapter.config import is_loopback
-from ekl_provider_adapter.errors import AgentError, BalanceLow
+from ekl_provider_adapter.errors import AgentError, BalanceLow, NoProvider
 from ekl_provider_adapter.local_guard import LocalGuard
 
 log = logging.getLogger("ekl_provider_adapter.callbacks")
@@ -68,7 +69,7 @@ V2_FLAG = "callback_v2"
 # decision's comes with it.
 CONNECTION_HOURS = "EKL_CONNECTION_DECISION_HOURS"
 REPLY_MINUTES = "EKL_REPLY_DECISION_MINUTES"
-REPLY_EVENTS = ("need", "need_answered", "message")
+REPLY_EVENTS = ("need", "need_answered", "message", "outreach")
 
 Perform = Callable[[dict[str, Any], dict[str, Any]], Awaitable[None]]
 
@@ -316,6 +317,39 @@ def _candidate(c: Candidate | None) -> dict[str, Any] | None:
     return {"handle": c.handle, "capability_id": c.capability_id, "summary": str(c.summary), "price": c.price}
 
 
+def _listing(c: Candidate) -> dict[str, Any]:
+    """A candidate as `find` lists it to callbacks: everything a choice of their own may weigh."""
+    return {
+        **(_candidate(c) or {}),
+        "currency": c.currency,
+        "plans": c.plans,
+        "data_retention": c.data_policy,
+        "provider_tier": c.provider_tier,
+        "reviews": c.reviews,
+        "accepts_trials": c.accepts_trials,
+        "tested_quality": c.tested_quality,
+        "eligible": c.eligible,
+        "excluded_by": c.excluded_by,
+    }
+
+
+def _trial(t: Trial) -> dict[str, Any]:
+    """One trial as `choose` and `trial` report it: the network's score against the expectation, each check's score
+    and reason, whether it passed, and why. Never the output: a trial doesn't return it."""
+    return {
+        "handle": t.candidate.handle,
+        "capability_id": t.candidate.capability_id,
+        "score": t.score,
+        "checks": t.checks,
+        "passed": t.passed,
+        "skipped": t.skipped,
+        "untried": t.untried,
+        "reason": t.reason,
+        "price": t.price,
+        "seconds": t.seconds,
+    }
+
+
 def _perform_for(agent: Agent, channel: CallbackChannel) -> None:
     """How each applied answer, and each default at a deadline, reaches the network."""
 
@@ -339,6 +373,18 @@ def _perform_for(agent: Agent, channel: CallbackChannel) -> None:
         if answer.get("reply"):
             await agent.aio.message(str(request["connection_id"]), str(answer["reply"]))
 
+    async def outreach(request: dict[str, Any], answer: dict[str, Any]) -> None:
+        if "decline" in answer:
+            try:
+                await agent.aio.outreach_reply(str(request["thread_id"]), str(answer["decline"] or ""), decline=True)
+            except AgentError as exc:
+                if exc.code != "INVALID_REQUEST":
+                    raise
+                # Only a thread's recipient declines it; asking again would be refused the same way.
+                log.warning("outreach thread %s not declined: %s", request["thread_id"], exc)
+        elif answer.get("reply"):
+            await agent.aio.outreach_reply(str(request["thread_id"]), str(answer["reply"]))
+
     async def decide(request: dict[str, Any], answer: dict[str, Any]) -> None:
         d = Decision(
             agent, str(request["kind"]), str(request["subject_id"]), str(request["deadline"]), str(request["fallback"])
@@ -346,7 +392,11 @@ def _perform_for(agent: Agent, channel: CallbackChannel) -> None:
         if ("accept" in answer or "decline" in answer) and d.kind not in ("connection_request", "paid_offer"):
             # Answered in the console or with its own tool: an answer here can't be applied, and retrying the event
             # wouldn't change that, so say so once and let the decision's fallback apply.
-            log.warning("a %s decision can't be answered from the callbacks; its fallback applies", d.kind)
+            log.warning(
+                "a %s decision can't be answered here; its fallback applies%s",
+                d.kind,
+                " unless on_outreach replies or declines first" if d.kind == "outreach" else "",
+            )
             return
         if answer.get("accept"):
             await agent.aio.decide(d, True)
@@ -365,6 +415,7 @@ def _perform_for(agent: Agent, channel: CallbackChannel) -> None:
             "need_answered": answered_reply,
             "connection_request": respond,
             "message": send_message,
+            "outreach": outreach,
             "decision": decide,
         }
     )
@@ -428,6 +479,21 @@ def bridge(
                 "from": m.sender,
                 "text": str(m.text),
                 "payload": m.payload,
+            },
+        )
+
+    @agent.on_outreach
+    async def outreach(o: Outreach) -> None:
+        await channel.decide(
+            "outreach",
+            {
+                "thread_id": o.thread_id,
+                "message_id": o.message_id,
+                "from": o.sender,
+                "state": o.state,
+                "intent": o.intent,
+                "refs": o.refs,
+                "text": str(o.text),
             },
         )
 
@@ -496,16 +562,23 @@ def local_api(agent: Agent) -> Starlette:
 
     async def find(body: dict[str, Any]) -> dict[str, Any]:
         found = await agent.aio.find(body["query"], int(body.get("limit", 5)))
-        return {"candidates": [_candidate(c) for c in found]}
+        return {"candidates": [_listing(c) for c in found]}
 
     async def choose(body: dict[str, Any]) -> dict[str, Any]:
-        choice = await agent.aio.choose(body["query"], body.get("sample"))
+        choice = await agent.aio.choose(body["query"], body.get("sample"), body.get("expect"))
         return {
             "main": _candidate(choice.main),
             "backup": _candidate(choice.backup),
             "reason": choice.reason,
             "waiting": choice.waiting,
+            "trials": [_trial(t) for t in choice.trials],
         }
+
+    async def trial(body: dict[str, Any]) -> dict[str, Any]:
+        """The service the callbacks picked, tried once on their own sample against their `expect` and never charged:
+        the answer is the score, so they can decide before they call it."""
+        service = await _service(agent, body["handle"], body["capability_id"])
+        return _trial(await agent.aio.try_service(service, body.get("sample"), body.get("expect")))
 
     async def call(body: dict[str, Any]) -> dict[str, Any]:
         service = await _service(agent, body["handle"], body["capability_id"])
@@ -521,6 +594,16 @@ def local_api(agent: Agent) -> Starlette:
     async def message(body: dict[str, Any]) -> dict[str, Any]:
         return await agent.aio.message(body["connection_id"], body["text"])
 
+    async def outreach(body: dict[str, Any]) -> dict[str, Any]:
+        """First contact with an agent this one is not connected to; `need_id` or `capability_id` name what it is
+        about. A reply in a thread goes with `thread_id` instead of `to`."""
+        if body.get("thread_id"):
+            return await agent.aio.outreach_reply(str(body["thread_id"]), str(body["text"]))
+        refs = {key: str(body[key]) for key in ("need_id", "capability_id") if body.get(key)}
+        return await agent.aio.outreach(
+            str(body["to"]), str(body["intent"]), str(body["text"]), refs, str(body.get("idempotency_key") or "")
+        )
+
     async def close_agreement(body: dict[str, Any]) -> dict[str, Any]:
         """The agreement for the service ends and its review period opens on both sides."""
         service = await _service(agent, body["handle"], body["capability_id"])
@@ -531,11 +614,11 @@ def local_api(agent: Agent) -> Starlette:
 
     async def service(body: dict[str, Any]) -> dict[str, Any]:
         """A service the agent plans to use (`uses` in eukollab.json): chosen with trials on the first call, preferring
-        `prefer`, then called. `expect` is a JSON Schema the output must satisfy when the provider is chosen."""
+        `prefer`, then called. `expect` is what the trials are scored against when the provider is chosen: an
+        expectation, a JSON Schema the output must satisfy, or words."""
         need, prefer, expect = str(body["need"]), body.get("prefer"), body.get("expect")
         if (need, prefer) not in planned:
-            check = (lambda out: not any(jsonschema.Draft202012Validator(expect).iter_errors(out))) if expect else None
-            planned[(need, prefer)] = agent.service(need, prefer=prefer, sample=body.get("sample"), check=check)
+            planned[(need, prefer)] = agent.service(need, prefer=prefer, sample=body.get("sample"), expect=expect)
         declared = planned[(need, prefer)]
         result = await agent.aio.call_planned(declared, body.get("input") or {}, body.get("idempotency_key"))
         return {
@@ -551,8 +634,10 @@ def local_api(agent: Agent) -> Starlette:
         "post_need": post_need,
         "find": find,
         "choose": choose,
+        "trial": trial,
         "call": call,
         "message": message,
+        "outreach": outreach,
         "close_agreement": close_agreement,
         "service": service,
     }
@@ -567,6 +652,10 @@ def local_api(agent: Agent) -> Starlette:
             return JSONResponse({"error": "NOT_FOUND"}, status_code=404)
         try:
             return JSONResponse(await action(await request.json()))
+        except NoProvider as exc:
+            # Every candidate considered and why none passed, so the callbacks can post a need instead.
+            detail = exc.detail | {"trials": [_trial(t) for t in exc.trials]}
+            return JSONResponse({"error": exc.code, "message": str(exc), "detail": detail}, status_code=409)
         except BalanceLow as exc:
             # `detail` carries what the next pack needs (`needed`, `currency`), so the callbacks can tell their person.
             return JSONResponse({"error": exc.code, "message": str(exc), "detail": exc.detail}, status_code=402)

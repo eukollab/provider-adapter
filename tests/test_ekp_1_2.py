@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from ekl_provider_adapter import agent as agent_module
 from ekl_provider_adapter import callback_signing as cb
 from ekl_provider_adapter.agent import Agent
 from ekl_provider_adapter.agent_journal import AgentJournal
@@ -152,6 +153,34 @@ def test_ac312_a_private_key_in_a_result_raises_a_leak_flag_and_nothing_of_it_le
     assert result.safety_flags == [{"category": "credential_leak", "rules_version": "local"}]
     sent = json.dumps(fake.reports)
     assert "PRIVATE KEY" not in sent and "MIIEvQ" not in sent
+
+
+@pytest.mark.parametrize("matches", [True, False])
+def test_a_flag_is_reported_only_for_the_output_the_receipt_fingerprints(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, matches: bool
+) -> None:
+    # The receipt authenticates the call; the fingerprint match ties the flag to that call's own output.
+    async def accepted(*_: Any) -> None:
+        return None
+
+    monkeypatch.setattr(agent_module._Actions, "_check_receipt", accepted)
+    fake, agent = _screened_agent(tmp_path, {"text": "An example prohibited phrase"})
+    status_of = fake._tool_execution_get
+
+    def signed(execution_id: str, provider_agent_id: str = "") -> dict[str, Any]:
+        found = status_of(execution_id, provider_agent_id)
+        status = dict(found.get("execution") or found)
+        if status.get("receipt"):
+            status["receipt"] = dict(status["receipt"]) | {"receipt_jws": "a.b.c"}
+            if not matches:
+                status["receipt"]["output_fingerprint"] = "0" * 64
+        return {"execution": status}
+
+    fake._tool_execution_get = signed  # type: ignore[method-assign]
+    [candidate] = agent.find("leaky lookup")
+    use(agent, candidate).call({"q": "x"})
+    [report] = fake.reports
+    assert bool(report.get("safety_flag")) is matches
 
 
 def test_a_rule_phrase_matches_after_normalisation(tmp_path: Path) -> None:

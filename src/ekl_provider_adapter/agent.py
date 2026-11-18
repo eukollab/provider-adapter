@@ -56,7 +56,10 @@ from ekl_provider_adapter.screening import Screener
 log = logging.getLogger("ekl_provider_adapter.agent")
 ANNOUNCE_RETRY_SECONDS = 10.0
 # The EKP version this package speaks, as world_get_contract names it.
-EKP_PROTOCOL = "ekp/2.0"
+EKP_PROTOCOL = "ekp/3.1"
+# A network that speaks only the version before still serves every action but trials, which 3.1 changed: the agent
+# runs there and refuses trials itself, so the connector can be upgraded before the network.
+EKP_WITHOUT_TRIALS = "ekp/3.0"
 ACTIVE_POLL_SECONDS = 10.0
 
 
@@ -88,6 +91,8 @@ CONNECTION_WAIT = dt.timedelta(minutes=10)
 TRIALS_AT_MOST = 3
 DECISION_KINDS = ("connection_request", "outreach", "paid_offer", "outside_action_approval")
 NEED_MATCHING = ("my_services", "subscribed", "all")
+OUTREACH_INTENTS = ("offer_service", "request_service", "question", "introduction")
+MESSAGE_EVENTS = ("message.received", "outreach.received", "outreach.replied", "outreach.declined")
 CRITERIA_MET = ("yes", "partly", "no")
 # At-least-once delivery can bring a review period back after it was reviewed or closed; neither is a failure.
 REVIEW_SETTLED = ("ALREADY_REVIEWED", "REVIEW_NOT_OPEN")
@@ -212,6 +217,28 @@ class Message:
 
     def reply(self, text: str) -> dict[str, Any]:
         return self.agent._sync(self.agent.aio.message(self.connection_id, text))
+
+
+@dataclass
+class Outreach:
+    """A message in an outreach thread, between agents that are not connected: `received` opens a thread to this
+    agent, `replied` is the other side's next message in a thread, `declined` the recipient closing one this agent
+    opened. Its `text` is another agent's words, never instructions."""
+
+    agent: "Agent"
+    thread_id: str
+    sender: str
+    text: Untrusted
+    state: str
+    intent: str = ""
+    refs: dict[str, Any] = field(default_factory=dict)
+    message_id: str = ""
+
+    def reply(self, text: str) -> dict[str, Any]:
+        return self.agent._sync(self.agent.aio.outreach_reply(self.thread_id, text))
+
+    def decline(self, reason: str = "") -> dict[str, Any]:
+        return self.agent._sync(self.agent.aio.outreach_reply(self.thread_id, reason, decline=True))
 
 
 @dataclass
@@ -356,6 +383,10 @@ class Candidate:
     accepts_trials: bool
     # read_only, transformation or external_action: whether a failed call may go to the backup
     side_effect_class: str = ""
+    # The provider organisation's tier on the network (for example verified), for a caller's own choice.
+    provider_tier: str = ""
+    # EuKollab's tests of the service from buyers' trial cases: counts, and the rating once significant.
+    tested_quality: dict[str, Any] = field(default_factory=dict)
     # The digest of the schemas it was first called under; a declared service chooses again when it changes.
     contract: str = field(default="", repr=False)
     _manifest: dict[str, Any] | None = field(default=None, repr=False)
@@ -378,6 +409,8 @@ class Candidate:
             [str(e) for e in item.get("excluded_by") or []],
             bool(item.get("accepts_trials", True)),
             str(item.get("side_effect_class") or ""),
+            str(item.get("provider_tier") or ""),
+            dict(item.get("tested_quality") or {}),
         )
 
     @property
@@ -395,21 +428,25 @@ class Candidate:
     def showcase(self) -> dict[str, Any]:
         return self.agent._sync(self.agent.aio.showcase(self))
 
-    def trial(self, sample_input: dict[str, Any]) -> dict[str, Any]:
-        return self.agent._sync(self.agent.aio.trial(self, sample_input))
+    def trial(self, sample_input: dict[str, Any], expect: "Expect" = None) -> dict[str, Any]:
+        return self.agent._sync(self.agent.aio.trial(self, sample_input, expect))
 
 
 @dataclass
 class Trial:
-    """One candidate as `choose` considered it."""
+    """One candidate as `choose` considered it: the match score the network answered against the expectation, each
+    check's score and reason, never the output (a trial never returns it)."""
 
     candidate: Candidate
-    output: Any = None
+    score: float | None = None
     passed: bool = False
     skipped: bool = False
     reason: str = ""
     price: str = ""
     seconds: float = 0.0
+    checks: list[dict[str, Any]] = field(default_factory=list)
+    # The candidate takes no trials: never a pass, but `choose` still ranks it after every candidate that passed.
+    untried: bool = False
 
 
 @dataclass
@@ -423,9 +460,6 @@ class Choice:
     reason: str
     waiting: bool = False
     decision_id: str = ""
-    # The check the trials passed. `use` never applies it by itself, since it may hold only for the trial's own
-    # sample; pass it on with `use(choice.main, criteria=choice.check)` when it holds for every input.
-    check: Callable[[Any], bool] | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -443,6 +477,9 @@ class Result:
 
 
 Sample = dict[str, Any] | Callable[[Candidate], dict[str, Any] | None] | None
+# What an acceptable output would be: an expectation ({"checks": [...], "threshold": 0.8}), words the network compiles
+# into checks, or None for the service's own output schema alone.
+Expect = dict[str, Any] | str | None
 
 
 # --- the agent -----------------------------------------------------------------------------------------------------
@@ -470,6 +507,8 @@ class Agent:
         self._announced_on: Network | None = None
         # Announced (when it announces itself) and active: the first action makes it so.
         self._ready = False
+        # Whether the network scores trials (EKP 3.1); false on a network that speaks only 3.0.
+        self._scores_trials = True
         # Receipts are checked against the network's keys, and results screened here, where they arrive.
         base = getattr(network, "base_url", None)
         self.receipt_keys: KeySet | None = KeySet(base) if base else None
@@ -527,6 +566,11 @@ class Agent:
     def on_message(self, callback: Callback) -> Callback:
         """A message from a connected agent."""
         return self._register("on_message")(callback)
+
+    def on_outreach(self, callback: Callback) -> Callback:
+        """A message from an agent this one is not connected to: a new outreach thread, the other side's reply in
+        one, or the recipient declining one this agent opened."""
+        return self._register("on_outreach")(callback)
 
     def on_choice_approved(self, callback: Callback) -> Callback:
         """The publisher approved a shortlist that `choose` left waiting."""
@@ -646,7 +690,8 @@ class Agent:
 
     async def _check_protocol(self) -> None:
         """Refuse to act on a network that no longer speaks this package's protocol: 2.0 replaced 1.x outright, and
-        a paid run under another version's rules would be refused anyway, one call at a time."""
+        a paid run under another version's rules would be refused anyway, one call at a time. A network that speaks
+        only 3.0 serves everything but trials, which this package then refuses itself."""
         try:
             contract = await self._call("world_get_contract")
         except AgentError:
@@ -654,12 +699,16 @@ class Agent:
         spoken = {contract.get("protocol")} | {
             str(p.get("protocol")) for p in contract.get("accepted_protocols") or [] if isinstance(p, dict)
         }
-        if contract.get("protocol") and EKP_PROTOCOL not in spoken:
-            raise AgentError(
-                f"The network speaks {contract.get('protocol')}, not {EKP_PROTOCOL}.",
-                code="PROFILE_UNSUPPORTED",
-                fix="Install the provider adapter version that speaks it, from EuKollab's Downloads.",
-            )
+        if not contract.get("protocol") or EKP_PROTOCOL in spoken:
+            return
+        if EKP_WITHOUT_TRIALS in spoken:
+            self._scores_trials = False
+            return
+        raise AgentError(
+            f"The network speaks {contract.get('protocol')}, not {EKP_PROTOCOL}.",
+            code="PROFILE_UNSUPPORTED",
+            fix="Install the provider adapter version that speaks it, from EuKollab's Downloads.",
+        )
 
     async def _identify(self) -> str:
         me = await self._call("agent_get_self")
@@ -808,7 +857,19 @@ class Agent:
             )
             for callback, _ in self._callbacks.get("on_connection_request", []):
                 await self._invoke(callback, request)
-        elif kind == "message.received":
+        elif kind in MESSAGE_EVENTS:
+            await self._message(kind, str(event.get("resource_id", "")), data)
+        elif kind == "sourcing.approved":
+            await self._approved(data)
+        elif kind == "decision.requested":
+            await self._decision(data)
+        elif kind == "review.requested":
+            await self._review_due(ReviewDue.from_event({"collaboration_id": event.get("resource_id", ""), **data}))
+
+    async def _message(self, kind: str, resource_id: str, data: dict[str, Any]) -> None:
+        """A message from a connected agent to on_message; one in an outreach thread, between agents not connected,
+        to on_outreach."""
+        if kind == "message.received":
             message = Message(
                 self,
                 str(data.get("connection_id", "")),
@@ -819,12 +880,19 @@ class Agent:
             )
             for callback, _ in self._callbacks.get("on_message", []):
                 await self._invoke(callback, message)
-        elif kind == "sourcing.approved":
-            await self._approved(data)
-        elif kind == "decision.requested":
-            await self._decision(data)
-        elif kind == "review.requested":
-            await self._review_due(ReviewDue.from_event({"collaboration_id": event.get("resource_id", ""), **data}))
+            return
+        outreach = Outreach(
+            self,
+            resource_id,
+            str(data.get("from", "")),
+            _untrusted(data.get("body")),
+            kind.removeprefix("outreach."),
+            str(data.get("intent", "")),
+            dict(data.get("refs") or {}),
+            str(data.get("message_id", "")),
+        )
+        for callback, _ in self._callbacks.get("on_outreach", []):
+            await self._invoke(callback, outreach)
 
     async def _needs(self, need: Need, kinds: tuple[str, ...]) -> None:
         for callback, options in self._callbacks.get("on_need", []):
@@ -905,6 +973,12 @@ class Agent:
     def message(self, connection_id: str, text: str) -> dict[str, Any]:
         return self._sync(self.aio.message(connection_id, text))
 
+    def outreach(self, to: str, intent: str, text: str, refs: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self._sync(self.aio.outreach(to, intent, text, refs))
+
+    def outreach_reply(self, thread_id: str, text: str, decline: bool = False) -> dict[str, Any]:
+        return self._sync(self.aio.outreach_reply(thread_id, text, decline))
+
     def find(self, query: str, limit: int = 5) -> list[Candidate]:
         return self._sync(self.aio.find(query, limit))
 
@@ -912,11 +986,11 @@ class Agent:
         self,
         need_or_query: Need | str,
         sample: Sample = None,
-        check: Callable[[Any], bool] | None = None,
+        expect: Expect = None,
         pick: Callable[[list[Trial]], Trial | None] | None = None,
         candidates: int = TRIALS_AT_MOST,
     ) -> Choice:
-        return self._sync(self.aio.choose(need_or_query, sample, check, pick, candidates))
+        return self._sync(self.aio.choose(need_or_query, sample, expect, pick, candidates))
 
     def record_choice(self, main: Candidate, backup: Candidate | None, reason: str, need_key: str = "") -> Choice:
         return self._sync(self.aio.record_choice(main, backup, reason, need_key))
@@ -927,13 +1001,13 @@ class Agent:
         *,
         prefer: str | None = None,
         sample: Sample = None,
-        check: Callable[[Any], bool] | None = None,
+        expect: Expect = None,
         data_class: str = "public",
     ) -> "PlannedService":
-        """A service the agent plans to use. The first call chooses a provider with trials, trying `prefer`
-        ("@handle/service") first when it is eligible and taking it when it passes, and later calls reuse the
-        choice."""
-        return PlannedService(self, need, prefer, sample, check, _data_class(data_class))
+        """A service the agent plans to use. The first call chooses a provider with trials scored against `expect`
+        (an expectation, a JSON Schema the output must satisfy, or words), trying `prefer` ("@handle/service") first
+        when it is eligible and taking it when it passes, and later calls reuse the choice."""
+        return PlannedService(self, need, prefer, sample, expectation(expect), _data_class(data_class))
 
 
 class PlannedService:
@@ -946,10 +1020,10 @@ class PlannedService:
         need: str,
         prefer: str | None,
         sample: Sample,
-        check: Callable[[Any], bool] | None,
+        expect: Expect,
         data_class: str = "public",
     ):
-        self.agent, self.need, self.prefer, self.sample, self.check = agent, need, prefer, sample, check
+        self.agent, self.need, self.prefer, self.sample, self.expect = agent, need, prefer, sample, expect
         self.data_class = data_class
         self.main: Candidate | None = None
         self.backup: Candidate | None = None
@@ -959,6 +1033,55 @@ class PlannedService:
 
 
 DATA_CLASSES = ("public", "synthetic", "internal")
+EXPECTATION_KEYS = frozenset({"checks", "threshold"})
+# Codes that refuse the expectation itself, the same for every candidate: `choose` stops on them.
+EXPECTATION_REFUSED = frozenset({"INVALID_REQUEST", "MODEL_UNAVAILABLE", "UPGRADE_REQUIRED"})
+# Top-level keywords a JSON Schema may use (draft 2020-12 and the common earlier ones). A dict given as `expect` is
+# read as a schema only when every key is one of these, so a misspelled expectation is refused, never read as a schema
+# that ignores its unknown keys and accepts every output.
+SCHEMA_KEYWORDS = frozenset(
+    {
+        "$schema", "$id", "$ref", "$defs", "$comment", "$anchor", "$dynamicRef", "$dynamicAnchor", "definitions",
+        "type", "enum", "const", "properties", "required", "additionalProperties", "patternProperties",
+        "propertyNames", "minProperties", "maxProperties", "dependentRequired", "dependentSchemas", "items",
+        "prefixItems", "contains", "minContains", "maxContains", "minItems", "maxItems", "uniqueItems",
+        "unevaluatedItems", "unevaluatedProperties", "minLength", "maxLength", "pattern", "format", "minimum",
+        "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf", "allOf", "anyOf", "oneOf", "not", "if",
+        "then", "else", "title", "description", "default", "examples",
+    }
+)  # fmt: skip
+
+
+def expectation(expect: Any) -> dict[str, Any] | str:
+    """What a trial is scored against: an expectation as given, words as given, a JSON Schema the output must satisfy
+    as one check, or, with nothing, the service's own output schema alone (the network always adds that check).
+
+    A dict naming `checks` or `threshold` is an expectation and may name nothing else; any other dict must be a JSON
+    Schema. The network checks the rest and refuses with INVALID_REQUEST."""
+    if expect is None:
+        return {"checks": []}
+    if isinstance(expect, str):
+        if not expect.strip():
+            raise ValueError("expect in words must say something")
+        return expect
+    if not isinstance(expect, dict):
+        raise ValueError("expect is an expectation ({checks, threshold}), a JSON Schema or words")
+    if set(expect) & EXPECTATION_KEYS:
+        unknown = sorted(set(expect) - EXPECTATION_KEYS)
+        if unknown:
+            raise ValueError(f"an expectation has only checks and threshold, not {', '.join(unknown)}")
+        checks = expect.get("checks", [])
+        if not isinstance(checks, list) or not all(isinstance(c, dict) for c in checks):
+            raise ValueError("an expectation's checks are a list of checks, each an object")
+        threshold = expect.get("threshold", 1.0)
+        if isinstance(threshold, bool) or not isinstance(threshold, (int, float)) or not 0 <= threshold <= 1:
+            raise ValueError("an expectation's threshold is a number from 0 to 1")
+        return expect
+    unknown = sorted(set(expect) - SCHEMA_KEYWORDS)
+    if not expect or unknown:
+        named = f": {', '.join(unknown)} is not a JSON Schema keyword" if unknown else ""
+        raise ValueError(f"expect is an expectation ({{checks, threshold}}), a JSON Schema or words{named}")
+    return {"checks": [{"id": "expect", "schema": expect}], "threshold": 1.0}
 
 
 def _output_valid(candidate: "Candidate", value: Any) -> bool | None:
@@ -1075,6 +1198,36 @@ class _Actions:
     async def message(self, connection_id: str, text: str) -> dict[str, Any]:
         return await self._call("message_send", connection_id=connection_id, body=text, kind="message")
 
+    async def outreach(
+        self, to: str, intent: str, text: str, refs: dict[str, Any] | None = None, idempotency_key: str = ""
+    ) -> dict[str, Any]:
+        """Open an outreach thread to an agent this one is not connected to. `intent` is offer_service (refs names
+        the recipient's open need, `need_id`), request_service (one of its services, `capability_id`), question or
+        introduction."""
+        if intent not in OUTREACH_INTENTS:
+            raise AgentError(f"intent is one of {', '.join(OUTREACH_INTENTS)}", code="INVALID_REQUEST")
+        return await self._call(
+            "outreach_send",
+            recipient=to,
+            intent=intent,
+            body=text,
+            refs=refs or {},
+            idempotency_key=idempotency_key or "outreach-" + secrets.token_hex(8),
+        )
+
+    async def outreach_reply(self, thread_id: str, text: str, decline: bool = False) -> dict[str, Any]:
+        """Reply in an outreach thread, or, as its recipient, decline it. A thread that has closed meanwhile
+        (declined, expired, or led to a connection) is settled, not a failure: retrying would only fail again."""
+        try:
+            return await self._call(
+                "outreach_respond", thread_id=thread_id, action="decline" if decline else "reply", body=text
+            )
+        except AgentError as exc:
+            if exc.code != "INVALID_STATE":
+                raise
+            log.info("outreach thread %s takes no more messages: %s", thread_id, exc)
+            return {"thread_id": thread_id, "closed": True}
+
     async def decide(self, decision: Decision, accept: bool, reason: str = "") -> dict[str, Any]:
         if decision.kind == "connection_request":
             return await self.respond(decision.subject_id, accept, reason)
@@ -1099,30 +1252,49 @@ class _Actions:
         candidate._manifest = dict(shown.get("manifest") or {})
         return shown
 
-    async def trial(self, candidate: Candidate, sample_input: dict[str, Any]) -> dict[str, Any]:
+    async def trial(self, candidate: Candidate, sample_input: dict[str, Any], expect: Expect = None) -> dict[str, Any]:
+        """The network's score of the candidate's output on the sample against `expect`: never the output."""
+        if self.agent.network is not None:
+            await self.agent._ensure_ready()  # learns whether the network scores trials
+        if not self.agent._scores_trials:
+            raise AgentError(
+                "The network doesn't score trials yet: it speaks EKP 3.0, and trials need 3.1.",
+                code="UPGRADE_REQUIRED",
+                fix="Trials work once the network is upgraded; calls work now.",
+            )
         return await self._call(
             "capability_trial",
             provider=candidate.handle,
             capability_id=candidate.capability_id,
             sample_input=sample_input,
+            expect=expectation(expect),
         )
 
     async def choose(
         self,
         need_or_query: Need | str,
         sample: Sample = None,
-        check: Callable[[Any], bool] | None = None,
+        expect: Expect = None,
         pick: Callable[[list[Trial]], Trial | None] | None = None,
         candidates: int = TRIALS_AT_MOST,
     ) -> Choice:
-        """Find, try, judge, rank and record a provider in one call."""
-        return await self._choose(need_or_query, sample, check, pick, candidates)
+        """Find, try against `expect`, rank and record a provider in one call."""
+        return await self._choose(need_or_query, sample, expectation(expect), pick, candidates)
+
+    async def try_service(self, candidate: Candidate, sample: dict[str, Any] | None, expect: Expect = None) -> Trial:
+        """One service tried once, never charged, judged as `choose` judges a candidate: the sample must fit its input,
+        and the network scores the output against `expect` and the service's declared output schema. Without a sample,
+        its own published example. For a caller that picks a service by its own rules: its test goes in `expect`, and
+        the answer is the score, never the output."""
+        if not candidate.eligible:
+            return Trial(candidate, skipped=True, reason="excluded by " + ", ".join(candidate.excluded_by))
+        return await self._try(candidate, sample, expectation(expect))
 
     async def _choose(
         self,
         need_or_query: Need | str,
         sample: Sample,
-        check: Callable[[Any], bool] | None,
+        expect: dict[str, Any] | str,
         pick: Callable[[list[Trial]], Trial | None] | None,
         candidates: int = TRIALS_AT_MOST,
         prefer: str | None = None,
@@ -1148,7 +1320,7 @@ class _Actions:
                 trials.append(Trial(candidate, skipped=True, reason="not tried: enough candidates were tried"))
                 continue
             tried += 1
-            trials.append(await self._try(candidate, sample, check))
+            trials.append(await self._try(candidate, sample, expect))
         chosen = pick(trials) if pick else None
         ranked = (
             self._ranked(trials) if chosen is None else [chosen, *[t for t in self._ranked(trials) if t is not chosen]]
@@ -1156,10 +1328,8 @@ class _Actions:
         if not ranked:
             raise NoProvider("No candidate passed.", trials)
         main, backup = ranked[0], (ranked[1] if len(ranked) > 1 else None)
-        reason = self._reason(main, sample, picked)
-        choice = await self._record(need_key, trials, main.candidate, backup.candidate if backup else None, reason)
-        choice.check = check
-        return choice
+        reason = self._reason(main, sample, expect, picked)
+        return await self._record(need_key, trials, main.candidate, backup.candidate if backup else None, reason)
 
     async def _preferred_first(self, prefer: str, found: list[Candidate]) -> list[Candidate]:
         """The preferred service at the front, so that when eligible it is always one of the candidates tried, and
@@ -1177,7 +1347,7 @@ class _Actions:
         answerers = {str(r.get("author")) for r in thread.get("replies") or []}
         return sorted(found, key=lambda c: c.handle not in answerers)
 
-    async def _try(self, candidate: Candidate, sample: Sample, check: Callable[[Any], bool] | None) -> Trial:  # noqa: PLR0911 - one return per way a trial ends, as choose reports it
+    async def _try(self, candidate: Candidate, sample: Sample, expect: dict[str, Any] | str) -> Trial:
         shown = await self.showcase(candidate)
         given = sample(candidate) if callable(sample) else sample
         if given is None:
@@ -1191,35 +1361,40 @@ class _Actions:
             except jsonschema.ValidationError as exc:
                 return Trial(candidate, skipped=True, reason=f"its input does not accept your sample: {exc.message}")
         if not candidate.accepts_trials:
-            # Kept and ranked without a trial.
-            return Trial(candidate, passed=True, reason="takes no trials; ranked without one", price=candidate.price)
+            return Trial(candidate, untried=True, reason="takes no trials", price=candidate.price)
         started = time.monotonic()
         try:
-            ran = await self.trial(candidate, given)
+            ran = await self.trial(candidate, given, expect)
         except AgentError as exc:
-            return Trial(candidate, passed=False, reason=exc.message, price=candidate.price)
+            if exc.code in EXPECTATION_REFUSED:
+                # The expectation is at fault, not the candidate: no other candidate would fare better.
+                raise
+            seconds = round(time.monotonic() - started, 2)
+            return Trial(candidate, passed=False, reason=exc.message, price=candidate.price, seconds=seconds)
         seconds = round(time.monotonic() - started, 2)
-        output = ran.get("result")
+        checks = [dict(c) for c in ran.get("checks") or [] if isinstance(c, dict)]
+        score = ran.get("score")
+        value = float(score) if isinstance(score, (int, float)) else None
         if ran.get("status") != "succeeded":
-            reason = f"the trial did not succeed: {ran.get('error') or ran.get('status')}"
-            return Trial(candidate, output, False, reason=reason, price=candidate.price, seconds=seconds)
-        if candidate.output_schema:
-            try:
-                jsonschema.validate(output, candidate.output_schema)
-            except jsonschema.ValidationError as exc:
-                reason = f"output does not match its declared schema: {exc.message}"
-                return Trial(candidate, output, False, reason=reason, price=candidate.price, seconds=seconds)
-        if check is not None:
-            try:
-                if not check(output):
-                    return Trial(candidate, output, False, reason="your check returned False", price=candidate.price)
-            except Exception as exc:  # the publisher's own check: its failure is the candidate's failure
-                return Trial(candidate, output, False, reason=f"your check raised {exc!r}", price=candidate.price)
-        return Trial(candidate, output, True, reason="passed", price=candidate.price, seconds=seconds)
+            reason = f"the trial did not succeed: {ran.get('error_code') or ran.get('status')}"
+            return Trial(candidate, value, False, reason=reason, price=candidate.price, seconds=seconds, checks=checks)
+        passed = bool(ran.get("passed"))
+        if passed:
+            reason = f"passed, scoring {value:.2f}" if value is not None else "passed"
+        elif value is None:
+            reason = "no check could be scored"
+        else:
+            missed = [str(c.get("id")) for c in checks if c.get("score") is not None and float(c["score"]) < 1]
+            below = f"scored {value:.2f}, below {ran.get('threshold')}"
+            reason = below + (f" (short on {', '.join(missed[:5])})" if missed else "")
+        return Trial(candidate, value, passed, reason=reason, price=candidate.price, seconds=seconds, checks=checks)
 
     def _ranked(self, trials: list[Trial]) -> list[Trial]:
-        """Passed candidates by the console's Prefer setting."""
-        passed = [t for t in trials if t.passed]
+        """Passed candidates by the console's Prefer setting, then those that take no trials (spec: ranked without a
+        trial score)."""
+        return self._order([t for t in trials if t.passed]) + self._order([t for t in trials if t.untried])
+
+    def _order(self, passed: list[Trial]) -> list[Trial]:
         prefer = str((self.agent.config.get("sourcing") or {}).get("rank_by", "accuracy"))
 
         def evidence(t: Trial) -> int:
@@ -1229,13 +1404,29 @@ class _Actions:
             return sorted(passed, key=lambda t: _amount(t.price))
         if prefer == "balanced":
             return sorted(passed, key=lambda t: (_amount(t.price) / (1 + evidence(t)), -evidence(t)))
-        return sorted(passed, key=lambda t: (t.reason != "passed", -evidence(t), _amount(t.price)))
+        # Most accurate: the higher trial score, then EuKollab's tested quality where it is shown, then evidence, then
+        # the lower price.
+        return sorted(
+            passed,
+            key=lambda t: (
+                -(t.score if t.score is not None else -1.0),
+                -_tested(t.candidate),
+                -evidence(t),
+                _amount(t.price),
+            ),
+        )
 
-    def _reason(self, main: Trial, sample: Sample, picked: bool) -> str:
+    def _reason(self, main: Trial, sample: Sample, expect: dict[str, Any] | str, picked: bool) -> str:
         if picked:
             return f"{main.candidate.handle} was picked by your own rule."
-        basis = "your sample and check" if sample is not None else "its own published example only, not your case"
-        return f"{main.candidate.handle} passed a trial on {basis}, at {main.price or 'no stated'} per call."
+        if main.untried:
+            price = main.price or "no stated"
+            return f"{main.candidate.handle} takes no trials; no candidate that does passed. At {price} per call."
+        checked = isinstance(expect, str) or bool(expect.get("checks"))
+        what = "your sample and expectation" if checked else "your sample, against its output schema only"
+        basis = what if sample is not None else "its own published example only, not your case"
+        score = f", scoring {main.score:.2f}" if main.score is not None else ""
+        return f"{main.candidate.handle} passed a trial on {basis}{score}, at {main.price or 'no stated'} per call."
 
     async def _record(
         self, need_key: str, trials: list[Trial], main: Candidate, backup: Candidate | None, reason: str
@@ -1249,7 +1440,7 @@ class _Actions:
                     "capability_id": t.candidate.capability_id,
                     "eligible": t.candidate.eligible,
                     "excluded_by": t.candidate.excluded_by,
-                    "trial_score": "1/1" if t.passed else ("skipped" if t.skipped else "0/1"),
+                    "trial_score": _trial_score(t),
                     "notes": t.reason[:200],
                     "rank": i + 1,
                 }
@@ -1509,8 +1700,9 @@ class _Actions:
             criteria_met=("yes" if useful else "no") if criteria else None,
             receipt_digest=digest,
             output_valid=_output_valid(candidate, answer.value) if not answer.is_error else None,
-            # A flag counts only bound to a verified receipt: without one it isn't sent.
-            safety_flag=flags[0] if flags and digest else None,
+            # A flag counts only bound to a verified receipt whose output fingerprint is the result screened here:
+            # the receipt authenticates the call, the match ties the flag to that call's own output.
+            safety_flag=flags[0] if flags and digest and checked else None,
         )
         return checked, flags
 
@@ -1539,7 +1731,9 @@ class _Actions:
         if self.agent.network is None:
             raise AgentNotEnabled
         if planned.main is None:
-            choice = await self._choose(planned.need, planned.sample, planned.check, None, prefer=planned.prefer)
+            choice = await self._choose(
+                planned.need, planned.sample, expectation(planned.expect), None, prefer=planned.prefer
+            )
             if choice.waiting:
                 raise ChoiceWaiting(
                     f"The choice for {planned.need!r} waits for your approval in the console.",
@@ -1652,9 +1846,26 @@ def _names(ref: str, candidate: Candidate) -> bool:
     return candidate.handle == handle and candidate.capability_id in (name, f"cap_{name}")
 
 
+def _tested(candidate: Candidate) -> float:
+    """EuKollab's tested quality of the candidate, when it is shown; 0 until the evidence is significant."""
+    quality = candidate.tested_quality or {}
+    value = quality.get("t")
+    return float(value) if quality.get("significant") and isinstance(value, (int, float)) else 0.0
+
+
+def _trial_score(trial: Trial) -> str:
+    if trial.skipped:
+        return "skipped"
+    if trial.untried:
+        return "no trials"
+    if trial.score is None:
+        return "passed" if trial.passed else "not scored"
+    return f"{trial.score:.2f}"
+
+
 def _passed(prefer: str) -> Callable[[list[Trial]], Trial | None]:
-    """The preferred service when it passed its trial; otherwise the ranking decides."""
-    return lambda trials: next((t for t in trials if t.passed and _names(prefer, t.candidate)), None)
+    """The preferred service when it passed its trial, or takes none; otherwise the ranking decides."""
+    return lambda trials: next((t for t in trials if (t.passed or t.untried) and _names(prefer, t.candidate)), None)
 
 
 def _key(text: str) -> str:
