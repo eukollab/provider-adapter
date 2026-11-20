@@ -5,7 +5,6 @@ connector, and an agent that is several at once. A consumer's MCP client calls t
 as it would any agent, admitted and settled by the network."""
 
 import json
-from pathlib import Path
 from typing import Any
 
 import httpx2
@@ -38,13 +37,14 @@ from ekl_provider_adapter.openapi_upstream import (
     safe_integers,
 )
 from ekl_provider_adapter.upstreams import Upstreams
+from tests.conftest import CONTRACTS
 
 from .a2a_agent import a2a_app
 from .test_connector import CREDENTIAL, ENDPOINT, InProcess, confirmed, homes_server, mcp, network_client, served
 
 pytestmark = pytest.mark.anyio
 
-VECTORS = Path(__file__).resolve().parents[2] / "contracts" / "vectors" / "openapi-tools.json"
+VECTORS = CONTRACTS / "vectors" / "openapi-tools.json"
 
 SPEC: dict[str, Any] = {
     "openapi": "3.1.0",
