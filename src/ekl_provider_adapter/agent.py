@@ -1646,9 +1646,9 @@ class _Actions:
 
     # using a service
 
-    async def _connection(self, candidate: Candidate) -> str:
-        """An active connection with access to the service: reused, or requested and waited for. On a connection to the
-        provider that covers other services, the request asks the provider to add this one."""
+    async def _connection(self, candidate: Candidate, deadline: float) -> str:
+        """An active connection with access to the service: reused, or requested and waited for until `deadline`. On a
+        connection to the provider that covers other services, the request asks the provider to add this one."""
 
         def covering(listed: dict[str, Any]) -> str | None:
             for c in listed.get("connections") or []:
@@ -1663,10 +1663,11 @@ class _Actions:
             "connection_request", target=candidate.handle, capability_ids=[candidate.capability_id], note=""
         )
         connection_id = str(requested["connection_id"])
-        deadline = time.monotonic() + CONNECTION_WAIT.total_seconds()
-        while time.monotonic() < deadline:
+        while True:
             if covering(await self._call("connection_list", state="active")) == connection_id:
                 return connection_id
+            if time.monotonic() >= deadline:
+                break
             await asyncio.sleep(3)
         raise ConnectionPending(
             f"{candidate.handle} has not accepted the connection yet.",
@@ -1675,6 +1676,8 @@ class _Actions:
         )
 
     async def _agreement(self, candidate: Candidate, data_class: str = "public") -> tuple[str, dict[str, Any]]:
+        # The connection and a paid agreement are waited for within one CONNECTION_WAIT, which act() outlasts.
+        deadline = time.monotonic() + CONNECTION_WAIT.total_seconds()
         saved = self.agent.journal.agreement(candidate.handle, candidate.capability_id)
         # An agreement covers one declared data class: sharing another needs another agreement.
         if saved is not None and saved[1].get("data_class", data_class) != data_class:
@@ -1683,16 +1686,12 @@ class _Actions:
         if saved is not None:
             connection_id, agreement = saved
             got = await self._call("engagement_get", collaboration_id=agreement["collaboration_id"])
+            if got.get("engagement_state") == "offered":
+                got = await self._accepted(candidate, agreement, deadline)
             if got.get("engagement_state") == "open":
                 return connection_id, agreement | got
-            if got.get("engagement_state") == "offered":
-                raise AgreementPending(
-                    f"The agreement with {candidate.handle} waits for the provider to accept it.",
-                    code="AGREEMENT_PENDING",
-                    detail={"collaboration_id": agreement["collaboration_id"]},
-                )
             self.agent.journal.forget_agreement(candidate.handle, candidate.capability_id)
-        connection_id = await self._connection(candidate)
+        connection_id = await self._connection(candidate, deadline)
         plan = (candidate.plans or [{"plan_id": "free", "type": "free"}])[0]
         made = await self._call(
             "collaboration_create",
@@ -1706,12 +1705,32 @@ class _Actions:
         made = {**made, "data_class": data_class}
         self.agent.journal.save_agreement(candidate.handle, candidate.capability_id, connection_id, made)
         if made.get("engagement_state") == "offered":
-            raise AgreementPending(
-                f"A paid agreement with {candidate.handle} waits for the provider to accept it.",
-                code="AGREEMENT_PENDING",
-                detail={"collaboration_id": made["collaboration_id"]},
-            )
+            got = await self._accepted(candidate, made, deadline)
+            if got.get("engagement_state") != "open":
+                self.agent.journal.forget_agreement(candidate.handle, candidate.capability_id)
+                raise AgentError(
+                    f"{candidate.handle} did not accept the agreement ({got.get('engagement_state')}).",
+                    code="AGREEMENT_DECLINED",
+                    detail={"collaboration_id": made["collaboration_id"]},
+                )
+            made = made | got
         return connection_id, made
+
+    async def _accepted(self, candidate: Candidate, agreement: dict[str, Any], deadline: float) -> dict[str, Any]:
+        """An offered agreement, waited for as a connection is: a provider's agent usually accepts a paid one on its
+        next pass, within a minute or two, and failing at once would lose the need that asked for it. The engagement
+        as it then stands, open or ended; AgreementPending when it is still offered at `deadline`."""
+        collaboration_id = agreement["collaboration_id"]
+        while time.monotonic() < deadline:
+            await asyncio.sleep(3)
+            got: dict[str, Any] = await self._call("engagement_get", collaboration_id=collaboration_id)
+            if got.get("engagement_state") != "offered":
+                return got
+        raise AgreementPending(
+            f"A paid agreement with {candidate.handle} waits for the provider to accept it.",
+            code="AGREEMENT_PENDING",
+            detail={"collaboration_id": collaboration_id},
+        )
 
     async def close_agreement(self, candidate: Candidate, outcome: str = "completed") -> dict[str, Any]:
         """Close the open agreement with this service, opening its review period; nothing to close is an error."""

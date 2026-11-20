@@ -1179,6 +1179,61 @@ def test_a_connection_not_accepted_in_time_is_refused_as_pending(
     assert vat.calls == 0
 
 
+def test_a_paid_agreement_the_provider_accepts_a_little_later_is_waited_for(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A seller's agent accepts a paid agreement on its next pass; the first call waits for it rather than fail.
+    from ekl_provider_adapter import agent as agent_module  # noqa: PLC0415 - only this test shortens its pauses
+
+    async def no_pause(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(agent_module.asyncio, "sleep", no_pause)
+
+    class Later(FakeNetwork):
+        def _tool_collaboration_create(self, connection_id: str, capability_id: str, **rest: Any) -> dict[str, Any]:
+            made = super()._tool_collaboration_create(connection_id, capability_id, **rest)
+            self.agreements[made["collaboration_id"]]["engagement_state"] = "offered"
+            self.asked = 0
+            return dict(self.agreements[made["collaboration_id"]])
+
+        def _tool_engagement_get(self, collaboration_id: str) -> dict[str, Any]:
+            self.asked += 1
+            if self.asked == 3:
+                self.agreements[collaboration_id]["engagement_state"] = "open"
+            return super()._tool_engagement_get(collaboration_id)
+
+    fake = Later()
+    vat = fake.provider("@vat", "cap_vat_check", lambda _: {"valid": True}, summary="validate vat")
+    agent = _agent(fake, tmp_path)
+    [candidate] = agent.find("validate vat")
+    assert use(agent, candidate).call({"vat_number": "DE1"}).value == {"valid": True}
+    assert vat.calls == 1 and fake.asked >= 3
+
+
+def test_a_paid_agreement_not_accepted_in_time_is_refused_as_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ekl_provider_adapter import agent as agent_module  # noqa: PLC0415 - only this test shortens the wait
+
+    monkeypatch.setattr(agent_module, "CONNECTION_WAIT", agent_module.dt.timedelta(0))
+
+    class Unanswered(FakeNetwork):
+        def _tool_collaboration_create(self, connection_id: str, capability_id: str, **rest: Any) -> dict[str, Any]:
+            made = super()._tool_collaboration_create(connection_id, capability_id, **rest)
+            self.agreements[made["collaboration_id"]]["engagement_state"] = "offered"
+            return dict(self.agreements[made["collaboration_id"]])
+
+    fake = Unanswered()
+    vat = fake.provider("@vat", "cap_vat_check", lambda _: {"valid": True}, summary="validate vat")
+    agent = _agent(fake, tmp_path)
+    [candidate] = agent.find("validate vat")
+    with pytest.raises(AgentError) as pending:
+        use(agent, candidate).call({"vat_number": "DE1"})
+    assert pending.value.code == "AGREEMENT_PENDING" and pending.value.detail["collaboration_id"]
+    assert vat.calls == 0
+
+
 def test_an_unreachable_provider_is_refused_with_its_code(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # Agent code reads ActionRefused.code: an unreachable provider is SERVICE_UNAVAILABLE, never an empty code.
     from ekl_provider_adapter import agent as agent_module  # noqa: PLC0415 - only this test shortens its pauses
