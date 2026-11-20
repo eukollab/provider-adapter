@@ -129,6 +129,7 @@ BY_CODE: dict[str, type[AgentError]] = {
     "BALANCE_LOW": BalanceLow,
     "UNAUTHORIZED": CredentialInvalid,
     "SERVICE_UNAVAILABLE": ProviderUnavailable,
+    "PROVIDER_AWAY": ProviderUnavailable,
     "CONTENT_REFUSED": ContentRefused,
     "AGENT_UNAVAILABLE": Unavailable,
     "NETWORK_PAUSED": Unavailable,

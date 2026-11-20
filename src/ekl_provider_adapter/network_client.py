@@ -22,6 +22,9 @@ from ekl_provider_adapter.fingerprint import result_body
 PROTOCOL_VERSION = "2026-07-28"
 # A long poll waits up to 30 seconds on the network's side.
 TIMEOUT_SECONDS = 60
+# The relay's answer when a relayed provider is not running: the MCP client reports only "an error response", so the
+# code is read from the HTTP answer itself.
+PROVIDER_AWAY = "PROVIDER_AWAY"
 
 
 @dataclass(frozen=True)
@@ -34,6 +37,18 @@ class ProviderAnswer:
     meta: dict[str, Any]
     text: str
     body: Any
+
+
+async def _relay_refusal(response: httpx2.Response, refusals: list[str]) -> None:
+    """Note the relay's PROVIDER_AWAY, a 503 whose JSON body carries the code."""
+    if response.status_code != 503 or not response.headers.get("content-type", "").startswith("application/json"):
+        return
+    try:
+        body = json.loads(await response.aread())
+    except (ValueError, httpx2.HTTPError):
+        return
+    if isinstance(body, dict) and body.get("code") == PROVIDER_AWAY:
+        refusals.append(PROVIDER_AWAY)
 
 
 class Network(Protocol):
@@ -95,7 +110,12 @@ class McpNetwork:
     async def call_provider(
         self, endpoint: str, token: str, tool: str, arguments: dict[str, Any], ekl: dict[str, Any]
     ) -> ProviderAnswer:
-        http = httpx2.AsyncClient(headers={"Authorization": f"Bearer {token}"}, timeout=120)
+        refusals: list[str] = []
+        http = httpx2.AsyncClient(
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=120,
+            event_hooks={"response": [lambda response: _relay_refusal(response, refusals)]},
+        )
         sent = False
         try:
             async with Client(streamable_http_client(endpoint, http_client=http)) as client:
@@ -104,8 +124,15 @@ class McpNetwork:
         except AgentError:
             raise
         except Exception as exc:  # no answer: the outcome is unknown, and the same execution ID finds it later
+            if PROVIDER_AWAY in refusals:
+                # Nothing took the call, so it is known not to have run: another provider may take it.
+                raise ProviderUnavailable(
+                    "The provider isn't running now; try again later.", code=PROVIDER_AWAY, detail={"sent": False}
+                ) from exc
             raise ProviderUnavailable(
-                f"The provider could not be reached ({type(exc).__name__}).", detail={"sent": sent}
+                f"The provider could not be reached ({type(exc).__name__}).",
+                code="SERVICE_UNAVAILABLE",
+                detail={"sent": sent},
             ) from exc
         finally:
             await http.aclose()

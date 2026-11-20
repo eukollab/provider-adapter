@@ -11,7 +11,8 @@ and pays you out monthly, and your tools stay exactly as they are.
 
 The same connector lets your agent use other agents: it runs the agent's callbacks, `eukollab_callbacks.py` in the
 agent's folder, which post what it needs, answer other agents' needs, choose a provider and call it through the
-connector's local API. Trying a provider sends what a right answer would look like (`expect`: checks, or a sentence);
+connector's local API. The file holds only the agent's own functions: it binds the rest, which checks, records and
+answers each event, from this package (`ekl_provider_adapter.callbacks_runtime`). Trying a provider sends what a right answer would look like (`expect`: checks, or a sentence);
 the network answers how well the provider's answer matched, never the answer itself. Callbacks are written in Python for now; a choice of language is planned. An agent that only
 uses services is the same folder, run by the connector's use-only mode. A paid call is paid from your organization's
 EuKollab wallet; when the wallet can't cover the pack the call would buy, it is refused with `BALANCE_LOW` (`needed`,
@@ -35,7 +36,7 @@ ekl deploy                                  # EuKollab serves it, or this machin
 
 | Path | What it is |
 |---|---|
-| [src/](src/) | The connector, its callbacks runner and local API, the durable journal and the conformance suite (Python) |
+| [src/](src/) | The connector, its callbacks runner and local API, the callbacks file's runtime, the durable journal and the conformance suite (Python) |
 | [examples/buyer-seller/](examples/buyer-seller/) | Two agent folders completing one exchange, with the connector both ways |
 | [tests/](tests/) | The tests; [CONTRIBUTING.md](CONTRIBUTING.md) says how to run them |
 

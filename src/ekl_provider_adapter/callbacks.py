@@ -51,6 +51,7 @@ from ekl_provider_adapter.agent import (
     PlannedService,
     ReviewDue,
     Trial,
+    need_key,
 )
 from ekl_provider_adapter.agent_journal import AgentJournal, PendingDecision
 from ekl_provider_adapter.config import is_loopback
@@ -330,6 +331,9 @@ def _listing(c: Candidate) -> dict[str, Any]:
         "tested_quality": c.tested_quality,
         "eligible": c.eligible,
         "excluded_by": c.excluded_by,
+        # This agent's own record with the service, or None when it never called it.
+        "used_before": c.used_before,
+        "still_listed": c.still_listed,
     }
 
 
@@ -561,8 +565,13 @@ def local_api(agent: Agent) -> Starlette:
         return {"need_id": need.post_id}
 
     async def find(body: dict[str, Any]) -> dict[str, Any]:
-        found = await agent.aio.find(body["query"], int(body.get("limit", 5)))
-        return {"candidates": [_listing(c) for c in found]}
+        """The candidates for a query, each with this agent's record where it used them; with `need`, the providers
+        it chose for that need before that the search didn't return, under previously_used."""
+        need = str(body.get("need") or "")
+        found, earlier = await agent.aio.find_with_history(
+            body["query"], int(body.get("limit", 5)), need_key(need) if need else ""
+        )
+        return {"candidates": [_listing(c) for c in found], "previously_used": [_listing(c) for c in earlier]}
 
     async def choose(body: dict[str, Any]) -> dict[str, Any]:
         choice = await agent.aio.choose(body["query"], body.get("sample"), body.get("expect"))
@@ -604,6 +613,12 @@ def local_api(agent: Agent) -> Starlette:
             str(body["to"]), str(body["intent"]), str(body["text"]), refs, str(body.get("idempotency_key") or "")
         )
 
+    async def connect(body: dict[str, Any]) -> dict[str, Any]:
+        """A connection for one of another agent's services, asked for without calling it; with `thread_id`, from the
+        outreach thread the two agents talked in, which then counts as converted."""
+        service = await _service(agent, body["handle"], body["capability_id"])
+        return await agent.aio.connect(service, str(body.get("thread_id") or ""), str(body.get("note") or ""))
+
     async def close_agreement(body: dict[str, Any]) -> dict[str, Any]:
         """The agreement for the service ends and its review period opens on both sides."""
         service = await _service(agent, body["handle"], body["capability_id"])
@@ -620,7 +635,13 @@ def local_api(agent: Agent) -> Starlette:
         if (need, prefer) not in planned:
             planned[(need, prefer)] = agent.service(need, prefer=prefer, sample=body.get("sample"), expect=expect)
         declared = planned[(need, prefer)]
-        result = await agent.aio.call_planned(declared, body.get("input") or {}, body.get("idempotency_key"))
+        result = await agent.aio.call_planned(
+            declared,
+            body.get("input") or {},
+            body.get("idempotency_key"),
+            choose_again=bool(body.get("choose_again")),
+            provider=str(body["provider"]) if body.get("provider") else None,
+        )
         return {
             "value": result.value,
             "execution_id": result.execution_id,
@@ -628,6 +649,8 @@ def local_api(agent: Agent) -> Starlette:
             "receipt_checked": result.receipt_checked,
             "safety_flags": result.safety_flags,
             "provider": declared.main.handle if declared.main else prefer,
+            # Calls left in the packs bought from it, when it is paid.
+            "calls_left": declared.calls_left,
         }
 
     actions = {
@@ -638,6 +661,7 @@ def local_api(agent: Agent) -> Starlette:
         "call": call,
         "message": message,
         "outreach": outreach,
+        "connect": connect,
         "close_agreement": close_agreement,
         "service": service,
     }

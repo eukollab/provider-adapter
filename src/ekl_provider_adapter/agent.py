@@ -22,7 +22,7 @@ import os
 import re
 import secrets
 import time
-from collections.abc import Callable, Coroutine, Iterable
+from collections.abc import Awaitable, Callable, Coroutine, Iterable
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from fractions import Fraction
@@ -56,7 +56,7 @@ from ekl_provider_adapter.screening import Screener
 log = logging.getLogger("ekl_provider_adapter.agent")
 ANNOUNCE_RETRY_SECONDS = 10.0
 # The EKP version this package speaks, as world_get_contract names it.
-EKP_PROTOCOL = "ekp/3.1"
+EKP_PROTOCOL = "ekp/3.2"
 # A network that speaks only the version before still serves every action but trials, which 3.1 changed: the agent
 # runs there and refuses trials itself, so the connector can be upgraded before the network.
 EKP_WITHOUT_TRIALS = "ekp/3.0"
@@ -86,8 +86,13 @@ Callback = Callable[..., Any]
 MAX_ATTEMPTS = 5
 # The pause before a failed callback's next attempt grows by this much each time, up to 30 seconds.
 RETRY_SECONDS = 2.0
+# The longest pause between attempts while the network is unreachable.
+MAX_RETRY_SECONDS = 60.0
 WAIT_SECONDS = 25
-CONNECTION_WAIT = dt.timedelta(minutes=10)
+# How long a call waits for its connection to be accepted before it is refused CONNECTION_PENDING. It stays under the
+# five minutes the callbacks file's act() waits for the local API, so agent code is told CONNECTION_PENDING and keeps
+# its idempotency_key, rather than timing out without knowing why.
+CONNECTION_WAIT = dt.timedelta(minutes=4)
 TRIALS_AT_MOST = 3
 DECISION_KINDS = ("connection_request", "outreach", "paid_offer", "outside_action_approval")
 NEED_MATCHING = ("my_services", "subscribed", "all")
@@ -243,8 +248,8 @@ class Outreach:
 
 @dataclass
 class Decision:
-    """A decision the publisher handed to the agent (Ask my runtime). Answer before `deadline`, or
-    the console's fallback applies."""
+    """A decision the publisher handed to the agent (Decisions your code makes, in the console). Answer before
+    `deadline`, or the console's fallback applies."""
 
     agent: "Agent"
     kind: str
@@ -387,6 +392,11 @@ class Candidate:
     provider_tier: str = ""
     # EuKollab's tests of the service from buyers' trial cases: counts, and the rating once significant.
     tested_quality: dict[str, Any] = field(default_factory=dict)
+    # This agent's own record with the service, when it called it before: first and last use, calls, calls left in
+    # its packs and the reviews it wrote. None for a service it never called.
+    used_before: dict[str, Any] | None = None
+    # False for a provider chosen for the need before that is no longer listed: named, never offered.
+    still_listed: bool = True
     # The digest of the schemas it was first called under; a declared service chooses again when it changes.
     contract: str = field(default="", repr=False)
     _manifest: dict[str, Any] | None = field(default=None, repr=False)
@@ -411,7 +421,41 @@ class Candidate:
             str(item.get("side_effect_class") or ""),
             str(item.get("provider_tier") or ""),
             dict(item.get("tested_quality") or {}),
+            dict(item["used_before"]) if item.get("used_before") else None,
+            bool(item.get("still_listed", True)),
         )
+
+    @property
+    def used(self) -> bool:
+        """Whether this agent called the service before."""
+        return bool(self.used_before and int(self.used_before.get("calls") or 0) > 0)
+
+    @property
+    def calls_left(self) -> int:
+        return int((self.used_before or {}).get("calls_left") or 0)
+
+    @property
+    def paid(self) -> bool:
+        """Whether calling it uses packs: a paid plan, or a price per call."""
+        return any(p.get("type") == "pack" and _amount(str(p.get("price", "0"))) > 0 for p in self.plans) or (
+            not self.plans and _amount(self.price) > 0
+        )
+
+    @property
+    def per_call(self) -> Decimal:
+        """What one call costs: the cheapest pack's price over its calls, else the price per call."""
+        packs = [p for p in self.plans if p.get("type") == "pack" and int(p.get("calls") or 0) > 0]
+        if packs:
+            return min(_amount(str(p.get("price", "0"))) / int(p["calls"]) for p in packs)
+        return _amount(self.price)
+
+    @property
+    def pack_calls(self) -> int:
+        """The calls a new pack of its cheapest plan holds."""
+        packs = [p for p in self.plans if p.get("type") == "pack" and int(p.get("calls") or 0) > 0]
+        if not packs:
+            return 1
+        return int(min(packs, key=lambda p: _amount(str(p.get("price", "0"))) / int(p["calls"]))["calls"])
 
     @property
     def input_schema(self) -> dict[str, Any]:
@@ -504,6 +548,8 @@ class Agent:
         # An agent that only uses services announces its own agent.json: the provider API and the file to announce,
         # for the network it was made with. A test that swaps in a FakeNetwork has nothing to announce.
         self._announcement: tuple[HttpProviderApi, dict[str, Any]] | None = None
+        # Per event loop: an action from plain code runs on a loop of its own, and a lock binds to the loop it waits on.
+        self._getting_ready: dict[asyncio.AbstractEventLoop, asyncio.Lock] = {}
         self._announced_on: Network | None = None
         # Announced (when it announces itself) and active: the first action makes it so.
         self._ready = False
@@ -577,7 +623,8 @@ class Agent:
         return self._register("on_choice_approved")(callback)
 
     def on_decision(self, *, kind: str | None = None) -> Callable[[Callback], Callback]:
-        """A decision the console hands to the agent (Ask my runtime), with its deadline; `kind` narrows it."""
+        """A decision the console hands to the agent (Decisions your code makes), with its deadline; `kind` narrows
+        it."""
         if kind is not None and kind not in DECISION_KINDS:
             raise ValueError(f"kind is one of {', '.join(DECISION_KINDS)}")
         return self._register("on_decision", {"kind": kind})
@@ -651,6 +698,13 @@ class Agent:
         pass, waiting for that."""
         if self._ready:
             return
+        # The event loop and an action from the local API can both find the agent not ready yet: one announces and
+        # waits, and the other finds it ready, rather than announcing twice.
+        async with self._getting_ready.setdefault(asyncio.get_running_loop(), asyncio.Lock()):
+            if not self._ready:
+                await self._get_ready()
+
+    async def _get_ready(self) -> None:
         await self._check_protocol()
         if self._announcement is None or self.network is not self._announced_on:
             # Announced by the connector serving it (or not at all): wait here until its publisher confirms it,
@@ -727,8 +781,8 @@ class Agent:
 
     async def _events(self) -> None:
         """Long-poll events, run the matching callbacks, and acknowledge only what was handled."""
-        await self._ensure_ready()
-        await self._subscribe()
+        await self._retrying("getting ready", self._ensure_ready)
+        await self._retrying("subscribing", self._subscribe)
         await self._started()
         holder = "copy-" + secrets.token_hex(8)
         attempts: dict[str, int] = {}
@@ -756,9 +810,26 @@ class Agent:
                 continue
             acked, failed, retry = await self._handle_page(page.get("events") or [], attempts)
             if acked is not None:
-                await self._call("events_ack", cursor=acked, failed=failed or None)
+                # Handled events are journalled, so an acknowledgement that waits for the network only delays it.
+                await self._retrying(
+                    "acknowledging events", self._call, "events_ack", cursor=acked, failed=failed or None
+                )
             if retry:
                 await asyncio.sleep(min(RETRY_SECONDS * max(attempts.values(), default=1), 30))
+
+    async def _retrying(self, what: str, step: Callable[..., Awaitable[Any]], *args: Any, **kwargs: Any) -> Any:
+        """A step of the event loop, again after a pause while the network can't be reached: a redeploy or a dropped
+        connection is passing, and stopping the loop would leave the callbacks unrun until the agent restarts."""
+        pause = RETRY_SECONDS
+        while True:
+            try:
+                return await step(*args, **kwargs)
+            except ProviderUnavailable as exc:
+                if self._stopping.is_set():
+                    raise
+                log.warning("%s: %s; trying again in %.0f s", what, exc, pause)
+                await asyncio.sleep(pause)
+                pause = min(pause * 2, MAX_RETRY_SECONDS)
 
     async def _handle_page(
         self, events: list[dict[str, Any]], attempts: dict[str, int]
@@ -979,6 +1050,9 @@ class Agent:
     def outreach_reply(self, thread_id: str, text: str, decline: bool = False) -> dict[str, Any]:
         return self._sync(self.aio.outreach_reply(thread_id, text, decline))
 
+    def connect(self, candidate: Candidate, thread_id: str = "", note: str = "") -> dict[str, Any]:
+        return self._sync(self.aio.connect(candidate, thread_id, note))
+
     def find(self, query: str, limit: int = 5) -> list[Candidate]:
         return self._sync(self.aio.find(query, limit))
 
@@ -1027,9 +1101,34 @@ class PlannedService:
         self.data_class = data_class
         self.main: Candidate | None = None
         self.backup: Candidate | None = None
+        # Calls left in the packs bought from the main choice, counted down per call; None while it is free or not
+        # known yet. Zero after a call means its pack ran out.
+        self.calls_left: int | None = None
+        self.called = False
+        # The recorded choice is resumed once, on the first call: a choice dropped later (a changed contract, a
+        # failed provider with no backup) is made again with trials, never resumed.
+        self.resumed = False
 
-    def call(self, arguments: dict[str, Any], idempotency_key: str | None = None) -> Result:
-        return self.agent._sync(self.agent.aio.call_planned(self, arguments, idempotency_key))
+    @property
+    def need_key(self) -> str:
+        return _key(self.need)
+
+    def call(
+        self,
+        arguments: dict[str, Any],
+        idempotency_key: str | None = None,
+        *,
+        choose_again: bool = False,
+        provider: str | None = None,
+    ) -> Result:
+        return self.agent._sync(
+            self.agent.aio.call_planned(self, arguments, idempotency_key, choose_again=choose_again, provider=provider)
+        )
+
+    def _chose(self, main: Candidate, backup: Candidate | None) -> None:
+        self.main, self.backup = main, backup
+        self.calls_left = main.calls_left if main.paid else None
+        self.called = main.used
 
 
 DATA_CLASSES = ("public", "synthetic", "internal")
@@ -1228,6 +1327,20 @@ class _Actions:
             log.info("outreach thread %s takes no more messages: %s", thread_id, exc)
             return {"thread_id": thread_id, "closed": True}
 
+    async def connect(self, candidate: Candidate, thread_id: str = "", note: str = "") -> dict[str, Any]:
+        """Ask to connect for this service, without calling it. With `thread_id`, the request comes from that outreach
+        thread, which then counts as converted. An active connection that already reaches the service is returned as
+        it is, and nothing is requested."""
+        listed = await self._call("connection_list", state="active")
+        for c in listed.get("connections") or []:
+            if c.get("peer") == candidate.handle and candidate.capability_id in (c.get("peer_capabilities") or []):
+                return {"connection_id": str(c["connection_id"]), "state": "active"}
+        origin = {"outreach_thread_id": thread_id} if thread_id else {}
+        requested = await self._call(
+            "connection_request", target=candidate.handle, capability_ids=[candidate.capability_id], note=note, **origin
+        )
+        return {"connection_id": str(requested["connection_id"]), "state": str(requested.get("state") or "pending")}
+
     async def decide(self, decision: Decision, accept: bool, reason: str = "") -> dict[str, Any]:
         if decision.kind == "connection_request":
             return await self.respond(decision.subject_id, accept, reason)
@@ -1244,8 +1357,20 @@ class _Actions:
     # finding and choosing
 
     async def find(self, query: str, limit: int = 5) -> list[Candidate]:
-        found = await self._call("agent_search", query=query, limit=limit)
-        return [Candidate.from_search(self.agent, item) for item in found.get("items") or []]
+        return (await self.find_with_history(query, limit))[0]
+
+    async def find_with_history(
+        self, query: str, limit: int = 5, need_key: str = ""
+    ) -> tuple[list[Candidate], list[Candidate]]:
+        """The search's candidates, each with this agent's record where it used them, and, for a need, the providers
+        it chose for that need before that the search didn't return."""
+        asked: dict[str, Any] = {"query": query, "limit": limit}
+        if need_key:
+            asked["need_key"] = need_key
+        found = await self._call("agent_search", **asked)
+        items = [Candidate.from_search(self.agent, item) for item in found.get("items") or []]
+        earlier = [Candidate.from_search(self.agent, item) for item in found.get("previously_used") or []]
+        return items, earlier
 
     async def showcase(self, candidate: Candidate) -> dict[str, Any]:
         shown = await self._call("agent_get_showcase", handle=candidate.handle, capability_id=candidate.capability_id)
@@ -1298,10 +1423,17 @@ class _Actions:
         pick: Callable[[list[Trial]], Trial | None] | None,
         candidates: int = TRIALS_AT_MOST,
         prefer: str | None = None,
+        keep: Candidate | None = None,
+        code: str = "initial",
     ) -> Choice:
+        """Search, try and choose. A provider this agent called before is compared on its record, never
+        trialled again, and the providers chosen for the need before stay in the comparison while still offered.
+        With `keep`, the current choice stays unless another candidate is clearly better; `code` is
+        the reason the decision is recorded with."""
         query = need_or_query.text if isinstance(need_or_query, Need) else need_or_query
         need_key = need_or_query.post_id if isinstance(need_or_query, Need) else _key(query)
-        found = await self.find(str(query), limit=10)
+        found, earlier = await self.find_with_history(str(query), limit=10, need_key=need_key)
+        found = found + [c for c in earlier if c.still_listed]
         if isinstance(need_or_query, Need):
             found = await self._answerers_first(need_or_query, found)
         # The reason says "picked by your own rule" only for the caller's own pick, not for a preferred service.
@@ -1316,6 +1448,10 @@ class _Actions:
                 # Excluded by the console's rules: never contacted.
                 trials.append(Trial(candidate, skipped=True, reason="excluded by " + ", ".join(candidate.excluded_by)))
                 continue
+            if candidate.used:
+                # Its real calls stand for a trial; a regression is the network's to catch, by its own test runs.
+                trials.append(Trial(candidate, passed=True, reason=_used_reason(candidate), price=candidate.price))
+                continue
             if tried >= min(max(candidates, 1), TRIALS_AT_MOST):
                 trials.append(Trial(candidate, skipped=True, reason="not tried: enough candidates were tried"))
                 continue
@@ -1327,9 +1463,39 @@ class _Actions:
         )
         if not ranked:
             raise NoProvider("No candidate passed.", trials)
+        kept = None
+        if keep is not None and chosen is None:
+            kept = next((t for t in ranked if _same(t.candidate, keep)), None)
+            if kept is not None:
+                better = next((t for t in ranked if t is not kept and self._clearly_better(t, kept)), None)
+                lead = better or kept
+                ranked = [lead, *[t for t in ranked if t is not lead]]
         main, backup = ranked[0], (ranked[1] if len(ranked) > 1 else None)
         reason = self._reason(main, sample, expect, picked)
-        return await self._record(need_key, trials, main.candidate, backup.candidate if backup else None, reason)
+        if kept is not None:
+            reason = (
+                f"Kept {kept.candidate.handle}: no other candidate is clearly better."
+                if main is kept
+                else f"{main.candidate.handle} is clearly better than {kept.candidate.handle}. {reason}"
+            )
+        return await self._record(
+            need_key, trials, main.candidate, backup.candidate if backup else None, reason, code=code
+        )
+
+    def _clearly_better(self, other: Trial, kept: Trial) -> bool:
+        """Whether a candidate beats the current choice by enough to leave it, under the console's Prefer setting:
+        for accuracy, a higher tested quality at no higher price per call; for price, at least 10% cheaper per call
+        with a tested quality not lower where both show one; for balanced, either."""
+        new, old = other.candidate, kept.candidate
+        prefer = str((self.agent.config.get("sourcing") or {}).get("rank_by", "accuracy"))
+        both_tested = _significant(new) and _significant(old)
+        accurate = _tested(new) > _tested(old) and new.per_call <= old.per_call
+        cheaper = new.per_call <= old.per_call * Decimal("0.9") and (not both_tested or _tested(new) >= _tested(old))
+        if prefer == "price":
+            return cheaper
+        if prefer == "balanced":
+            return accurate or cheaper
+        return accurate
 
     async def _preferred_first(self, prefer: str, found: list[Candidate]) -> list[Candidate]:
         """The preferred service at the front, so that when eligible it is always one of the candidates tried, and
@@ -1429,7 +1595,13 @@ class _Actions:
         return f"{main.candidate.handle} passed a trial on {basis}{score}, at {main.price or 'no stated'} per call."
 
     async def _record(
-        self, need_key: str, trials: list[Trial], main: Candidate, backup: Candidate | None, reason: str
+        self,
+        need_key: str,
+        trials: list[Trial],
+        main: Candidate,
+        backup: Candidate | None,
+        reason: str,
+        code: str = "initial",
     ) -> Choice:
         recorded = await self._call(
             "sourcing_record",
@@ -1449,7 +1621,7 @@ class _Actions:
             primary=main.handle,
             backup=backup.handle if backup else None,
             rationale=reason,
-            reason="initial",
+            reason=code,
         )
         waiting = recorded.get("state") == "awaiting_owner"
         return Choice(main, backup, trials, reason, waiting=waiting, decision_id=str(recorded.get("decision_id", "")))
@@ -1721,31 +1893,29 @@ class _Actions:
         return await self.agent.screener.screen(value)
 
     async def call_planned(
-        self, planned: PlannedService, arguments: dict[str, Any], idempotency_key: str | None = None
+        self,
+        planned: PlannedService,
+        arguments: dict[str, Any],
+        idempotency_key: str | None = None,
+        *,
+        choose_again: bool = False,
+        provider: str | None = None,
     ) -> Result:
-        """A planned service's call, to the chosen provider. When the provider
-        is unavailable, failover follows the service's side-effect class: read-only or safely
-        repeatable work goes to the backup once, as a new execution linked to the same key; work that acts outside
-        goes to the backup only when the first call is known to have had no effect, and otherwise ends with its
-        outcome unknown, to be learnt with the same idempotency_key."""
+        """A planned service's call, to the chosen provider. The choice is the agent's latest sourcing decision for the
+        need, so a restart resumes it without trials; when a pack bought from it runs out, the console's rule
+        sourcing.on_pack_end applies, and `choose_again` compares again now, `provider` ("@handle/service") names the
+        provider to use instead. When the provider is unavailable, failover follows the service's
+        side-effect class: read-only or safely repeatable work goes to the backup once, as a new execution linked to
+        the same key; work that acts outside goes to the backup only when the first call is known to have had no
+        effect, and otherwise ends with its outcome unknown, to be learnt with the same idempotency_key."""
         if self.agent.network is None:
             raise AgentNotEnabled
-        if planned.main is None:
-            choice = await self._choose(
-                planned.need, planned.sample, expectation(planned.expect), None, prefer=planned.prefer
-            )
-            if choice.waiting:
-                raise ChoiceWaiting(
-                    f"The choice for {planned.need!r} waits for your approval in the console.",
-                    code="CHOICE_WAITING",
-                    fix="Approve it under Network → Sourcing, or with: ekl sourcing approve <decision>",
-                )
-            planned.main, planned.backup = choice.main, choice.backup
+        await self._select(planned, choose_again, provider)
         assert planned.main is not None
         key = idempotency_key or "call-" + secrets.token_hex(12)
         failed = planned.main
         try:
-            return await self.call(failed, arguments, None, key, same_contract=True, data_class=planned.data_class)
+            result = await self.call(failed, arguments, None, key, same_contract=True, data_class=planned.data_class)
         except ContractChanged:
             # The selection was made against the old contract: choose again, with trials, then call.
             planned.main = planned.backup = None
@@ -1760,8 +1930,101 @@ class _Actions:
             if planned.backup is None:
                 planned.main = None  # the next call chooses again
                 raise
-            planned.main, planned.backup = planned.backup, None
-            return await self.call(planned.main, arguments, None, f"{key}-backup", data_class=planned.data_class)
+            planned._chose(planned.backup, None)
+            assert planned.main is not None
+            result = await self.call(planned.main, arguments, None, f"{key}-backup", data_class=planned.data_class)
+        planned.called = True
+        if planned.calls_left is not None:
+            # A call with no calls left bought a new pack and used its first call.
+            planned.calls_left = planned.calls_left - 1 if planned.calls_left > 0 else planned.main.pack_calls - 1
+        return result
+
+    async def _select(self, planned: PlannedService, choose_again: bool, provider: str | None) -> None:
+        """The provider the next call goes to: the agent's recorded choice, a fresh choice on a first call, a provider
+        its code names, or a comparison when its code asks or a pack from the main choice ran out."""
+        if planned.main is None and not planned.resumed:
+            planned.resumed = True
+            await self._resume(planned)
+        pack_ended = planned.main is not None and planned.calls_left == 0 and planned.called
+        rule = str((self.agent.config.get("sourcing") or {}).get("on_pack_end", "compare"))
+        if provider:
+            await self._use_named(planned, provider)
+        elif planned.main is None:
+            choice = await self._choose(
+                planned.need, planned.sample, expectation(planned.expect), None, prefer=planned.prefer
+            )
+            if choice.waiting:
+                raise _waiting(planned.need)
+            assert choice.main is not None
+            planned._chose(choice.main, choice.backup)
+        elif choose_again:
+            await self._compare(planned, "agent_request")
+        elif pack_ended and rule != "keep":
+            # A pack bought from the main choice ran out: the next call would buy another.
+            await self._compare(planned, "pack_end")
+
+    async def _resume(self, planned: PlannedService) -> None:
+        """The agent's latest sourcing decision for the need, so a restarted connector carries on with its choice and
+        the calls left in its packs, without searching or trialling again."""
+        try:
+            got = await self._call("sourcing_get", need_key=planned.need_key)
+        except AgentError:
+            return  # nothing recorded, or a network that keeps no decisions: choose as on a first call
+        decision = dict(got.get("decision") or {})
+        if decision.get("state") == "awaiting_owner":
+            raise _waiting(planned.need)
+        if decision.get("state") not in ("recorded", "approved") or not decision.get("primary"):
+            return
+        found, earlier = await self.find_with_history(planned.need, 25, planned.need_key)
+        offered = [c for c in [*found, *earlier] if c.still_listed and c.eligible]
+        main = next((c for c in offered if c.handle == decision["primary"]), None)
+        backup = next((c for c in offered if c.handle == decision.get("backup")), None)
+        if main is not None:
+            planned._chose(main, backup)
+
+    async def _compare(self, planned: PlannedService, code: str) -> None:
+        """Compare again, keeping the current choice unless another candidate is clearly better; providers used before
+        are compared on their record, not trialled."""
+        choice = await self._choose(
+            planned.need, planned.sample, expectation(planned.expect), None, keep=planned.main, code=code
+        )
+        if choice.waiting:
+            raise _waiting(planned.need)
+        assert choice.main is not None
+        planned._chose(choice.main, choice.backup)
+
+    async def _use_named(self, planned: PlannedService, provider: str) -> None:
+        """The provider the agent's code names becomes the main choice, the previous one its backup, recorded with
+        reason agent_request; calls left in the previous provider's packs stay there."""
+        found, earlier = await self.find_with_history(planned.need, 25, planned.need_key)
+        named = [c for c in [*found, *earlier] if _names(provider, c) or c.handle == provider]
+        if not named:
+            name = provider.partition("/")[2].removeprefix("cap_").replace("_", " ") or provider.lstrip("@")
+            named = [c for c in await self.find(name, limit=25) if _names(provider, c) or c.handle == provider]
+        if not named:
+            raise AgentError(f"{provider} offers no service for this need.", code="NOT_FOUND")
+        chosen = named[0]
+        if not chosen.still_listed or not chosen.eligible:
+            raise AgentError(
+                f"{provider} can't be used: " + (", ".join(chosen.excluded_by) or "it is no longer listed"),
+                code="POLICY_DENIED",
+                detail={"excluded_by": chosen.excluded_by},
+            )
+        previous = planned.main if planned.main is not None and not _same(planned.main, chosen) else None
+        tried = [Trial(chosen, passed=True, reason="named by the agent's code")]
+        if previous is not None:
+            tried.append(Trial(previous, passed=True, reason="the previous choice"))
+        choice = await self._record(
+            planned.need_key,
+            tried,
+            chosen,
+            previous,
+            f"{chosen.handle} named by the agent's code.",
+            code="agent_request",
+        )
+        if choice.waiting:
+            raise _waiting(planned.need)
+        planned._chose(chosen, previous)
 
     async def _no_effect(self, key: str, candidate: Candidate, failure: ProviderUnavailable) -> bool:
         """Whether a failed call is known to have had no effect: it never reached the provider, or the network
@@ -1846,6 +2109,30 @@ def _names(ref: str, candidate: Candidate) -> bool:
     return candidate.handle == handle and candidate.capability_id in (name, f"cap_{name}")
 
 
+def _waiting(need: str) -> ChoiceWaiting:
+    return ChoiceWaiting(
+        f"The choice for {need!r} waits for your approval in the console.",
+        code="CHOICE_WAITING",
+        fix="Approve it in Needs you or on the agent's Spending tab.",
+    )
+
+
+def _significant(candidate: Candidate) -> bool:
+    return bool((candidate.tested_quality or {}).get("significant"))
+
+
+def _same(a: Candidate, b: Candidate) -> bool:
+    return a.handle == b.handle and a.capability_id == b.capability_id
+
+
+def _used_reason(candidate: Candidate) -> str:
+    """Why a provider used before was not trialled: its record with this agent."""
+    used = candidate.used_before or {}
+    rating = (used.get("own_reviews") or {}).get("rating")
+    rated = f", rated {rating} by you" if rating is not None else ""
+    return f"used before: {used.get('calls', 0)} calls, {used.get('calls_left', 0)} left{rated}; not trialled again"
+
+
 def _tested(candidate: Candidate) -> float:
     """EuKollab's tested quality of the candidate, when it is shown; 0 until the evidence is significant."""
     quality = candidate.tested_quality or {}
@@ -1870,6 +2157,11 @@ def _passed(prefer: str) -> Callable[[list[Trial]], Trial | None]:
 
 def _key(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:60] or "need"
+
+
+def need_key(text: str) -> str:
+    """The key a need's sourcing decisions are recorded under: the need in words, reduced to a stable slug."""
+    return _key(text)
 
 
 def _held(reserved: dict[str, Any]) -> dict[str, Any]:

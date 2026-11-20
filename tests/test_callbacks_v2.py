@@ -21,6 +21,7 @@ from starlette.responses import Response
 from starlette.routing import Route
 
 from ekl_provider_adapter import callback_signing as cb
+from ekl_provider_adapter import callbacks_runtime as runtime
 from ekl_provider_adapter.agent import Agent
 from ekl_provider_adapter.agent_journal import AgentJournal
 from ekl_provider_adapter.callbacks import CallbackChannel, bridge
@@ -322,9 +323,9 @@ def _counting(module: ModuleType, answer: dict[str, Any] | None = None) -> list[
 
 
 def _rows(module: ModuleType) -> int:
-    if not module.STORE.exists():
+    if not module.callbacks.store.exists():
         return 0
-    with module._store() as db:
+    with module.callbacks._store() as db:
         return int(db.execute("SELECT COUNT(*) FROM events").fetchone()[0])
 
 
@@ -334,9 +335,9 @@ def test_ac263_a_retry_whose_first_answer_was_lost_gets_the_stored_answer(
     module = _template(tmp_path, monkeypatch)
     seen = _counting(module)
     body, headers = _request("evt_1", {"text": "hi"})
-    first = module.receive(body, headers)
+    first = module.callbacks.receive(body, headers)
     _, retry_headers = _request("evt_1", {"text": "hi"}, t=time.time() + 1)  # a new t and MAC, the same body
-    retry = module.receive(body, retry_headers)
+    retry = module.callbacks.receive(body, retry_headers)
     assert len(seen) == 1 and first[2] == retry[2] == b'{"reply": "answer 1"}'
     assert cb.response_valid(
         KEY,
@@ -356,11 +357,11 @@ def test_ac264_a_replay_after_300_s_is_refused_and_a_changed_body_conflicts(
     module = _template(tmp_path, monkeypatch)
     seen = _counting(module)
     body, old = _request("evt_1", {"text": "hi"}, t=time.time() - 301)
-    assert module.receive(body, old)[0] == 401 and not seen
+    assert module.callbacks.receive(body, old)[0] == 401 and not seen
     body, headers = _request("evt_1", {"text": "hi"})
-    assert module.receive(body, headers)[0] == 200
+    assert module.callbacks.receive(body, headers)[0] == 200
     other, other_headers = _request("evt_1", {"text": "something else"})
-    status, _, payload = module.receive(other, other_headers)
+    status, _, payload = module.callbacks.receive(other, other_headers)
     assert status == 409 and b"CONFLICT" in payload and len(seen) == 1
 
 
@@ -368,10 +369,10 @@ def test_ac268_deduplication_survives_a_restart(tmp_path: Path, monkeypatch: pyt
     module = _template(tmp_path, monkeypatch)
     _counting(module)
     body, headers = _request("evt_1", {"text": "hi"})
-    first = module.receive(body, headers)
+    first = module.callbacks.receive(body, headers)
     restarted = _template(tmp_path, monkeypatch, name="callbacks_again")
     seen = _counting(restarted)
-    assert restarted.receive(body, headers)[2] == first[2] and not seen
+    assert restarted.callbacks.receive(body, headers)[2] == first[2] and not seen
 
 
 def test_ac329_a_bad_mac_is_refused_without_a_store_row_or_the_handler(
@@ -381,7 +382,7 @@ def test_ac329_a_bad_mac_is_refused_without_a_store_row_or_the_handler(
     seen = _counting(module)
     body, headers = _request("evt_1", {"text": "hi"})
     forged = {cb.REQUEST_HEADER: headers[cb.REQUEST_HEADER][:-4] + "0000"}
-    assert module.receive(body, forged)[0] == 401
+    assert module.callbacks.receive(body, forged)[0] == 401
     assert not seen and _rows(module) == 0
 
 
@@ -400,23 +401,23 @@ def test_ac330_two_simultaneous_deliveries_run_the_handler_once(
     module.on_message = on_message
     body, headers = _request("evt_1", {"text": "hi"})
     results: list[tuple[int, dict[str, str], bytes]] = []
-    first = threading.Thread(target=lambda: results.append(module.receive(body, headers)))
+    first = threading.Thread(target=lambda: results.append(module.callbacks.receive(body, headers)))
     first.start()
     while not seen:
         time.sleep(0.01)
-    second = module.receive(body, headers)
+    second = module.callbacks.receive(body, headers)
     assert second[0] == 409 and b"IN_PROGRESS" in second[2] and second[1]["Retry-After"] == "2"
     release.set()
     first.join()
-    assert module.receive(body, headers)[2] == b'{"reply": "once"}' and seen == ["evt_1"]
+    assert module.callbacks.receive(body, headers)[2] == b'{"reply": "once"}' and seen == ["evt_1"]
 
 
 def test_ac340_a_handler_paused_past_its_lease_is_taken_over_and_commits_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     module = _template(tmp_path, monkeypatch)
-    monkeypatch.setattr(module, "LEASE_SECONDS", 0.2)
-    monkeypatch.setattr(module, "RENEW_SECONDS", 60.0)  # the paused handler doesn't renew
+    monkeypatch.setattr(runtime, "LEASE_SECONDS", 0.2)
+    monkeypatch.setattr(runtime, "RENEW_SECONDS", 60.0)  # the paused handler doesn't renew
     paused = threading.Event()
     calls: list[int] = []
 
@@ -432,15 +433,15 @@ def test_ac340_a_handler_paused_past_its_lease_is_taken_over_and_commits_nothing
     module.on_message = on_message
     body, headers = _request("evt_1", {"text": "hi"})
     results: list[tuple[int, dict[str, str], bytes]] = []
-    first = threading.Thread(target=lambda: results.append(module.receive(body, headers)))
+    first = threading.Thread(target=lambda: results.append(module.callbacks.receive(body, headers)))
     first.start()
     time.sleep(0.4)  # past the lease
-    second = module.receive(body, headers)
+    second = module.callbacks.receive(body, headers)
     paused.set()
     first.join()
     assert second[2] == b'{"reply": "second"}'
     assert results[0][0] == 409  # the first handler's commit found its fence stale
-    assert module.receive(body, headers)[2] == b'{"reply": "second"}' and module.recalled("who") == "second"
+    assert module.callbacks.receive(body, headers)[2] == b'{"reply": "second"}' and module.recalled("who") == "second"
 
 
 def test_the_template_declines_connections_for_services_it_does_not_offer(

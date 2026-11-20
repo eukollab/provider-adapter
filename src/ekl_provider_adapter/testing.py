@@ -79,7 +79,9 @@ class FakeNetwork:
         # What agent_get_profile answers about each peer's availability, by handle.
         self.availability: dict[str, list[dict[str, Any]]] = {}
         self.handle, self.agent_id = handle, _id("agt")
-        self.config: dict[str, Any] = {"sourcing": {"rank_by": rank_by, "mode": "auto_within_limits"}}
+        self.config: dict[str, Any] = {
+            "sourcing": {"rank_by": rank_by, "mode": "auto_within_limits", "on_pack_end": "compare"}
+        }
         # A new agent's rules share public and synthetic data only, as the network's defaults do.
         self.data_classes = {"public", "synthetic"}
         self.providers: dict[str, FakeProvider] = {}
@@ -106,6 +108,8 @@ class FakeNetwork:
         self.wallet: Decimal | None = None
         # The calls left of each pack bought, by provider handle and capability.
         self.packs: dict[tuple[str, str], int] = {}
+        # Paid or free runs made to each service, by provider handle and capability: this agent's record with it.
+        self.calls_made: dict[tuple[str, str], int] = {}
         # True: the next reservation's grant expires unused, as when the machine sleeps before the call.
         self.lapse = False
         # The agent's state, as agent_get_self reports it: "review" or "added" test an agent not yet confirmed.
@@ -390,7 +394,7 @@ class FakeNetwork:
         return result
 
     def _tool_world_get_contract(self) -> dict[str, Any]:
-        return {"protocol": "ekp/3.1", "profile": "ekp/3.1", "accepted_protocols": []}
+        return {"protocol": "ekp/3.2", "profile": "ekp/3.2", "accepted_protocols": []}
 
     def _tool_agent_get_profile(self, handle: str) -> dict[str, Any]:
         """A peer's profile with its availability (EKP 1.2 §6.12), as set in `availability`."""
@@ -507,16 +511,57 @@ class FakeNetwork:
             "excluded_by": p.excluded_by,
             "reputation": {"reviews": 0, "rating": None},
             "data_retention": "none",
+            "used_before": self._used_before(p.handle, p.capability_id),
         }
 
-    def _tool_agent_search(self, query: str, limit: int = 10) -> dict[str, Any]:
+    def _used_before(self, handle: str, capability_id: str) -> dict[str, Any] | None:
+        """This agent's record with a service, as agent_search gives it; None when it never called it."""
+        calls = self.calls_made.get((handle, capability_id), 0)
+        if not calls:
+            return None
+        at = "2026-11-18T10:00:00+00:00"
+        return {
+            "first_used_at": at,
+            "last_used_at": at,
+            "calls": calls,
+            "calls_left": self.packs.get((handle, capability_id), 0),
+            "own_reviews": {"count": 0, "rating": None},
+        }
+
+    def _tool_agent_search(self, query: str, limit: int = 10, need_key: str | None = None) -> dict[str, Any]:
         words = {w for w in query.lower().split() if len(w) > 2}
         found = [
             p
             for p in self.providers.values()
             if not words or words & set((p.summary + " " + p.capability_id).lower().replace("_", " ").split())
         ]
-        return {"items": [self._search_item(p) for p in (found or list(self.providers.values()))[:limit]]}
+        items = [self._search_item(p) for p in (found or list(self.providers.values()))[:limit]]
+        shown = {(i["handle"], i["capability_id"]) for i in items}
+        earlier: list[dict[str, Any]] = []
+        for choice in reversed([c for c in self.choices if need_key and c["need_key"] == need_key]):
+            for handle in (choice["primary"], choice.get("backup")):
+                capability_id = next(
+                    (str(c["capability_id"]) for c in choice.get("candidates") or [] if c.get("handle") == handle), ""
+                )
+                key = (str(handle), capability_id)
+                if not handle or key in shown or any((e["handle"], e["capability_id"]) == key for e in earlier):
+                    continue
+                p = self.providers.get(f"{handle}/{capability_id}")
+                if p is not None:
+                    earlier.append(self._search_item(p) | {"still_listed": True})
+                else:  # no longer listed: named, never offered
+                    earlier.append(
+                        {
+                            "handle": handle,
+                            "capability_id": capability_id,
+                            "summary": "",
+                            "eligible": False,
+                            "excluded_by": ["no longer listed"],
+                            "still_listed": False,
+                            "used_before": self._used_before(str(handle), capability_id),
+                        }
+                    )
+        return {"items": items, "previously_used": earlier}
 
     def _provider(self, handle: str, capability_id: str) -> FakeProvider:
         found = self.providers.get(f"{handle}/{capability_id}")
@@ -573,7 +618,9 @@ class FakeNetwork:
         } | scored
 
     def _tool_sourcing_record(self, need_key: str, primary: str, **record: Any) -> dict[str, Any]:
-        waiting = self.config["sourcing"]["mode"] == "approve_each"
+        waiting = self.config["sourcing"]["mode"] == "approve_each" or (
+            record.get("reason") == "pack_end" and self.config["sourcing"].get("on_pack_end") == "ask"
+        )
         stored = {
             "decision_id": _id("src"),
             "need_key": need_key,
@@ -584,6 +631,11 @@ class FakeNetwork:
         self.choices.append(stored)
         return stored
 
+    def _tool_sourcing_get(self, need_key: str) -> dict[str, Any]:
+        """The latest decision for the need, as the network keeps it across restarts."""
+        found = [c for c in self.choices if c["need_key"] == need_key]
+        return {"decision": dict(found[-1]) if found else None}
+
     def _approved(self, handle: str) -> bool:
         if self.config["sourcing"]["mode"] != "approve_each":
             return True
@@ -592,7 +644,9 @@ class FakeNetwork:
     def _tool_connection_list(self, state: str = "active") -> dict[str, Any]:
         return {"connections": [c for c in self.connections.values() if c.get("state") == state]}
 
-    def _tool_connection_request(self, target: str, capability_ids: list[str], note: str = "") -> dict[str, Any]:
+    def _tool_connection_request(
+        self, target: str, capability_ids: list[str], note: str = "", outreach_thread_id: str | None = None
+    ) -> dict[str, Any]:
         if not self._approved(target):
             raise NotAllowed(
                 f"{target} is waiting for your publisher's approval.",
@@ -606,6 +660,8 @@ class FakeNetwork:
             "state": "active",
             "peer_capabilities": capability_ids,
         }
+        if outreach_thread_id:  # as the network does: a connection asked for from a thread converts it
+            self.threads[outreach_thread_id]["state"] = "converted"
         return {"connection_id": connection_id, "state": "pending"}
 
     def _tool_collaboration_create(
@@ -685,6 +741,7 @@ class FakeNetwork:
             return record | {"state": "expired", "amount_atoms": "0"}
         agreement = self.agreements.get(str(request.get("collaboration_id")), {})
         key = (str(agreement.get("provider", "")), str(request.get("capability_id", "")))
+        self.calls_made[key] = self.calls_made.get(key, 0) + 1
         p = self.providers.get(f"{key[0]}/{key[1]}")
         plan = (p.plan if p else None) or {"price": p.price if p else "0", "calls": 1}
         price = Decimal(str(plan.get("price") or "0"))
@@ -737,11 +794,15 @@ class FakeNetwork:
         p = self._provider(handle, str(ekl["capability_id"]))
         execution_id, salt = str(ekl["execution_id"]), str(ekl["salt"])
         if p.fails == "unreachable":
-            raise ProviderUnavailable("The provider could not be reached (ConnectError).", detail={"sent": False})
+            raise ProviderUnavailable(
+                "The provider could not be reached (ConnectError).", code="SERVICE_UNAVAILABLE", detail={"sent": False}
+            )
         if p.fails == "timeout":
             p.calls += 1
             self.executions[execution_id] = {"execution_id": execution_id, "state": "admitted"}
-            raise ProviderUnavailable("The provider could not be reached (ReadTimeout).", detail={"sent": True})
+            raise ProviderUnavailable(
+                "The provider could not be reached (ReadTimeout).", code="SERVICE_UNAVAILABLE", detail={"sent": True}
+            )
         kept = self.executions.get(execution_id)
         if kept is None:
             # The provider runs each execution once; a repeat returns the kept result.

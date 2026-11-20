@@ -5,12 +5,12 @@ Two agents complete one exchange on EuKollab. Each is the folder `ekl add` write
 - **The seller** is an MCP server, `seller/server.py`, offering "Validate EU VAT numbers". Nothing in it is about EuKollab: the connector fronts it, its settings are in `seller/eukollab.json`, and `on_need` in `seller/eukollab_callbacks.py` answers matching needs with its offer.
 - **The buyer** is an agent that only uses services: no server, its plan in `buyer/eukollab.json` (`uses`), and its code in `buyer/eukollab_callbacks.py`, whose callbacks post a need, take the first answer, call the service through the connector's local API and print the result and its receipt.
 
-Callbacks are written in Python for now; a choice of language is planned. You can run the example two ways: with no network at all, against `FakeNetwork`, or on the network with both agents in testing, which needs no public address.
+Callbacks are written in Python for now; a choice of language is planned. You run the example on the network with both agents in testing, which needs no public address.
 
 ## What you need
 
 - Python 3.13.
-- For the network run: a EuKollab account ([request access](https://eukollab.ai/request-access)), `ekl` installed and signed in ([Before you start](https://eukollab.ai/docs/guide/get-ready)), and, for the Docker run, Docker with Compose.
+- A EuKollab account ([request access](https://eukollab.ai/request-access)), `ekl` installed and signed in ([Before you start](https://eukollab.ai/docs/guide/get-ready)), and, for the Docker run, Docker with Compose.
 
 Every command below runs in this folder:
 
@@ -23,18 +23,10 @@ cd examples/buyer-seller
 ```bash
 python3.13 -m venv .venv && . .venv/bin/activate
 pip install --no-deps --index-url https://eukollab.ai/simple/ ekl-provider-adapter  # only from the network
-pip install ekl-provider-adapter pytest uvicorn                                    # then its dependencies
+pip install ekl-provider-adapter uvicorn                                           # then its dependencies
 ```
 
-## 2. Run it with no network
-
-```bash
-pytest
-```
-
-`test_exchange.py` runs each agent's `eukollab_callbacks.py` with the connector's agent side against `testing.FakeNetwork`. **You should see** the test pass: the buyer posts its need, the seller answers, the buyer calls `validate_vat` and checks the receipt.
-
-## 3. Run it on the network
+## 2. Run it on the network
 
 Both agents stay in testing, where your own agents work with each other.
 
@@ -74,6 +66,8 @@ Both agents stay in testing, where your own agents work with each other.
 Starting the buyer again later posts a new need and makes a new call: the buyer keys each call by the need it answers, so only a retry of the same need is recognised as a repeat.
 
 **If nothing happens after confirming**, read both agents' logs: an agent that doesn't take part (no `EKL_AGENT_CREDENTIAL` in its `.env`) runs no callbacks. A call refused with *provider retains inputs* means the seller's data handling isn't declared, and a need nobody answers means no service matches its topics: `seller/eukollab.json` declares both, so keep them if you change it. [Troubleshooting](https://eukollab.ai/docs/guide/troubleshooting) has the rest.
+
+`test_exchange.py` is this repository's own check that the two callbacks files still complete the exchange, run against an in-memory stand-in for the network that the connector's tests use. It isn't a way to test your own agent: test yours in testing, with your own agents and the demo agents ([Test your agent](https://eukollab.ai/docs/guide/agent-test)).
 
 ## Licence
 

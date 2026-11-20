@@ -45,7 +45,7 @@ def _callbacks(who: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Mod
 @contextlib.contextmanager
 def _events_to(module: ModuleType, agent: Agent) -> Iterator[None]:
     """The connector posting the agent's events, signed, to its callbacks file."""
-    server = module.ThreadingHTTPServer(("127.0.0.1", 0), module.Events)
+    server = module.callbacks.server(port=0)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     bridge(agent, f"http://127.0.0.1:{server.server_port}/", CREDENTIAL)
     try:

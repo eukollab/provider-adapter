@@ -472,6 +472,23 @@ def test_the_local_api_opens_an_outreach_thread_and_replies_in_it(tmp_path: Path
     assert replied.json()["state"] == "replied" and wrong.status_code == 409
 
 
+def test_the_local_api_connects_from_an_outreach_thread(tmp_path: Path) -> None:
+    # After talking in a thread, the callbacks ask to connect from it: the thread counts as converted, and a second
+    # ask finds the connection already there and requests nothing.
+    fake = FakeNetwork(handle="@buyer")
+    fake.provider("@holidays", "cap_banking_day", lambda _: {"banking_day": True}, summary="banking day")
+    with TestClient(local_api(_agent(fake, tmp_path)), base_url="http://127.0.0.1:8765") as client:
+        opened = client.post(
+            "/agent/outreach",
+            json={"to": "@holidays", "intent": "request_service", "capability_id": "cap_banking_day", "text": "JP?"},
+        ).json()
+        body = {"handle": "@holidays", "capability_id": "cap_banking_day", "thread_id": opened["thread_id"]}
+        connected = client.post("/agent/connect", json=body).json()
+        again = client.post("/agent/connect", json=body).json()
+    assert connected["connection_id"].startswith("con_") and fake.threads[opened["thread_id"]]["state"] == "converted"
+    assert again == {"connection_id": connected["connection_id"], "state": "active"} and len(fake.connections) == 1
+
+
 def test_criteria_judge_every_call_and_choose_s_expectation_never_does(tmp_path: Path) -> None:
     # Criteria given to use(...) apply to every call's report; a call without criteria is not assessed, and
     # choose's expectation, scored by the network on the trial's sample, judges no later call.
@@ -1033,3 +1050,139 @@ def test_most_accurate_ranks_by_score_then_tested_quality(tmp_path: Path) -> Non
     assert (
         next(t for t in choice.trials if t.candidate.handle == "@near").score == 0.75
     )  # the schema 1, the near miss 0.5
+
+
+def test_a_network_that_drops_once_never_stops_the_event_loop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A redeploy or a dropped TLS start is passing: each step the loop takes on the network is tried again after a
+    pause, and the callbacks keep running, instead of the loop stopping until the agent restarts."""
+    from ekl_provider_adapter import agent as agent_module  # noqa: PLC0415 - only this test shortens its pauses
+    from ekl_provider_adapter.errors import ProviderUnavailable  # noqa: PLC0415
+
+    monkeypatch.setattr(agent_module, "RETRY_SECONDS", 0.01)
+
+    class Flaky(FakeNetwork):
+        def __init__(self) -> None:
+            super().__init__()
+            self.dropped: set[str] = set()
+
+        async def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            if tool in {"agent_get_self", "feed_subscribe", "events_ack"} and tool not in self.dropped:
+                self.dropped.add(tool)
+                raise ProviderUnavailable("EuKollab could not be reached (ConnectError).", code="SERVICE_UNAVAILABLE")
+            return await super().call(tool, arguments)
+
+    fake = Flaky()
+    agent = _agent(fake, tmp_path)
+    seen: list[str] = []
+
+    @agent.on_need(matching="subscribed", topics=["vat"])
+    def need(_: Need) -> None:
+        pass
+
+    @agent.on_message
+    def note(message: Any) -> None:
+        seen.append(str(message.text))
+
+    fake.message("@peer", "heard after the drop")
+
+    async def go() -> None:
+        await agent.start()
+        for _ in range(500):
+            if seen and "events_ack" in fake.dropped and agent._task is not None and not agent._task.done():
+                break
+            await asyncio.sleep(0.01)
+        assert agent._task is not None and not agent._task.done()
+        await agent.stop()
+
+    asyncio.run(go())
+    assert seen == ["heard after the drop"]
+    assert fake.dropped == {"agent_get_self", "feed_subscribe", "events_ack"}
+
+
+def test_a_connection_not_accepted_in_time_is_refused_as_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The connector stops waiting before act() does, so agent code is told CONNECTION_PENDING, not a timeout.
+    from ekl_provider_adapter import agent as agent_module  # noqa: PLC0415 - only this test shortens the wait
+
+    monkeypatch.setattr(agent_module, "CONNECTION_WAIT", agent_module.dt.timedelta(0))
+
+    class Unanswered(FakeNetwork):
+        def _tool_connection_request(
+            self, target: str, capability_ids: list[str], note: str = "", outreach_thread_id: str | None = None
+        ) -> dict[str, Any]:
+            answer = super()._tool_connection_request(target, capability_ids, note, outreach_thread_id)
+            self.connections[answer["connection_id"]]["state"] = "pending"
+            return answer
+
+    fake = Unanswered()
+    vat = fake.provider("@vat", "cap_vat_check", lambda _: {"valid": True}, summary="validate vat")
+    agent = _agent(fake, tmp_path)
+    [candidate] = agent.find("validate vat")
+    with pytest.raises(AgentError) as pending:
+        use(agent, candidate).call({"vat_number": "DE1"})
+    assert pending.value.code == "CONNECTION_PENDING" and pending.value.detail["connection_id"]
+    assert vat.calls == 0
+
+
+def test_an_unreachable_provider_is_refused_with_its_code(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Agent code reads ActionRefused.code: an unreachable provider is SERVICE_UNAVAILABLE, never an empty code.
+    from ekl_provider_adapter import agent as agent_module  # noqa: PLC0415 - only this test shortens its pauses
+
+    async def no_pause(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(agent_module.asyncio, "sleep", no_pause)
+    fake = FakeNetwork()
+    vat = fake.provider("@vat", "cap_vat_check", lambda _: {"valid": True}, summary="validate vat")
+    vat.fails = "unreachable"
+    agent = _agent(fake, tmp_path)
+    [candidate] = agent.find("validate vat")
+    with pytest.raises(AgentError) as away:
+        use(agent, candidate).call({"vat_number": "DE1"})
+    assert away.value.code == "SERVICE_UNAVAILABLE" and away.value.detail["sent"] is False
+
+
+def _provider_answering(monkeypatch: pytest.MonkeyPatch, handler: Any) -> None:
+    from ekl_provider_adapter import network_client  # noqa: PLC0415 - only these tests replace its transport
+
+    real = httpx2.AsyncClient
+
+    def client(**kwargs: Any) -> httpx2.AsyncClient:
+        return real(transport=httpx2.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(network_client.httpx2, "AsyncClient", client)
+
+
+def _call_provider() -> None:
+    from ekl_provider_adapter.network_client import McpNetwork  # noqa: PLC0415
+
+    network = McpNetwork("https://network.example", "credential")
+    asyncio.run(network.call_provider("https://relay.example/r/agt_1", "token", "check", {}, {"execution_id": "x"}))
+
+
+def test_the_relay_s_provider_away_reaches_agent_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The relay answers 503 PROVIDER_AWAY when a relayed provider isn't running: nothing took the call.
+    from ekl_provider_adapter.errors import ProviderUnavailable  # noqa: PLC0415
+
+    def away(_: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(
+            503, json={"code": "PROVIDER_AWAY", "retryable": True, "message": "the agent is not running"}
+        )
+
+    _provider_answering(monkeypatch, away)
+    with pytest.raises(ProviderUnavailable) as refused:
+        _call_provider()
+    assert refused.value.code == "PROVIDER_AWAY" and refused.value.detail == {"sent": False}
+
+
+def test_a_provider_that_cannot_be_reached_is_service_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ekl_provider_adapter.errors import ProviderUnavailable  # noqa: PLC0415
+
+    def down(request: httpx2.Request) -> httpx2.Response:
+        raise httpx2.ConnectError("refused", request=request)
+
+    _provider_answering(monkeypatch, down)
+    with pytest.raises(ProviderUnavailable) as refused:
+        _call_provider()
+    assert refused.value.code == "SERVICE_UNAVAILABLE"
