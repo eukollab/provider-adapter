@@ -1,10 +1,12 @@
 # Copyright © 2026 EuKreate, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""The connector: the adapter as its own process next to an existing MCP server.
+"""The connector: the adapter as its own process next to an existing MCP server, HTTPS API or A2A agent.
 
     EKL_PROVIDER_CREDENTIAL=… EKL_NETWORK_URL=… EKL_UPSTREAM_MCP_URL=… ekl-provider-connector --port 8000
 
-It calls the existing server's tools over MCP and needs nothing from that server's process, environment or files:
+It calls the existing server's tools over MCP (an API's operations over HTTPS, by its OpenAPI document in
+upstream.openapi_url; an A2A agent's skills over A2A, from upstream.a2a_url: upstreams) and needs nothing from that
+server's process, environment or files:
 give it its agent.json (--config, else the file EKL_AGENT_FILE names, else the text EKL_AGENT_JSON holds, else
 ./agent.json), the provider credential, the server's address (upstream.mcp_url, which may carry the server's own
 token), the headers the server wants on each request (EKL_UPSTREAM_HEADERS, a JSON object such as
@@ -35,7 +37,7 @@ import socket
 import subprocess
 import sys
 import tempfile
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
 
@@ -50,18 +52,30 @@ from starlette.requests import Request
 from starlette.responses import PlainTextResponse, Response
 from starlette.routing import Route
 
+from ekl_provider_adapter.a2a_upstream import A2AUpstream
 from ekl_provider_adapter.agent import Agent
 from ekl_provider_adapter.agent_journal import AgentJournal
 from ekl_provider_adapter.api import HttpProviderApi, ProviderApi
 from ekl_provider_adapter.callback_signing import callback_key
 from ekl_provider_adapter.callbacks import CallbackChannel, bridge, local_api
-from ekl_provider_adapter.config import DEFAULT_NETWORK_URL, AgentFile, LocalFile, inline_agent_file, require_https
+from ekl_provider_adapter.config import (
+    DEFAULT_NETWORK_URL,
+    AgentFile,
+    LocalFile,
+    Via,
+    inline_agent_file,
+    require_https,
+    via_of,
+)
 from ekl_provider_adapter.core import AdapterCore, Hooks, Settings
 from ekl_provider_adapter.local_guard import announce_when_listening, local_api_file
 from ekl_provider_adapter.network_client import McpNetwork, Network
+from ekl_provider_adapter.openapi_upstream import OpenAPIUpstream
 from ekl_provider_adapter.relay import Relay, relay_address
 from ekl_provider_adapter.server import adapter_routes
 from ekl_provider_adapter.storage import Storage, open_storage
+from ekl_provider_adapter.surfaces import uses_of
+from ekl_provider_adapter.upstreams import Target, Upstreams, addresses
 
 log = logging.getLogger(__name__)
 CALLBACKS_FILE = "eukollab_callbacks.py"
@@ -219,6 +233,29 @@ class Upstream:
             return await client.read_resource(uri)
 
 
+def upstream_targets(found: dict[str, str], headers: dict[str, str]) -> Upstreams:
+    """The servers agent.json names, each reached in its own protocol. The same headers go to each: an agent with
+    servers wanting different keys runs one connector per server."""
+    by_kind: dict[Via, Target] = {}
+    if "mcp_url" in found:
+        by_kind["mcp"] = Upstream(found["mcp_url"], headers=headers)
+    if "openapi_url" in found:
+        by_kind["openapi"] = OpenAPIUpstream(found["openapi_url"], found.get("api_url"), headers=headers)
+    if "a2a_url" in found:
+        by_kind["a2a"] = A2AUpstream(found["a2a_url"], headers=headers)
+    return Upstreams(by_kind)
+
+
+def routing(core: AdapterCore, kinds: list[Via]) -> Callable[[str], Via | None]:
+    """Which upstream answers a tool: its capability's `via`, as the configuration served now declares it."""
+
+    def route(tool: str) -> Via | None:
+        cap = next((c for c in core.listed if c.tool == tool), None)
+        return via_of(cap, kinds) if cap is not None else None
+
+    return route
+
+
 def connector_app(
     agent_file: AgentFileSource | None = None,
     *,
@@ -227,7 +264,7 @@ def connector_app(
     credential: str | None = None,
     network_url: str | None = None,
     api: ProviderApi | None = None,
-    upstream: Upstream | None = None,
+    upstream: Target | None = None,
     upstream_url: str | None = None,
     settings: Settings | None = None,
     callbacks: str | None = None,
@@ -238,15 +275,14 @@ def connector_app(
     `callbacks` (start_callbacks). Arguments override the environment; tests pass their own api, upstream, storage
     and network."""
     local = local_file(agent_file)
-    url = (
-        upstream_url
-        or os.environ.get("EKL_UPSTREAM_MCP_URL")
-        or (local.agent.upstream.mcp_url if local and local.agent.upstream else None)
-    )
-    if upstream is None and not url:
-        raise ValueError("set upstream.mcp_url in agent.json, or EKL_UPSTREAM_MCP_URL, to your MCP server's address")
+    found = addresses(local, upstream_url)
+    if upstream is None and not found:
+        raise ValueError(
+            "set upstream.mcp_url, upstream.openapi_url or upstream.a2a_url in agent.json (or EKL_UPSTREAM_MCP_URL, "
+            "EKL_UPSTREAM_OPENAPI_URL or EKL_UPSTREAM_A2A_URL) to your server's address"
+        )
     found_credential, found_network = settings_from_environment(local, credential, network_url)
-    target = upstream or Upstream(str(url), headers=upstream_headers(os.environ.get(UPSTREAM_HEADERS)))
+    target = upstream or upstream_targets(found, upstream_headers(os.environ.get(UPSTREAM_HEADERS)))
     core = AdapterCore(
         local,
         api or HttpProviderApi(found_network, found_credential),
@@ -257,6 +293,8 @@ def connector_app(
         hooks=hooks,
         settings=settings,
     )
+    if isinstance(target, Upstreams):
+        target.route = routing(core, list(target.by_kind))
     routes, adapter_lifespan = adapter_routes(core, target.tools, resources=target)
 
     async def healthz(_: Request) -> Response:
@@ -293,6 +331,7 @@ def connector_app(
 
     app = AdapterApp(routes=routes, lifespan=lifespan)
     app.state.ekl_core = core
+    app.state.ekl_uses = uses_of(local.config if local else None)
     app.agent = own
     return app
 
@@ -306,20 +345,22 @@ def use_only_app(callbacks: str | None = None, agent_network: Network | None = N
     if own.enabled and agent_network is None:
         own.announce_itself(network)
     channel = bridge(own, callbacks, os.environ.get("EKL_AGENT_CREDENTIAL", "")) if own.enabled and callbacks else None
-    app = local_api(own)
+    app = local_api(own, uses_of(_agent_json()))
     app.state.ekl_agent = own
+    surfaces = app.router.lifespan_context
 
     @contextlib.asynccontextmanager
-    async def lifespan(_: Starlette) -> AsyncIterator[None]:
-        await own.start()
-        if channel is not None:
-            await channel.start()
-        try:
-            yield
-        finally:
+    async def lifespan(started: Starlette) -> AsyncIterator[None]:
+        async with surfaces(started):
+            await own.start()
             if channel is not None:
-                await channel.stop()
-            await own.stop()
+                await channel.start()
+            try:
+                yield
+            finally:
+                if channel is not None:
+                    await channel.stop()
+                await own.stop()
 
     app.router.lifespan_context = lifespan
     return app
@@ -374,6 +415,18 @@ def start_callbacks(agent_file: str | None) -> tuple[subprocess.Popen[bytes], st
     # Through callbacks_child, so the callbacks end with this connector however it stops.
     argv = [sys.executable, "-m", "ekl_provider_adapter.callbacks_child", str(path), "--port", port]
     return subprocess.Popen(argv, cwd=path.parent, env=child, process_group=0), f"http://127.0.0.1:{port}/"
+
+
+def _agent_json() -> dict[str, Any] | None:
+    """agent.json as an object, for what the connector reads beyond the adapter's settings (the services it plans to
+    use); None when there is none or it isn't JSON."""
+    try:
+        found = json.loads(
+            _agent_text(None) or ("" if not Path("agent.json").is_file() else Path("agent.json").read_text())
+        )
+    except ValueError:
+        return None
+    return found if isinstance(found, dict) else None
 
 
 def _agent_text(agent_file: str | None) -> str | None:
@@ -481,7 +534,7 @@ def serve(options: argparse.Namespace, private_port: int, callbacks: str | None)
     # The agent's actions are served beside the public endpoint, on the loopback interface only.
     public = uvicorn.Server(uvicorn.Config(app, host=options.host, port=options.port, log_level="info"))
     private = uvicorn.Server(
-        uvicorn.Config(local_api(app.agent), host="127.0.0.1", port=private_port, log_level="info")
+        uvicorn.Config(local_api(app.agent, app.state.ekl_uses), host="127.0.0.1", port=private_port, log_level="info")
     )
 
     async def both() -> None:
@@ -503,7 +556,9 @@ async def serve_relayed(options: argparse.Namespace, private_port: int, callback
     os.environ["EKL_ADAPTER_ENDPOINT"] = endpoint
     app = connector_app(options.config, upstream_url=options.upstream, callbacks=callbacks)
     private = uvicorn.Server(
-        uvicorn.Config(local_api(app.agent), host="127.0.0.1", port=private_port, log_level="warning")
+        uvicorn.Config(
+            local_api(app.agent, app.state.ekl_uses), host="127.0.0.1", port=private_port, log_level="warning"
+        )
     )
     log.info("serving the agent's calls through the network's relay at %s", endpoint)
     async with app.router.lifespan_context(app):

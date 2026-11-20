@@ -56,7 +56,7 @@ from ekl_provider_adapter.screening import Screener
 log = logging.getLogger("ekl_provider_adapter.agent")
 ANNOUNCE_RETRY_SECONDS = 10.0
 # The EKP version this package speaks, as world_get_contract names it.
-EKP_PROTOCOL = "ekp/3.2"
+EKP_PROTOCOL = "ekp/3.4"
 # A network that speaks only the version before still serves every action but trials, which 3.1 changed: the agent
 # runs there and refuses trials itself, so the connector can be upgraded before the network.
 EKP_WITHOUT_TRIALS = "ekp/3.0"
@@ -448,6 +448,12 @@ class Candidate:
         if packs:
             return min(_amount(str(p.get("price", "0"))) / int(p["calls"]) for p in packs)
         return _amount(self.price)
+
+    @property
+    def price_per_call(self) -> str:
+        """`per_call` as callbacks read it: a plain decimal, "0" for a free service. A service sold in packs has no
+        price per call of its own (the search result's says 0), so its cheapest pack's price over its calls."""
+        return format(self.per_call.normalize(), "f") if self.per_call else "0"
 
     @property
     def pack_calls(self) -> int:
@@ -1450,7 +1456,9 @@ class _Actions:
                 continue
             if candidate.used:
                 # Its real calls stand for a trial; a regression is the network's to catch, by its own test runs.
-                trials.append(Trial(candidate, passed=True, reason=_used_reason(candidate), price=candidate.price))
+                trials.append(
+                    Trial(candidate, passed=True, reason=_used_reason(candidate), price=candidate.price_per_call)
+                )
                 continue
             if tried >= min(max(candidates, 1), TRIALS_AT_MOST):
                 trials.append(Trial(candidate, skipped=True, reason="not tried: enough candidates were tried"))
@@ -1527,7 +1535,7 @@ class _Actions:
             except jsonschema.ValidationError as exc:
                 return Trial(candidate, skipped=True, reason=f"its input does not accept your sample: {exc.message}")
         if not candidate.accepts_trials:
-            return Trial(candidate, untried=True, reason="takes no trials", price=candidate.price)
+            return Trial(candidate, untried=True, reason="takes no trials", price=candidate.price_per_call)
         started = time.monotonic()
         try:
             ran = await self.trial(candidate, given, expect)
@@ -1536,14 +1544,16 @@ class _Actions:
                 # The expectation is at fault, not the candidate: no other candidate would fare better.
                 raise
             seconds = round(time.monotonic() - started, 2)
-            return Trial(candidate, passed=False, reason=exc.message, price=candidate.price, seconds=seconds)
+            return Trial(candidate, passed=False, reason=exc.message, price=candidate.price_per_call, seconds=seconds)
         seconds = round(time.monotonic() - started, 2)
         checks = [dict(c) for c in ran.get("checks") or [] if isinstance(c, dict)]
         score = ran.get("score")
         value = float(score) if isinstance(score, (int, float)) else None
         if ran.get("status") != "succeeded":
             reason = f"the trial did not succeed: {ran.get('error_code') or ran.get('status')}"
-            return Trial(candidate, value, False, reason=reason, price=candidate.price, seconds=seconds, checks=checks)
+            return Trial(
+                candidate, value, False, reason=reason, price=candidate.price_per_call, seconds=seconds, checks=checks
+            )
         passed = bool(ran.get("passed"))
         if passed:
             reason = f"passed, scoring {value:.2f}" if value is not None else "passed"
@@ -1553,7 +1563,9 @@ class _Actions:
             missed = [str(c.get("id")) for c in checks if c.get("score") is not None and float(c["score"]) < 1]
             below = f"scored {value:.2f}, below {ran.get('threshold')}"
             reason = below + (f" (short on {', '.join(missed[:5])})" if missed else "")
-        return Trial(candidate, value, passed, reason=reason, price=candidate.price, seconds=seconds, checks=checks)
+        return Trial(
+            candidate, value, passed, reason=reason, price=candidate.price_per_call, seconds=seconds, checks=checks
+        )
 
     def _ranked(self, trials: list[Trial]) -> list[Trial]:
         """Passed candidates by the console's Prefer setting, then those that take no trials (spec: ranked without a
@@ -1635,19 +1647,25 @@ class _Actions:
     # using a service
 
     async def _connection(self, candidate: Candidate) -> str:
-        """An active connection with access to the service: reused, or requested and waited for."""
-        listed = await self._call("connection_list", state="active")
-        for c in listed.get("connections") or []:
-            if c.get("peer") == candidate.handle and candidate.capability_id in (c.get("peer_capabilities") or []):
-                return str(c["connection_id"])
+        """An active connection with access to the service: reused, or requested and waited for. On a connection to the
+        provider that covers other services, the request asks the provider to add this one."""
+
+        def covering(listed: dict[str, Any]) -> str | None:
+            for c in listed.get("connections") or []:
+                if c.get("peer") == candidate.handle and candidate.capability_id in (c.get("peer_capabilities") or []):
+                    return str(c["connection_id"])
+            return None
+
+        found = covering(await self._call("connection_list", state="active"))
+        if found:
+            return found
         requested = await self._call(
             "connection_request", target=candidate.handle, capability_ids=[candidate.capability_id], note=""
         )
         connection_id = str(requested["connection_id"])
         deadline = time.monotonic() + CONNECTION_WAIT.total_seconds()
         while time.monotonic() < deadline:
-            listed = await self._call("connection_list", state="active")
-            if any(c.get("connection_id") == connection_id for c in listed.get("connections") or []):
+            if covering(await self._call("connection_list", state="active")) == connection_id:
                 return connection_id
             await asyncio.sleep(3)
         raise ConnectionPending(

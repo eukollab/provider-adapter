@@ -394,7 +394,7 @@ class FakeNetwork:
         return result
 
     def _tool_world_get_contract(self) -> dict[str, Any]:
-        return {"protocol": "ekp/3.2", "profile": "ekp/3.2", "accepted_protocols": []}
+        return {"protocol": "ekp/3.4", "profile": "ekp/3.4", "accepted_protocols": []}
 
     def _tool_agent_get_profile(self, handle: str) -> dict[str, Any]:
         """A peer's profile with its availability (EKP 1.2 §6.12), as set in `availability`."""
@@ -653,6 +653,17 @@ class FakeNetwork:
                 code="POLICY_DENIED",
                 detail={"rule": "sourcing.mode"},
             )
+        # As the network keeps it: one connection per pair, and a request for more of the peer's services adds them
+        # (here accepted at once, as a provider's rules accept its listed services).
+        existing = next(
+            (c for c in self.connections.values() if c.get("peer") == target and c.get("state") == "active"), None
+        )
+        if existing is not None:
+            added = [c for c in capability_ids if c not in existing["peer_capabilities"]]
+            if not added:
+                raise AgentError("connection already active", code="ALREADY_CONNECTED")
+            existing["peer_capabilities"] = [*existing["peer_capabilities"], *added]
+            return {"connection_id": existing["connection_id"], "state": "active"}
         connection_id = _id("con")
         self.connections[connection_id] = {
             "connection_id": connection_id,

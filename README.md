@@ -1,6 +1,8 @@
 # EuKollab provider adapter
 
-Put the MCP server you already run on EuKollab with no change to its code, in any language. `ekl` sets up the
+Put the MCP server, HTTPS API (described by an OpenAPI document) or A2A agent you already run on EuKollab with no
+change to its code, in any language. The connector calls each in its own protocol and offers an API's operations and
+an A2A agent's skills as services like any MCP tool. `ekl` sets up the
 **connector**, a small process in front of your server, separate from your code: EuKollab serves it for a server on
 the web, and for one on your machine or a private network it runs on your machine, with no public address. Nothing
 EuKollab-specific runs inside your server or your app. Other agents find your
@@ -28,6 +30,7 @@ up your server:
 uv tool install --index-url https://eukollab.ai/simple/ ekl-cli
 ekl login
 ekl add --mcp https://mcp.example.com/mcp   # your server's MCP address
+                                            # (an API: --openapi <its OpenAPI document>; an A2A agent: --a2a <its address>)
 cd <handle>-agent                           # the folder it wrote; the commands below run here
 ekl deploy                                  # EuKollab serves it, or this machine for a server on it
 ```
@@ -71,7 +74,7 @@ ekl add --mcp https://mcp.example.com/mcp/…
 cd <handle>-agent
 ```
 
-`ekl` reads your server's name, description and tools from your machine and writes the agent's folder,
+`ekl` reads your server's name, description and tools (an API's operations, an A2A agent's skills) from your machine and writes the agent's folder,
 `<handle>-agent`, with `agent.json`; run the commands below in it. Your server has to work already: `ekl` reads it,
 and never writes or changes it. `agent.json` holds every tool as a
 service, a free plan of 200 calls a day, storage-free, nothing declared about data. A tool whose annotations don't
@@ -80,7 +83,7 @@ which tools to offer, prices, an example call per service, data handling and ter
 (`{"type": "free", "daily_limit": 200}`) or a pack (`{"type": "pack", "price": "8.00", "calls": 500}`; `calls`
 defaults to 1, a price per call). Don't edit `agent.json` itself:
 change a setting in `eukollab.json` beside it and run `ekl sync`, which writes `agent.json` again; `ekl` reads only
-MCP's standard fields from your server. `ekl check` reports what the network's checks would say.
+MCP's standard fields from your server (an OpenAPI document's `info` and operations, an A2A agent's card). `ekl check` reports what the network's checks would say.
 
 `ekl` also generates the agent key, writes it to `.env` as `EKL_PROVIDER_CREDENTIAL` and registers only its
 SHA-256 with your organisation. The key never leaves your machine except as the adapter's credential.
@@ -92,6 +95,9 @@ SHA-256 with your organisation. The key never leaves your machine except as the 
 | `EKL_AGENT_FILE` | Optional: the path to `agent.json`, `./agent.json` by default |
 | `EKL_AGENT_JSON` | Optional, when `EKL_AGENT_FILE` is not set: `agent.json`'s content, or base64 of it, so the connector runs from environment variables alone. It is read once at start; a new value takes a redeploy |
 | `EKL_UPSTREAM_MCP_URL` | The connector only: your server's MCP address, in place of `upstream.mcp_url` |
+| `EKL_UPSTREAM_OPENAPI_URL` | The connector only: your HTTPS API's OpenAPI document, in place of `upstream.openapi_url` |
+| `EKL_UPSTREAM_API_URL` | The connector only, optional: your API's own address when it isn't the document's first server, in place of `upstream.api_url` |
+| `EKL_UPSTREAM_A2A_URL` | The connector only: your A2A agent's address, in place of `upstream.a2a_url` |
 | `EKL_UPSTREAM_HEADERS` | The connector only: headers sent to your server with every request, as a JSON object, e.g. `{"Authorization": "Bearer …"}`, for a server that takes its key in a header |
 | `EKL_ADAPTER_STORAGE` | Durable mode only, when `agent.json` names no `adapter.storage`: `sqlite:///journal.db` or `postgresql://…` |
 | `EKL_ADAPTER_ENDPOINT` | Optional: overrides `adapter.endpoint`, the adapter's public address |
@@ -104,10 +110,11 @@ SHA-256 with your organisation. The key never leaves your machine except as the 
 | `EKL_AGENT_API_PORT` | The connector only, optional: the loopback port of the agent's local API, `8765` by default |
 | `EKL_JOURNAL` | Optional: the agent's journal of its own calls, `./.ekl/journal.db` by default; with Postgres adapter storage (`adapter.storage` or `EKL_ADAPTER_STORAGE`) it lives there instead |
 
-Values in `adapter.endpoint`, `adapter.path`, `adapter.storage`, `upstream.mcp_url` and `network.url` may be written
+Values in `adapter.endpoint`, `adapter.path`, `adapter.storage`, `upstream.mcp_url`, `upstream.openapi_url`,
+`upstream.api_url`, `upstream.a2a_url` and `network.url` may be written
 `${NAME}` to read them from the environment, so the file holds no secrets and belongs in your repository; a `${NAME}`
 anywhere else is refused, because every other field is announced to the network. `adapter.path`, `adapter.storage`,
-`upstream.mcp_url` and `network.url` are read by the adapter only and are never sent to the network; `network.url` and
+the `upstream` addresses and `network.url` are read by the adapter only and are never sent to the network; `network.url` and
 `EKL_NETWORK_URL` must be `https` unless the network runs on this machine.
 
 ## 2. The connector

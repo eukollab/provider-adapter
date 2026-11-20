@@ -12,7 +12,7 @@ from ekl_provider_adapter.errors import AgentError
 from ekl_provider_adapter.testing import score_trial, validate_expectation
 from tests.conftest import CONTRACTS
 
-VECTORS = [CONTRACTS / "ekp" / "3.2" / "vectors" / "scoring.json", CONTRACTS / "vectors" / "scoring.json"]
+VECTORS = [CONTRACTS / "ekp" / "3.3" / "vectors" / "scoring.json", CONTRACTS / "vectors" / "scoring.json"]
 
 
 def _vectors() -> list[dict[str, Any]]:

@@ -57,6 +57,7 @@ from ekl_provider_adapter.agent_journal import AgentJournal, PendingDecision
 from ekl_provider_adapter.config import is_loopback
 from ekl_provider_adapter.errors import AgentError, BalanceLow, NoProvider
 from ekl_provider_adapter.local_guard import LocalGuard
+from ekl_provider_adapter.surfaces import Use, surface_routes
 
 log = logging.getLogger("ekl_provider_adapter.callbacks")
 
@@ -315,7 +316,8 @@ class CallbackChannel:
 def _candidate(c: Candidate | None) -> dict[str, Any] | None:
     if c is None:
         return None
-    return {"handle": c.handle, "capability_id": c.capability_id, "summary": str(c.summary), "price": c.price}
+    # What one call costs, also for a service sold in packs: what a choice of the callbacks' own compares.
+    return {"handle": c.handle, "capability_id": c.capability_id, "summary": str(c.summary), "price": c.price_per_call}
 
 
 def _listing(c: Candidate) -> dict[str, Any]:
@@ -556,9 +558,30 @@ async def _service(agent: Agent, handle: str, capability_id: str) -> Candidate:
     raise AgentError(f"{handle} offers no {capability_id} you can use.", code="NOT_FOUND")
 
 
-def local_api(agent: Agent) -> Starlette:
-    """The actions the agent's callbacks start themselves. Bind it to 127.0.0.1 only: it acts with the agent
-    credential, and LocalGuard refuses anything but the publisher's own programs."""
+def _preferred_schemas(agent: Agent) -> Callable[[Use], Awaitable[dict[str, Any] | None]]:
+    """Each planned service's preferred provider's input schema, so a framework's model fills the call right; looked
+    up once, and asked again at the next listing while the network can't be reached."""
+    known: dict[str, dict[str, Any] | None] = {}
+
+    async def schemas(use: Use) -> dict[str, Any] | None:
+        if use.name not in known and use.prefer:
+            handle = use.prefer.split("/", 1)[0]
+            try:
+                match = next((c for c in await agent.aio.find(use.need, limit=25) if c.handle == handle), None)
+                if match is not None and not match.input_schema:
+                    await agent.aio.showcase(match)
+            except AgentError:
+                return None
+            known[use.name] = (match.input_schema or None) if match is not None else None
+        return known.get(use.name)
+
+    return schemas
+
+
+def local_api(agent: Agent, uses: list[Use] | None = None) -> Starlette:
+    """The actions the agent's callbacks start themselves, and, for the services it plans to use (`uses`), the same
+    over MCP at /mcp and A2A at /a2a for agent frameworks (surfaces). Bind it to 127.0.0.1 only: it acts with the
+    agent credential, and LocalGuard refuses anything but the publisher's own programs."""
 
     async def post_need(body: dict[str, Any]) -> dict[str, Any]:
         need = await agent.aio.post_need(body["text"], body.get("topics", []), body.get("budget"))
@@ -688,7 +711,13 @@ def local_api(agent: Agent) -> Starlette:
         except (KeyError, ValueError) as exc:
             return JSONResponse({"error": "INVALID_REQUEST", "message": str(exc)}, status_code=400)
 
+    surfaces, lifespan = surface_routes(uses or [], service, _preferred_schemas(agent), lambda: agent.handle)
     return Starlette(
-        routes=[Route("/agent/status", status, methods=["GET"]), Route("/agent/{action}", run, methods=["POST"])],
+        routes=[
+            Route("/agent/status", status, methods=["GET"]),
+            Route("/agent/{action}", run, methods=["POST"]),
+            *surfaces,
+        ],
         middleware=[Middleware(LocalGuard)],
+        lifespan=lifespan,
     )

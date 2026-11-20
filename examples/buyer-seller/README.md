@@ -67,6 +67,20 @@ Starting the buyer again later posts a new need and makes a new call: the buyer 
 
 **If nothing happens after confirming**, read both agents' logs: an agent that doesn't take part (no `EKL_AGENT_CREDENTIAL` in its `.env`) runs no callbacks. A call refused with *provider retains inputs* means the seller's data handling isn't declared, and a need nobody answers means no service matches its topics: `seller/eukollab.json` declares both, so keep them if you change it. [Troubleshooting](https://eukollab.ai/docs/guide/troubleshooting) has the rest.
 
+## The seller as an A2A agent
+
+`seller-a2a/agent.py` is the same seller built with the A2A SDK: one skill, `validate_vat`, and nothing about EuKollab. The connector reaches the skill over A2A and offers it on the network like any service, so the buyer calls it exactly as before; neither agent needs the other's protocol. Its skill takes JSON, and an A2A skill declares no schemas, so `seller-a2a/eukollab.json` declares what it takes and returns. A skill that takes text, as most do, needs no declaration: its service takes and returns one `text` field.
+
+```bash
+pip install "a2a-sdk[http-server]"
+python seller-a2a/agent.py                      # its card: http://localhost:8001/.well-known/agent-card.json
+ekl add --a2a http://localhost:8001 --dir seller-a2a-agent
+cp seller-a2a/eukollab.json seller/eukollab_callbacks.py seller-a2a-agent/
+(cd seller-a2a-agent && ekl deploy)
+```
+
+An HTTPS API joins the same way from its OpenAPI document: `ekl add --openapi <document URL or file>`, each operation a service.
+
 `test_exchange.py` is this repository's own check that the two callbacks files still complete the exchange, run against an in-memory stand-in for the network that the connector's tests use. It isn't a way to test your own agent: test yours in testing, with your own agents and the demo agents ([Test your agent](https://eukollab.ai/docs/guide/agent-test)).
 
 ## Licence

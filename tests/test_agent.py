@@ -19,6 +19,7 @@ from starlette.testclient import TestClient
 from ekl_provider_adapter import callback_signing as cb
 from ekl_provider_adapter.agent import Agent, Choice, Need, ReviewDue, Untrusted, expectation
 from ekl_provider_adapter.agent_journal import AgentJournal
+from ekl_provider_adapter.callbacks import _listing as callbacks_listing
 from ekl_provider_adapter.callbacks import bridge, local_api
 from ekl_provider_adapter.connector import use_only_app
 from ekl_provider_adapter.errors import (
@@ -167,6 +168,59 @@ def test_post_a_need_choose_by_trial_and_call(tmp_path: Path) -> None:
     assert result.value == {"valid": True} and result.receipt_checked and result.charged == "0.05"
     assert fake.reports[0]["result"] == "useful" and fake.reports[0]["receipt"]
     assert fake.needs[0]["need_state"] == "resolved"
+
+
+def test_two_services_of_one_provider_share_its_connection(tmp_path: Path) -> None:
+    # The network keeps one connection per pair: the second service is asked for on it, not as a new connection.
+    fake = FakeNetwork(handle="@buyer")
+    for capability, work in (("cap_rate", lambda _: {"rate": 1.1}), ("cap_convert", lambda a: {"amount": a["n"] * 2})):
+        fake.provider("@fx", capability, work, summary="exchange rate", input_schema={"type": "object"})
+    agent = _agent(fake, tmp_path)
+    results: list[Any] = []
+
+    @agent.on_start
+    def both() -> None:
+        found = {c.capability_id: c for c in agent.find("exchange rate")}
+        results.append(use(agent, found["cap_rate"]).call({"pair": "EURUSD"}).value)
+        results.append(use(agent, found["cap_convert"]).call({"n": 2}).value)
+
+    fake.run(agent)
+    assert results == [{"rate": 1.1}, {"amount": 4}]
+    (connection,) = fake.connections.values()
+    assert connection["peer_capabilities"] == ["cap_rate", "cap_convert"]
+
+
+def test_a_service_sold_in_packs_is_priced_per_call(tmp_path: Path) -> None:
+    # The search result's price_per_call is 0 for a service sold in packs: what one call costs is its cheapest pack's
+    # price over its calls, which callbacks read as `price` and the cheapest choice ranks by.
+    fake = FakeNetwork(handle="@buyer")
+    for handle, plan in (
+        ("@dear-fx", {"plan_id": "pack-10", "type": "pack", "price": "1.00", "calls": 10}),
+        ("@cheap-fx", {"plan_id": "pack-100", "type": "pack", "price": "1.00", "calls": 100}),
+    ):
+        fake.provider(
+            handle,
+            "cap_rate",
+            lambda _: {"rate": 1.1},
+            summary="exchange rate",
+            plan=plan,
+            input_schema={"type": "object", "properties": {"pair": {"type": "string"}}},
+            output_schema={"type": "object", "properties": {"rate": {"type": "number"}}},
+        )
+    fake.rules(rank_by="price")
+    agent = _agent(fake, tmp_path)
+    found: list[Any] = []
+
+    @agent.on_start
+    def pick() -> None:
+        found.append({c.handle: callbacks_listing(c)["price"] for c in agent.find("exchange rate")})
+        expect = {"checks": [{"id": "rate", "path": "$.rate", "equals": 1.1}]}
+        found.append(agent.choose("exchange rate", sample={"pair": "EURUSD"}, expect=expect))
+
+    fake.run(agent)
+    prices, choice = found
+    assert prices == {"@dear-fx": "0.1", "@cheap-fx": "0.01"}
+    assert choice.main.handle == "@cheap-fx" and choice.backup.handle == "@dear-fx"
 
 
 def test_a_reply_to_a_need_posted_in_this_run_carries_the_need_s_words(tmp_path: Path) -> None:

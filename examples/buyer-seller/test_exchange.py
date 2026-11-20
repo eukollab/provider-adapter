@@ -2,9 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """The exchange, end to end with no network: each agent is its folder's eukollab_callbacks.py, run with the
 connector's agent side against testing.FakeNetwork. The seller answers the buyer's need; the buyer calls the seller's
-MCP server through the connector's local API and checks the receipt. Run it with `pytest`."""
+MCP server through the connector's local API and checks the receipt. The seller may as well be an A2A agent
+(seller-a2a/): the connector reaches its skill over A2A and the buyer calls it the same way. Run it with `pytest`."""
 
 import asyncio
+import concurrent.futures
 import contextlib
 import importlib.util
 import socket
@@ -15,9 +17,11 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+import httpx2
 import pytest
 import uvicorn
 
+from ekl_provider_adapter.a2a_upstream import A2AUpstream
 from ekl_provider_adapter.agent import Agent
 from ekl_provider_adapter.agent_journal import AgentJournal
 from ekl_provider_adapter.callbacks import bridge, local_api
@@ -75,15 +79,31 @@ def _local_api(agent: Agent, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         serving.join(5)
 
 
-def test_the_seller_answers_and_the_buyer_calls_it(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    server = _load(HERE / "seller" / "server.py", "seller_server")
+def _seller(kind: str) -> Any:
+    """The seller's tool as the connector reaches it: the MCP server's function, or the A2A agent's skill over A2A."""
+    if kind == "mcp":
+        server = _load(HERE / "seller" / "server.py", "seller_server")
+        return lambda arguments: server.validate_vat(**arguments)
+    agent = _load(HERE / "seller-a2a" / "agent.py", "seller_a2a")
+
+    async def over_a2a(arguments: dict[str, Any]) -> Any:
+        http = httpx2.AsyncClient(transport=httpx2.ASGITransport(app=agent.app("http://vat.test")))
+        result = await A2AUpstream("http://vat.test", http=http).call("validate_vat", arguments)
+        assert not result.is_error
+        return result.structured_content
+
+    # The fake network calls the seller from the buyer's own event loop, so the A2A call runs on a loop of its own.
+    pool = concurrent.futures.ThreadPoolExecutor(1)
+    return lambda arguments: pool.submit(asyncio.run, over_a2a(arguments)).result(10)
+
+
+@pytest.mark.parametrize("kind", ["mcp", "a2a"])
+def test_the_seller_answers_and_the_buyer_calls_it(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str) -> None:
+    validate = _seller(kind)
     seller, buyer = _callbacks("seller", tmp_path, monkeypatch), _callbacks("buyer", tmp_path, monkeypatch)
     seller_side, buyer_side = FakeNetwork(handle="@vat-check"), FakeNetwork(handle="@supplier-desk")
     seller_agent = Agent(seller_side, AgentJournal(str(tmp_path / "seller.db")))
     buyer_agent = Agent(buyer_side, AgentJournal(str(tmp_path / "buyer.db")))
-
-    def validate(arguments: dict[str, Any]) -> Any:
-        return server.validate_vat(**arguments)
 
     buyer_side.provider("@vat-check", "cap_validate_vat", validate, summary="validate eu vat numbers", price="0.05")
     with (

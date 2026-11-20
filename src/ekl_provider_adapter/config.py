@@ -26,6 +26,7 @@ IDENT = re.compile(r"[^a-z0-9_]+")
 DEFAULT_NETWORK_URL = "https://eukollab.ai"
 
 CapabilityClass = Literal["read_only", "transformation", "external_action"]
+Via = Literal["mcp", "openapi", "a2a"]
 Repeat = Literal["return_kept", "status_only", "refresh"]
 
 
@@ -63,6 +64,9 @@ class Refreshes(_Open):
 
 class Capability(_Open):
     tool: str
+    # How the connector reaches the tool: an MCP tool, an OpenAPI operation or an A2A skill (EKP 3.4 §5.2). Unset, it
+    # is the one kind of upstream agent.json names, else MCP.
+    via: Via | None = None
     capability_id: str | None = None
     version: str = "1.0.0"
     class_: CapabilityClass = Field(alias="class")
@@ -103,8 +107,34 @@ class AdapterSettings(_Open):
     storage: str | None = None
 
 
+UPSTREAM_KEYS = ("mcp_url", "openapi_url", "api_url", "a2a_url")
+
+
 class Upstream(_Open):
-    mcp_url: str
+    """The servers the connector calls: an MCP server, an HTTPS API by its OpenAPI document (api_url overrides the
+    document's server), an A2A agent, or several. All local: the network never sees them."""
+
+    mcp_url: str | None = None
+    openapi_url: str | None = None
+    api_url: str | None = None
+    a2a_url: str | None = None
+
+    @model_validator(mode="after")
+    def _named(self) -> "Upstream":
+        if not (self.mcp_url or self.openapi_url or self.a2a_url):
+            raise ValueError("upstream names no server: set mcp_url, openapi_url or a2a_url")
+        return self
+
+    @property
+    def kinds(self) -> list[Via]:
+        found: list[Via] = []
+        if self.mcp_url:
+            found.append("mcp")
+        if self.openapi_url:
+            found.append("openapi")
+        if self.a2a_url:
+            found.append("a2a")
+        return found
 
 
 def described(exc: BaseException) -> str:
@@ -186,9 +216,19 @@ class AgentFile(_Open):
     def capability(self, tool: str) -> Capability | None:
         return next((c for c in self.offered if c.tool == tool), None)
 
+    def via(self, cap: Capability) -> Via:
+        """How the connector reaches a capability: as declared, else the one kind of upstream named, else MCP."""
+        return via_of(cap, self.upstream.kinds if self.upstream else [])
+
     @property
     def offered(self) -> list[Capability]:
         return [c for c in self.capabilities if c.offered]
+
+
+def via_of(cap: Capability, kinds: list[Via]) -> Via:
+    if cap.via:
+        return cap.via
+    return kinds[0] if len(kinds) == 1 else "mcp"
 
 
 def default_repeat(cap: Capability, mode: str) -> Repeat:
@@ -222,8 +262,11 @@ def _problems(file: AgentFile) -> list[str]:
     tools = [c.tool for c in file.capabilities]
     if len(tools) != len(set(tools)):
         found.append("each tool may be listed once")
+    kinds = file.upstream.kinds if file.upstream else []
     for cap in file.offered:
         where = f"capability {cap.tool}"
+        if kinds and file.via(cap) not in kinds:
+            found.append(f"{where}: it is reached by {file.via(cap)}, but upstream names no such server")
         found.extend(f"{where}: {problem}" for p in cap.plans or [] if (problem := plan_problem(p)))
         if cap.class_ == "external_action" and file.execution_mode != "durable":
             found.append(f"{where}: external actions need execution_mode durable")
@@ -293,10 +336,10 @@ def _expand_value(value: Any) -> Any:
 
 
 # Settings only the adapter reads: the network ignores them, so they are stripped before announcing.
-LOCAL_SETTINGS = {"adapter": ("path", "storage"), "upstream": ("mcp_url",), "network": ("url",)}
+LOCAL_SETTINGS = {"adapter": ("path", "storage"), "upstream": UPSTREAM_KEYS, "network": ("url",)}
 # The fields whose ${NAME} is read from the environment: the local settings, and the deployment's own public address,
 # which changes per deployment and is a public URL, never a secret.
-EXPANDED = {"adapter": ("endpoint", "path", "storage"), "upstream": ("mcp_url",), "network": ("url",)}
+EXPANDED = {"adapter": ("endpoint", "path", "storage"), "upstream": UPSTREAM_KEYS, "network": ("url",)}
 
 
 def strip_local(raw: dict[str, Any]) -> dict[str, Any]:
