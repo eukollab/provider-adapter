@@ -75,7 +75,7 @@ from ekl_provider_adapter.relay import Relay, relay_address
 from ekl_provider_adapter.server import adapter_routes
 from ekl_provider_adapter.storage import Storage, open_storage
 from ekl_provider_adapter.surfaces import uses_of
-from ekl_provider_adapter.upstreams import Target, Upstreams, addresses
+from ekl_provider_adapter.upstreams import Plan, Target, Upstreams, addresses
 
 log = logging.getLogger(__name__)
 CALLBACKS_FILE = "eukollab_callbacks.py"
@@ -246,14 +246,18 @@ def upstream_targets(found: dict[str, str], headers: dict[str, str]) -> Upstream
     return Upstreams(by_kind)
 
 
-def routing(core: AdapterCore, kinds: list[Via]) -> Callable[[str], Via | None]:
-    """Which upstream answers a tool: its capability's `via`, as the configuration served now declares it."""
+def planning(core: AdapterCore, kinds: list[Via]) -> Callable[[str], Plan | None]:
+    """How a tool is reached: its capability's `via`, then the same function on the agent's other servers (`also`),
+    as the configuration served now declares them."""
 
-    def route(tool: str) -> Via | None:
+    def plan(tool: str) -> Plan | None:
         cap = next((c for c in core.listed if c.tool == tool), None)
-        return via_of(cap, kinds) if cap is not None else None
+        if cap is None:
+            return None
+        steps = [(via_of(cap, kinds), cap.tool), *((a.via, a.tool) for a in cap.also)]
+        return Plan(steps, effects=cap.class_ == "external_action")
 
-    return route
+    return plan
 
 
 def connector_app(
@@ -294,7 +298,8 @@ def connector_app(
         settings=settings,
     )
     if isinstance(target, Upstreams):
-        target.route = routing(core, list(target.by_kind))
+        target.plan = planning(core, list(target.by_kind))
+        target.services = lambda: [c.tool for c in core.listed]
     routes, adapter_lifespan = adapter_routes(core, target.tools, resources=target)
 
     async def healthz(_: Request) -> Response:
@@ -331,6 +336,7 @@ def connector_app(
 
     app = AdapterApp(routes=routes, lifespan=lifespan)
     app.state.ekl_core = core
+    app.state.ekl_target = target
     app.state.ekl_uses = uses_of(local.config if local else None)
     app.agent = own
     return app
@@ -562,7 +568,15 @@ async def serve_relayed(options: argparse.Namespace, private_port: int, callback
     )
     log.info("serving the agent's calls through the network's relay at %s", endpoint)
     async with app.router.lifespan_context(app):
-        relaying = asyncio.ensure_future(Relay(app, network, credential, path=app.state.ekl_core.path).run())
+        target: Target = app.state.ekl_target
+
+        async def answers() -> bool:
+            # The agent is reachable while its servers list what they offer; until then the lease is let go.
+            await target.tools()
+            return True
+
+        relay = Relay(app, network, credential, path=app.state.ekl_core.path, ready=answers)
+        relaying = asyncio.ensure_future(relay.run())
         try:
             await asyncio.gather(
                 private.serve(), announce_when_listening(private, f"http://127.0.0.1:{private_port}", options.config)

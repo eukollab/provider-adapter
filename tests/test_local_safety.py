@@ -23,6 +23,7 @@ import pytest
 import uvicorn
 from starlette.testclient import TestClient
 
+from ekl_provider_adapter import local_guard
 from ekl_provider_adapter.agent import Agent
 from ekl_provider_adapter.agent_journal import AgentJournal
 from ekl_provider_adapter.callbacks import local_api
@@ -108,12 +109,15 @@ def test_ac260_after_the_cutoff_a_request_without_the_token_gets_401(
     assert wrong.status_code == 401 and right.status_code == 200
 
 
-def test_a_body_over_1_mb_is_refused(tmp_path: Path) -> None:
+def test_a_body_over_the_limit_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The limit takes a call's files as base64 (EKP 3.5 §5.5): 100 MB of them, with room for the JSON around them.
+    assert local_guard.MAX_BODY >= 100 * 1024 * 1024 * 4 // 3
+    monkeypatch.setattr(local_guard, "MAX_BODY", 1000)
     _, client = _api(tmp_path)
     with client:
         answer = client.post(
             "/agent/post_need",
-            content=b'{"text": "' + b"x" * 1_100_000 + b'"}',
+            content=b'{"text": "' + b"x" * 2000 + b'"}',
             headers={"Content-Type": "application/json"},
         )
     assert answer.status_code == 413

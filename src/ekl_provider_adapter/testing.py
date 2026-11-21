@@ -394,7 +394,7 @@ class FakeNetwork:
         return result
 
     def _tool_world_get_contract(self) -> dict[str, Any]:
-        return {"protocol": "ekp/3.4", "profile": "ekp/3.4", "accepted_protocols": []}
+        return {"protocol": "ekp/3.5", "profile": "ekp/3.5", "accepted_protocols": []}
 
     def _tool_agent_get_profile(self, handle: str) -> dict[str, Any]:
         """A peer's profile with its availability (EKP 1.2 §6.12), as set in `availability`."""

@@ -10,6 +10,7 @@ them. `Network` is the seam the tests replace with `testing.FakeNetwork`.
 import json
 from dataclasses import dataclass
 from typing import Any, Protocol
+from urllib.parse import quote
 
 import httpx2
 import mcp_types as types
@@ -106,6 +107,38 @@ class McpNetwork:
             )
         data: dict[str, Any] = answer.get("data") or {}
         return data
+
+    async def _files(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        """The network's file store (EKP 3.5 §5.5), over HTTPS with the agent-operation credential."""
+        try:
+            async with httpx2.AsyncClient(
+                headers={"Authorization": f"Bearer {self.credential}"}, timeout=TIMEOUT_SECONDS
+            ) as http:
+                response = await http.request(method, self.base_url + path, json=body)
+        except httpx2.HTTPError as exc:
+            raise ProviderUnavailable(
+                f"EuKollab could not be reached ({type(exc).__name__}).", code="SERVICE_UNAVAILABLE"
+            ) from exc
+        try:
+            answer: dict[str, Any] = response.json()
+        except ValueError:
+            answer = {}
+        if response.status_code >= 400:
+            raise from_network(
+                str(answer.get("code") or "SERVICE_UNAVAILABLE"), str(answer.get("message") or "refused"), None
+            )
+        return answer
+
+    async def file_upload(
+        self, execution_id: str, receiver: str, sha256: str, size: int, media_type: str
+    ) -> dict[str, Any]:
+        """An upload for one of a call's files, for the provider it goes to."""
+        body = {"execution_id": execution_id, "receiver": receiver, "sha256": sha256, "size": size}
+        return await self._files("POST", "/v1/files", body | {"media_type": media_type})
+
+    async def file_download(self, sha256: str, execution_id: str) -> dict[str, Any]:
+        """A download for a file a provider sent back with a call's result."""
+        return await self._files("GET", f"/v1/files/{sha256}?execution_id={quote(execution_id, safe='')}")
 
     async def call_provider(
         self, endpoint: str, token: str, tool: str, arguments: dict[str, Any], ekl: dict[str, Any]

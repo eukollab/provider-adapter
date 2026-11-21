@@ -20,6 +20,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
+import httpx2
 import jsonschema
 import mcp_types as types
 
@@ -35,6 +36,7 @@ from ekl_provider_adapter.api import (
     proof_key,
 )
 from ekl_provider_adapter.config import AgentFile, Capability, LocalFile, described
+from ekl_provider_adapter.files import FileTransfer, FileUnavailableError, references
 from ekl_provider_adapter.fingerprint import fingerprint, result_body
 from ekl_provider_adapter.jcs import MAX_DEPTH, too_deep
 from ekl_provider_adapter.storage import ExecutionRecord, Storage, open_storage
@@ -555,7 +557,7 @@ class AdapterCore:
             return admission
         match admission.decision:
             case "run":
-                return await self._run(cap, arguments, attempt_id, str(salt), admission, record)
+                return await self._run(cap, arguments, attempt_id, str(salt), admission, record, execution_id)
             case "refresh":
                 await self._forget(attempt_id)
                 return await self._refresh(cap, arguments, admission)
@@ -615,6 +617,57 @@ class AdapterCore:
         if self.storage is not None:
             await asyncio.to_thread(self.storage.forget, attempt_id)
 
+    def _files(self, execution_id: str) -> FileTransfer | None:
+        """One execution's files, through the network's file store, when this connector's network client has one."""
+        upload = getattr(self.api, "file_upload", None)
+        download = getattr(self.api, "file_download", None)
+        if upload is None or download is None:
+            return None
+        return FileTransfer(
+            lambda sha256, size, kind: upload(execution_id, sha256, size, kind),
+            lambda sha256: download(sha256, execution_id),
+            # The client a network client moves files with, when it has one of its own (a test's, say).
+            getattr(self.api, "file_http", None),
+        )
+
+    async def _prepared(
+        self,
+        cap: Capability,
+        attempt_id: str,
+        admission: Admission,
+        arguments: dict[str, Any],
+        files: FileTransfer | None,
+    ) -> dict[str, Any] | types.CallToolResult:
+        """The arguments the tool runs with: a dry run's and an idempotency key's added, and the caller's files fetched
+        (EKP 3.5 §5.5), or the call refused without effect when either can't be done."""
+        admission_id = str(admission.admission_id)
+        effective = self._effective_arguments(cap, arguments, admission)
+        if isinstance(effective, str):
+            await self._settle(cap, attempt_id, admission_id, "failed_before_effect", None, None, error_code=effective)
+            return error_result(effective, "this capability has no genuine dry run", admission_id=admission_id)
+        arguments = effective
+        if not references(arguments):
+            return arguments
+        try:
+            if files is None:
+                raise FileUnavailableError("this connector can't fetch a call's files")
+            received: dict[str, Any] = await files.receive(arguments)
+        except (FileUnavailableError, ProviderApiError) as exc:
+            await self._settle(
+                cap, attempt_id, admission_id, "failed_before_effect", None, None, error_code="FILE_UNAVAILABLE"
+            )
+            return error_result("FILE_UNAVAILABLE", str(exc), admission_id=admission_id, outcome="failed_before_effect")
+        return received
+
+    @staticmethod
+    async def _send_files(cap: Capability, result: types.CallToolResult, files: FileTransfer) -> types.CallToolResult:
+        try:
+            return await files.send_result(result)
+        except (FileUnavailableError, ProviderApiError, httpx2.HTTPError, ValueError) as exc:
+            # The network keeps no file store, or it failed: the result goes as it is, the relay's limit permitting.
+            log.warning("%s: a result's files stay inline (%s)", cap.tool, exc)
+            return result
+
     def _effective_arguments(
         self, cap: Capability, arguments: dict[str, Any], admission: Admission
     ) -> dict[str, Any] | str:
@@ -636,6 +689,7 @@ class AdapterCore:
         salt: str,
         admission: Admission,
         record: ExecutionRecord | None,
+        execution_id: str,
     ) -> types.CallToolResult:
         admission_id = str(admission.admission_id)
         if self.storage is not None and record is not None:
@@ -681,11 +735,11 @@ class AdapterCore:
                     admission_id=admission_id,
                     outcome="failed_before_effect",
                 )
-        effective = self._effective_arguments(cap, arguments, admission)
-        if isinstance(effective, str):
-            await self._settle(cap, attempt_id, admission_id, "failed_before_effect", None, None, error_code=effective)
-            return error_result(effective, "this capability has no genuine dry run", admission_id=admission_id)
-        work = asyncio.ensure_future(self.invoke(cap.tool, effective))
+        files = self._files(execution_id)
+        received = await self._prepared(cap, attempt_id, admission, arguments, files)
+        if isinstance(received, types.CallToolResult):
+            return received
+        work = asyncio.ensure_future(self.invoke(cap.tool, received))
         lease = asyncio.ensure_future(self._hold_lease(cap, admission_id, admission.lease_expires_at, work))
         try:
             outcome, result = await self._outcome(cap, work)
@@ -696,8 +750,11 @@ class AdapterCore:
         if lease.done() and not lease.cancelled() and lease.result() is True:
             # The hook confirmed the work stopped: whatever the tool returned is not the completed work.
             outcome = "cancelled"
-        output_fp = fingerprint(salt, result_body(result)) if outcome == "succeeded" and result is not None else None
         keep = result if outcome == "succeeded" and cap.repeat == "return_kept" else None
+        if outcome == "succeeded" and result is not None and files is not None:
+            # Large files go back beside the result, which the output fingerprint then covers as sent.
+            result = await self._send_files(cap, result, files)
+        output_fp = fingerprint(salt, result_body(result)) if outcome == "succeeded" and result is not None else None
         await self._settle(cap, attempt_id, admission_id, outcome, output_fp, keep)
         if result is None:
             return error_result(

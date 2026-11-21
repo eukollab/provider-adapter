@@ -93,7 +93,7 @@ async def test_a_framework_calls_a_planned_service_over_a2a(tmp_path: Path) -> N
         got = await http.post(
             "/a2a", json={"jsonrpc": "2.0", "id": 2, "method": "GetTask", "params": {"id": task["id"]}}
         )
-        assert got.json()["result"]["task"]["id"] == task["id"]
+        assert got.json()["result"]["id"] == task["id"]  # A2A 1.0's GetTask answers the Task itself
         legacy = dict(message, kind="message", role="user", parts=[{"kind": "data", "data": {"amount": 1}}])
         old = await http.post(
             "/a2a", json={"jsonrpc": "2.0", "id": 3, "method": "message/send", "params": {"message": legacy}}
@@ -104,7 +104,9 @@ async def test_a_framework_calls_a_planned_service_over_a2a(tmp_path: Path) -> N
             "/a2a", json={"jsonrpc": "2.0", "id": 4, "method": "SendMessage", "params": {"message": unnamed}}
         )
         assert refused.json()["result"]["task"]["status"]["state"] == "TASK_STATE_REJECTED"
-        unknown = await http.post("/a2a", json={"jsonrpc": "2.0", "id": 5, "method": "ListTasks"})
+        listed = await http.post("/a2a", json={"jsonrpc": "2.0", "id": 5, "method": "ListTasks", "params": {}})
+        assert [t["id"] for t in listed.json()["result"]["tasks"]][-1] == task["id"]
+        unknown = await http.post("/a2a", json={"jsonrpc": "2.0", "id": 6, "method": "tasks/nothing"})
         assert unknown.json()["error"]["code"] == -32601
 
 

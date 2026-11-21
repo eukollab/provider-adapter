@@ -5,8 +5,8 @@
 It acts with the agent credential, so a web page the publisher happens to open must never reach it. Browsers send
 `Origin` on cross-site requests and can't send a JSON body cross-site without a preflight, which is refused; a page
 that rebinds its own name to 127.0.0.1 arrives with a foreign Host. Every request therefore needs a loopback Host,
-no Origin, a JSON body of at most 1 MB and, once set, the local token (EKL_LOCAL_TOKEN, which `ekl add` writes to
-.env, and `ekl deploy` when it is missing). No CORS header is ever sent.
+no Origin, a JSON body of at most 140 MB (a call's files, as base64) and, once set, the local token
+(EKL_LOCAL_TOKEN, which `ekl add` writes to .env, and `ekl deploy` when it is missing). No CORS header is ever sent.
 
 A connector set up with EKL_LOCAL_TOKEN requires it from the start. One set up before it existed keeps answering
 without it until LOCAL_TOKEN_REQUIRED_FROM, then refuses everything until the token is set.
@@ -30,7 +30,9 @@ from ekl_provider_adapter.private_files import write_private_json
 
 log = logging.getLogger("ekl_provider_adapter.local_api")
 
-MAX_BODY = 1_048_576
+# Large enough for a call's files as base64 (EKP 3.5 §5.5): up to 100 MB of them; the connector moves them beside the
+# call, so the network's own limits never see them.
+MAX_BODY = 140 * 1024 * 1024
 TOKEN_VARIABLE = "EKL_LOCAL_TOKEN"
 # 60 days after the release that introduced the token: existing installations need it from this day.
 LOCAL_TOKEN_REQUIRED_FROM = dt.date(2027, 1, 12)
@@ -114,7 +116,7 @@ class LocalGuard:
             return
         length = headers.get(b"content-length")
         if length is not None and length.isdigit() and int(length) > MAX_BODY:
-            await _answer(send, 413, "TOO_LARGE", "a request body is at most 1 MB")
+            await _answer(send, 413, "TOO_LARGE", "a request body is at most 140 MB")
             return
         # The body is read here, bounded, and replayed: a streamed body can't exceed the limit unseen.
         chunks: list[bytes] = []
@@ -127,7 +129,7 @@ class LocalGuard:
             chunk = message.get("body", b"")
             size += len(chunk)
             if size > MAX_BODY:
-                await _answer(send, 413, "TOO_LARGE", "a request body is at most 1 MB")
+                await _answer(send, 413, "TOO_LARGE", "a request body is at most 140 MB")
                 return
             chunks.append(chunk)
             more = bool(message.get("more_body"))

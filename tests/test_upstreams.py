@@ -8,6 +8,7 @@ import json
 from typing import Any
 
 import httpx2
+import mcp_types as types
 import pytest
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -36,7 +37,7 @@ from ekl_provider_adapter.openapi_upstream import (
     parse_document,
     safe_integers,
 )
-from ekl_provider_adapter.upstreams import Upstreams
+from ekl_provider_adapter.upstreams import Plan, Upstreams
 from tests.conftest import CONTRACTS
 
 from .a2a_agent import a2a_app
@@ -355,3 +356,121 @@ def test_skills_map_to_tools_as_the_shared_vectors_say() -> None:
         assert message_part(call["arguments"], call["text"], legacy=False) == call["sent_parts"][0], call["name"]
         answered = parts_result(call["answer_parts"], call["text"])
         assert answered.structured_content == call["structured"], call["name"]
+
+
+async def test_an_api_that_does_not_answer_lists_nothing_though_its_document_is_held() -> None:
+    """The document held (from a file, or read a minute ago) says nothing of the API: listing asks the API itself, with
+    any answer counting, so an agent whose API is down is offline."""
+    assert [t.name for t in await api_upstream().tools()] == ["get_rate", "create_label", "delete_label"]
+
+    def refused(request: httpx2.Request) -> httpx2.Response:
+        raise httpx2.ConnectError("connection refused", request=request)
+
+    down = OpenAPIUpstream(
+        "https://api.ship.test/openapi.json",
+        http=httpx2.AsyncClient(transport=httpx2.MockTransport(refused)),
+        spec=SPEC,
+    )
+    with pytest.raises(httpx2.ConnectError):
+        await down.tools()
+
+
+class Answers:
+    """A server whose calls are scripted: each tool answers, fails with an exception, or says it is unavailable."""
+
+    def __init__(self, tools: dict[str, Any], listed: list[str] | None = None) -> None:
+        self.answers = tools
+        self.calls: list[str] = []
+        self.listing: list[str] | BaseException = listed if listed is not None else list(tools)
+
+    async def call(self, tool: str, arguments: dict[str, Any]) -> types.CallToolResult:
+        del arguments
+        self.calls.append(tool)
+        answer = self.answers[tool]
+        if isinstance(answer, BaseException):
+            raise answer
+        if answer == "unavailable":
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text="HTTP 503")],
+                is_error=True,
+                meta={"ekl": {"unavailable": True}},
+            )
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=answer)], structured_content={"by": answer}
+        )
+
+    async def tools(self) -> list[types.Tool]:
+        if isinstance(self.listing, BaseException):
+            raise self.listing
+        return [types.Tool(name=n, input_schema={"type": "object"}) for n in self.listing]
+
+    async def list(self) -> list[types.Resource]:
+        return []
+
+    async def read(self, uri: str) -> types.ReadResourceResult:
+        raise LookupError(uri)
+
+
+REFUSED_CONNECTION = httpx2.ConnectError("connection refused")
+
+
+async def test_a_service_falls_back_to_the_same_function_on_another_server() -> None:
+    mcp_server = Answers({"convert": REFUSED_CONNECTION})
+    a2a_agent = Answers({"convert-currency": "a2a"})
+    both = Upstreams({"mcp": mcp_server, "a2a": a2a_agent})
+    both.plan = lambda _: Plan([("mcp", "convert"), ("a2a", "convert-currency")])
+    result = await both.call("convert", {"amount": 1})
+    assert result.structured_content == {"by": "a2a"}
+    assert (mcp_server.calls, a2a_agent.calls) == (["convert"], ["convert-currency"])
+    # A read-only service also moves on from a server that answered it can't answer now, or failed on the way.
+    mcp_server.answers["convert"] = "unavailable"
+    assert (await both.call("convert", {})).structured_content == {"by": "a2a"}
+    mcp_server.answers["convert"] = httpx2.ReadTimeout("no answer")
+    assert (await both.call("convert", {})).structured_content == {"by": "a2a"}
+
+
+async def test_an_external_action_moves_on_only_from_a_server_it_never_reached() -> None:
+    mcp_server = Answers({"send": REFUSED_CONNECTION})
+    api = Answers({"send_message": "api"})
+    both = Upstreams({"mcp": mcp_server, "openapi": api})
+    both.plan = lambda _: Plan([("mcp", "send"), ("openapi", "send_message")], effects=True)
+    assert (await both.call("send", {})).structured_content == {"by": "api"}
+    # Reached and then lost, or answered unavailable, the message may have gone: no second sending.
+    mcp_server.answers["send"] = httpx2.ReadTimeout("no answer")
+    with pytest.raises(httpx2.ReadTimeout):
+        await both.call("send", {})
+    mcp_server.answers["send"] = "unavailable"
+    assert (await both.call("send", {})).is_error
+    assert api.calls == ["send_message"]
+
+
+async def test_the_agent_answers_while_every_service_has_a_server_that_does() -> None:
+    mcp_server = Answers({"convert": "mcp", "quote": "mcp"})
+    a2a_agent = Answers({"convert-currency": "a2a"})
+    both = Upstreams({"mcp": mcp_server, "a2a": a2a_agent})
+    plans = {"convert": Plan([("mcp", "convert"), ("a2a", "convert-currency")]), "quote": Plan([("mcp", "quote")])}
+    both.plan = plans.get
+    both.services = lambda: ["convert"]
+    listed = {t.name for t in await both.tools()}
+    assert listed == {"convert", "quote", "convert-currency"}
+    # The MCP server goes away: convert still has A2A, so the agent answers, its listing as the server last gave it.
+    mcp_server.listing = REFUSED_CONNECTION
+    assert {t.name for t in await both.tools()} == listed
+    # A service with no other server makes the agent not answer, as does a server it never heard from.
+    both.services = lambda: ["convert", "quote"]
+    with pytest.raises(httpx2.ConnectError):
+        await both.tools()
+    fresh = Upstreams({"mcp": Answers({}, listed=[]), "a2a": a2a_agent})
+    fresh.by_kind["mcp"].listing = REFUSED_CONNECTION  # type: ignore[attr-defined]
+    fresh.plan, fresh.services = plans.get, lambda: ["convert"]
+    with pytest.raises(httpx2.ConnectError):
+        await fresh.tools()
+
+
+def test_also_names_the_agents_other_servers_once() -> None:
+    also = {"tool": "get_rate", "class": "read_only", "via": "openapi"}
+    load_agent_file(AGENT_BOTH | {"capabilities": [also | {"also": [{"via": "mcp", "tool": "rate"}]}]})
+    with pytest.raises(ValueError, match="never its own"):
+        load_agent_file(AGENT_BOTH | {"capabilities": [also | {"also": [{"via": "openapi", "tool": "x"}]}]})
+    with pytest.raises(ValueError, match="also names a2a, but upstream names no such server"):
+        load_agent_file(AGENT_BOTH | {"capabilities": [also | {"also": [{"via": "a2a", "tool": "x"}]}]})

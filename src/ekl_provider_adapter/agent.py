@@ -47,6 +47,7 @@ from ekl_provider_adapter.errors import (
     OutcomeUnknown,
     ProviderUnavailable,
 )
+from ekl_provider_adapter.files import FileTransfer, FileUnavailableError, references
 from ekl_provider_adapter.fingerprint import fingerprint, new_salt
 from ekl_provider_adapter.network_client import Network, ProviderAnswer
 from ekl_provider_adapter.receipts import CallMade, KeySet, ReceiptInvalid, receipt_digest
@@ -56,7 +57,7 @@ from ekl_provider_adapter.screening import Screener
 log = logging.getLogger("ekl_provider_adapter.agent")
 ANNOUNCE_RETRY_SECONDS = 10.0
 # The EKP version this package speaks, as world_get_contract names it.
-EKP_PROTOCOL = "ekp/3.4"
+EKP_PROTOCOL = "ekp/3.5"
 # A network that speaks only the version before still serves every action but trials, which 3.1 changed: the agent
 # runs there and refuses trials itself, so the connector can be upgraded before the network.
 EKP_WITHOUT_TRIALS = "ekp/3.0"
@@ -366,6 +367,16 @@ class Event:
 
 
 # --- finding and choosing ------------------------------------------------------------------------------------------
+
+
+def _tool_and_version(access: dict[str, Any], candidate: "Candidate") -> tuple[str, str]:
+    """The tool and version an access grant names for the chosen service, else what the search said."""
+    listed = next(
+        (c for c in access.get("capabilities") or [] if c.get("capability_id") == candidate.capability_id), None
+    )
+    if listed is None:
+        return candidate.capability_id.removeprefix("cap_"), candidate.version
+    return str(listed["tool"]), str(listed["version"])
 
 
 @dataclass
@@ -1675,6 +1686,39 @@ class _Actions:
             detail={"connection_id": connection_id},
         )
 
+    async def _send_files(self, execution_id: str, provider_id: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        files = self._files(execution_id, provider_id)
+        if files is None:
+            return arguments
+        try:
+            sent: dict[str, Any] = await files.send(arguments)
+        except (FileUnavailableError, ValueError) as exc:
+            code = "FILE_TOO_LARGE" if isinstance(exc, ValueError) else "FILE_UNAVAILABLE"
+            raise AgentError(f"A file couldn't be sent with the call: {exc}", code=code) from exc
+        return sent
+
+    async def _receive_files(self, execution_id: str, provider_id: str, value: Any) -> Any:
+        files = self._files(execution_id, provider_id)
+        if files is None or not references(value):
+            return value
+        try:
+            return await files.receive(value)
+        except FileUnavailableError as exc:
+            raise AgentError(f"A file of the result couldn't be fetched: {exc}", code="FILE_UNAVAILABLE") from exc
+
+    def _files(self, execution_id: str, provider_id: str) -> FileTransfer | None:
+        """One call's files, through the network's file store, when this agent's network client has one."""
+        upload = getattr(self.agent.network, "file_upload", None)
+        download = getattr(self.agent.network, "file_download", None)
+        if upload is None or download is None:
+            return None
+        return FileTransfer(
+            lambda sha256, size, kind: upload(execution_id, provider_id, sha256, size, kind),
+            lambda sha256: download(sha256, execution_id),
+            # The client a network client moves files with, when it has one of its own (a test's, say).
+            getattr(self.agent.network, "file_http", None),
+        )
+
     async def _agreement(self, candidate: Candidate, data_class: str = "public") -> tuple[str, dict[str, Any]]:
         # The connection and a paid agreement are waited for within one CONNECTION_WAIT, which act() outlasts.
         deadline = time.monotonic() + CONNECTION_WAIT.total_seconds()
@@ -1784,22 +1828,7 @@ class _Actions:
                 f"{candidate.handle}'s service changed its schemas since it was chosen.", code="CONTRACT_CHANGED"
             )
         candidate.contract = candidate.contract or contract
-        tool = next(
-            (
-                str(c["tool"])
-                for c in access.get("capabilities") or []
-                if c.get("capability_id") == candidate.capability_id
-            ),
-            candidate.capability_id.removeprefix("cap_"),
-        )
-        version = next(
-            (
-                str(c["version"])
-                for c in access.get("capabilities") or []
-                if c.get("capability_id") == candidate.capability_id
-            ),
-            candidate.version,
-        )
+        tool, version = _tool_and_version(access, candidate)
         terms = agreement.get("terms") or {}
         ekl: dict[str, Any] = {
             "execution_id": recorded.execution_id,
@@ -1810,6 +1839,8 @@ class _Actions:
         }
         if terms.get("hash"):
             ekl["terms_hash"] = terms["hash"]
+        # Large files travel beside the call (EKP 3.5 §5.5); the commitment and fingerprints cover their references.
+        arguments = await self._send_files(recorded.execution_id, candidate.agent_id, arguments)
         held_price = None
         if _paid(agreement, terms):
             ekl["execution_grant"], held_price = await self._grant(
@@ -1855,7 +1886,13 @@ class _Actions:
         self.agent.journal.finish_call(key, {"status": outcome, "charged": charged, "receipt_checked": checked})
         if answer.is_error:
             raise AgentError(answer.text or f"{candidate.handle} returned an error.", code="PROVIDER_ERROR")
-        return Result(answer.value, recorded.execution_id, charged, checked, safety_flags=flags)
+        return Result(
+            await self._receive_files(recorded.execution_id, candidate.agent_id, answer.value),
+            recorded.execution_id,
+            charged,
+            checked,
+            safety_flags=flags,
+        )
 
     async def _report(
         self,

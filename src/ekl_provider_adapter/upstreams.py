@@ -9,13 +9,20 @@ outcomes, fingerprints and the endpoint consumers call are the same for every ag
 protocol in common to work together.
 """
 
+import asyncio
+import logging
 import os
+import socket
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any, Protocol
 
+import httpx2
 import mcp_types as types
 
-from ekl_provider_adapter.config import LocalFile, Via
+from ekl_provider_adapter.config import ORDER, LocalFile, Via
+
+log = logging.getLogger(__name__)
 
 ENVIRONMENT: dict[str, str] = {
     "mcp_url": "EKL_UPSTREAM_MCP_URL",
@@ -49,38 +56,106 @@ def addresses(local: LocalFile | None, mcp_url: str | None = None) -> dict[str, 
     return found
 
 
-class Upstreams:
-    """Several upstreams as one: a call goes to the upstream `route` names for the tool, a listing holds every
-    upstream's tools (the routed upstream's when two share a name). Resources come only from an MCP server."""
+@dataclass(frozen=True)
+class Plan:
+    """How a service is reached: its server and tool, then the same function on the agent's other servers in the
+    order they are tried (`also`). `effects` is an external action's: it moves on only from a server never reached."""
 
-    def __init__(self, by_kind: dict[Via, Target], route: Callable[[str], Via | None] | None = None) -> None:
+    steps: list[tuple[Via, str]]
+    effects: bool = False
+
+
+def unreached(exc: BaseException) -> bool:
+    """Whether a call failed before reaching the server: no connection was made, so nothing ran there."""
+    seen: list[BaseException] = [exc]
+    while seen:
+        found = seen.pop()
+        if isinstance(found, httpx2.ConnectError | httpx2.ConnectTimeout | ConnectionRefusedError | socket.gaierror):
+            return True
+        if isinstance(found, BaseExceptionGroup):
+            seen.extend(found.exceptions)
+        seen.extend(e for e in (found.__cause__, found.__context__) if e is not None)
+    return False
+
+
+def _unavailable(result: types.CallToolResult) -> bool:
+    return bool(result.is_error and dict((result.meta or {}).get("ekl") or {}).get("unavailable"))
+
+
+class Upstreams:
+    """Several upstreams as one. A call goes to the server its service names; when that one can't answer, to the same
+    function on the agent's other servers in turn (`plan`). A listing holds every server's tools (the planned
+    server's when two share a name). Resources come only from an MCP server.
+
+    The agent answers while every service can be reached: a server that doesn't answer is passed over when each
+    service it serves has another that does, and its tools are listed as it last listed them, so the agent's
+    fingerprint doesn't move while it is away. Without a plan, every server must answer."""
+
+    def __init__(self, by_kind: dict[Via, Target], plan: Callable[[str], Plan | None] | None = None) -> None:
         if not by_kind:
             raise ValueError("no upstream server")
         self.by_kind = by_kind
-        self.route = route or (lambda _: None)
+        self.plan: Callable[[str], Plan | None] = plan or (lambda _: None)
+        # The services to keep reachable, and the tools each server last listed.
+        self.services: Callable[[], list[str]] = list
+        self._listed: dict[Via, list[types.Tool]] = {}
 
-    def _kind(self, tool: str) -> Via:
-        routed = self.route(tool)
-        if routed is not None:
-            return routed
-        return "mcp" if "mcp" in self.by_kind else next(iter(self.by_kind))
+    def _steps(self, tool: str) -> Plan:
+        planned = self.plan(tool)
+        if planned is not None and planned.steps:
+            return planned
+        first = next((k for k in ORDER if k in self.by_kind), next(iter(self.by_kind)))
+        return Plan([(first, tool)])
 
     async def call(self, tool: str, arguments: dict[str, Any]) -> types.CallToolResult:
-        kind = self._kind(tool)
-        target = self.by_kind.get(kind)
-        if target is None:
+        plan = self._steps(tool)
+        steps = [(kind, name) for kind, name in plan.steps if kind in self.by_kind]
+        if not steps:
+            kind = plan.steps[0][0]
             return types.CallToolResult(
                 content=[types.TextContent(type="text", text=f"no {kind} server is configured for {tool}")],
                 is_error=True,
                 meta={"ekl": {"effect": "none"}},
             )
-        return await target.call(tool, arguments)
+        for n, (kind, name) in enumerate(steps):
+            last = n == len(steps) - 1
+            try:
+                result = await self.by_kind[kind].call(name, arguments)
+            except Exception as exc:
+                # An external action moves on only from a server it never reached: anywhere else it may have acted.
+                if last or not (unreached(exc) or not plan.effects):
+                    raise
+                log.warning(
+                    "%s: %s server unreachable (%s); trying %s", tool, kind, type(exc).__name__, steps[n + 1][0]
+                )
+                continue
+            if _unavailable(result) and not last and not plan.effects:
+                log.warning("%s: %s server unavailable; trying %s", tool, kind, steps[n + 1][0])
+                continue
+            return result
+        raise AssertionError("unreachable: the last step returns or raises")
 
     async def tools(self) -> list[types.Tool]:
+        listed = await asyncio.gather(*(t.tools() for t in self.by_kind.values()), return_exceptions=True)
+        down: dict[Via, BaseException] = {}
+        for kind, answer in zip(self.by_kind, listed, strict=True):
+            if isinstance(answer, BaseException):
+                down[kind] = answer
+            else:
+                self._listed[kind] = answer
+        if down:
+            needed = [self._steps(tool) for tool in self.services()]
+            stranded = (
+                not needed
+                or any(kind not in self._listed for kind in down)
+                or any(all(kind in down for kind, _ in plan.steps if kind in self.by_kind) for plan in needed)
+            )
+            if stranded:
+                raise next(iter(down.values()))
         found: dict[str, types.Tool] = {}
-        for kind, target in self.by_kind.items():
-            for tool in await target.tools():
-                if tool.name not in found or self._kind(tool.name) == kind:
+        for kind in self.by_kind:
+            for tool in self._listed.get(kind, []):
+                if tool.name not in found or self._steps(tool.name).steps[0][0] == kind:
                     found[tool.name] = tool
         return list(found.values())
 

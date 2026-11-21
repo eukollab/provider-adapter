@@ -200,3 +200,82 @@ async def test_the_runner_says_it_is_alive_and_reconnects_once_its_lease_is_lost
     with pytest.raises(asyncio.CancelledError):
         await running
     assert alive[0] == {"holder": runner.holder} and streams == [runner.holder, runner.holder]
+
+
+def _holding_network(streams: list[str], alive: list[dict[str, Any]], opened: asyncio.Event) -> Starlette:
+    """The network's side for a runner that holds its stream open: records each stream and each alive."""
+
+    async def stream(request: Request) -> Response:
+        streams.append(request.query_params["holder"])
+        opened.set()
+
+        async def frames() -> Any:
+            yield "event: ping\ndata: {}\n\n"
+            await asyncio.sleep(30)
+
+        return StreamingResponse(frames(), media_type="text/event-stream")
+
+    async def said_alive(request: Request) -> Response:
+        alive.append(await request.json())
+        return JSONResponse({"lease_seconds": 30, "alive_seconds": 10})
+
+    return Starlette(
+        routes=[
+            Route("/v1/provider/stream", stream, methods=["GET"]),
+            Route("/v1/provider/relay/alive", said_alive, methods=["POST"]),
+        ]
+    )
+
+
+async def test_a_runner_whose_server_does_not_answer_holds_no_lease_until_it_does(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An agent whose own server is down is away: its runner takes no lease and says nothing, so the network answers
+    its callers that it is away, and serves it once the server answers."""
+    monkeypatch.setattr(relay_module, "UPSTREAM_SECONDS", 0.02)
+    streams, alive, opened = list[str](), list[dict[str, Any]](), asyncio.Event()
+    up = False
+
+    async def answers() -> bool:
+        if not up:
+            raise httpx2.ConnectError("connection refused")
+        return True
+
+    network = httpx2.AsyncClient(transport=httpx2.ASGITransport(app=_holding_network(streams, alive, opened)))
+    runner = Relay(Starlette(), NETWORK, "eklp_key", http=network, ready=answers)
+    runner._alive_every = 0.02
+    running = asyncio.create_task(runner.run())
+    await asyncio.sleep(0.2)
+    assert streams == [] and alive == []
+    up = True
+    await asyncio.wait_for(opened.wait(), 5)
+    running.cancel()
+    assert streams == [runner.holder]
+
+
+async def test_a_runner_lets_its_lease_go_when_its_server_stops_answering(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One silence is not enough; two in a row and the stream is dropped, and not taken again while the server stays
+    silent."""
+    monkeypatch.setattr(relay_module, "UPSTREAM_SECONDS", 0.02)
+    streams, alive, opened = list[str](), list[dict[str, Any]](), asyncio.Event()
+    held_when_asked: list[bool] = []
+    script = [True, True, False, True, False, False]  # start, one miss, recovered, then two misses
+
+    async def answers() -> bool:
+        held_when_asked.append(runner._holding is not None)
+        return script.pop(0) if script else False
+
+    network = httpx2.AsyncClient(transport=httpx2.ASGITransport(app=_holding_network(streams, alive, opened)))
+    runner = Relay(Starlette(), NETWORK, "eklp_key", http=network, ready=answers)
+    running = asyncio.create_task(runner.run())
+    await asyncio.wait_for(opened.wait(), 5)
+    while script:
+        await asyncio.sleep(0.02)
+    await asyncio.sleep(0.2)
+    # Held through the single miss, dropped after the two, never taken again while the server stays silent.
+    assert runner._waiting and runner._holding is None
+    assert held_when_asked[1:5] == [True, True, True, True]
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    assert streams == [runner.holder]

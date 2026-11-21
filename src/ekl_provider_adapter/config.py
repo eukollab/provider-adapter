@@ -62,11 +62,20 @@ class Refreshes(_Open):
     within_hours: int = Field(ge=1)
 
 
+class Also(_Open):
+    """The same function on another of the agent's servers, tried when the one before can't answer."""
+
+    via: Via
+    tool: str
+
+
 class Capability(_Open):
     tool: str
     # How the connector reaches the tool: an MCP tool, an OpenAPI operation or an A2A skill (EKP 3.4 §5.2). Unset, it
-    # is the one kind of upstream agent.json names, else MCP.
+    # is the first of the agent's servers in ORDER.
     via: Via | None = None
+    # The same function on the agent's other servers, in the order they are tried when `via` can't answer.
+    also: list[Also] = Field(default_factory=list)
     capability_id: str | None = None
     version: str = "1.0.0"
     class_: CapabilityClass = Field(alias="class")
@@ -225,10 +234,14 @@ class AgentFile(_Open):
         return [c for c in self.capabilities if c.offered]
 
 
+# Which of an agent's servers answers a service that doesn't say: those with schemas and a synchronous answer first.
+ORDER: tuple[Via, ...] = ("mcp", "openapi", "a2a")
+
+
 def via_of(cap: Capability, kinds: list[Via]) -> Via:
     if cap.via:
         return cap.via
-    return kinds[0] if len(kinds) == 1 else "mcp"
+    return next((k for k in ORDER if k in kinds), "mcp")
 
 
 def default_repeat(cap: Capability, mode: str) -> Repeat:
@@ -255,6 +268,17 @@ def plan_problem(plan: dict[str, Any]) -> str | None:
     return None
 
 
+def _also_problems(cap: Capability, via: Via, kinds: list[Via]) -> list[str]:
+    """`also` names each of the agent's other servers once, each one upstream names."""
+    found = []
+    for also in cap.also:
+        if also.via == via or [a.via for a in cap.also].count(also.via) > 1:
+            found.append("also names each of the agent's other servers once, never its own")
+        elif kinds and also.via not in kinds:
+            found.append(f"also names {also.via}, but upstream names no such server")
+    return found
+
+
 def _problems(file: AgentFile) -> list[str]:
     found = []
     if file.model_extra and "payment" in file.model_extra:
@@ -267,6 +291,7 @@ def _problems(file: AgentFile) -> list[str]:
         where = f"capability {cap.tool}"
         if kinds and file.via(cap) not in kinds:
             found.append(f"{where}: it is reached by {file.via(cap)}, but upstream names no such server")
+        found.extend(f"{where}: {problem}" for problem in _also_problems(cap, file.via(cap), kinds))
         found.extend(f"{where}: {problem}" for p in cap.plans or [] if (problem := plan_problem(p)))
         if cap.class_ == "external_action" and file.execution_mode != "durable":
             found.append(f"{where}: external actions need execution_mode durable")

@@ -6,6 +6,9 @@ The network gives the agent a relay address and announces it as the endpoint. Ca
 stream of server-sent events this process keeps open, each one a whole HTTP request, which is served by the
 connector's own app exactly as if it had arrived over HTTP, and the answer goes back with one POST. Nothing listens
 here but the loopback API, so the machine needs only to reach the network: a laptop behind any router will do.
+
+The lease is held only while the agent's own server answers: a connector whose server has stopped lets the lease go,
+so the network answers callers that the agent is away and lists it offline, as it does for a machine that sleeps.
 """
 
 import asyncio
@@ -14,7 +17,7 @@ import json
 import logging
 import secrets
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from typing import Any
 
 import httpx2
@@ -28,6 +31,11 @@ STREAM_TRIES = 3
 POLL_SECONDS = 25
 # The network keeps this runner's lease only while it hears it is alive: every 10 seconds, against a 30-second lease.
 ALIVE_SECONDS = 10
+# The agent's server is asked whether it answers this often; this many silences in a row, and the lease is let go.
+UPSTREAM_SECONDS = 15
+UPSTREAM_TRIES = 2
+UPSTREAM_TIMEOUT = 10
+AWAY_SAID = "the agent's server isn't answering; the agent is away until it does"
 
 
 async def relay_address(network_url: str, credential: str, http: httpx2.AsyncClient | None = None) -> str:
@@ -84,6 +92,7 @@ class Relay:
         *,
         path: str | None = None,
         http: httpx2.AsyncClient | None = None,
+        ready: Callable[[], Awaitable[bool]] | None = None,
     ) -> None:
         self._network = network_url.rstrip("/")
         self._credential = credential
@@ -98,29 +107,27 @@ class Relay:
         self._tasks: set[asyncio.Task[None]] = set()
         self._alive_every = ALIVE_SECONDS
         # The stream this runner holds now: its lease lost (a laptop that slept), it is dropped and taken again.
-        self._holding: asyncio.Task[bool] | None = None
+        self._holding: asyncio.Task[Any] | None = None
+        # Whether the agent's server answers; None serves without asking.
+        self._ready = ready
+        # Set while the lease is let go because the server doesn't answer: the runner says nothing to the network.
+        self._waiting = False
+        self._dropped = False
 
     async def run(self) -> None:
         """Serve calls until cancelled, reconnecting whenever the stream ends."""
         failures = silent = 0
         alive = asyncio.create_task(self._alive())
+        watch = asyncio.create_task(self._watch()) if self._ready is not None else None
         try:
             while True:
+                await self._until_answering()
                 try:
                     if silent >= STREAM_TRIES:
-                        await self._poll()
+                        await self._hold(self._poll())
                         failures = 0
                         continue
-                    self._holding = asyncio.create_task(self._stream())
-                    try:
-                        held = await self._holding
-                    except asyncio.CancelledError:
-                        current = asyncio.current_task()
-                        if current is not None and current.cancelling():
-                            raise
-                        held = True  # dropped for a lost lease, not stopped: connect again at once
-                    finally:
-                        self._holding = None
+                    held = await self._hold(self._stream())
                     silent = 0
                     failures = 0 if held else len(BACKOFF_SECONDS) - 1
                 except httpx2.ReadTimeout:
@@ -136,13 +143,72 @@ class Relay:
                     await asyncio.sleep(BACKOFF_SECONDS[failures])
         finally:
             alive.cancel()
+            if watch is not None:
+                watch.cancel()
             await self._local.aclose()
+
+    async def _hold(self, holding: Coroutine[Any, Any, bool | None]) -> bool:
+        """Hold the lease by a stream or a poll. False when another copy holds it; True when it ended, or was dropped
+        (a lost lease, a silent server) rather than this runner stopped, so the runner connects again."""
+        self._holding = asyncio.create_task(holding)
+        try:
+            return await self._holding is not False
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
+            return True
+        finally:
+            self._holding = None
+
+    async def _answers(self) -> bool:
+        if self._ready is None:
+            return True
+        try:
+            return await asyncio.wait_for(self._ready(), UPSTREAM_TIMEOUT)
+        except Exception:  # any failure to answer is the server not answering
+            return False
+
+    async def _until_answering(self) -> None:
+        """Hold no lease while the agent's server doesn't answer, asking again every 15 seconds."""
+        if self._ready is None or await self._answers():
+            if self._dropped:
+                log.warning("the agent's server answers again; serving its calls")
+            self._dropped = False
+            return
+        if not self._dropped:
+            log.warning(AWAY_SAID)
+        self._dropped = self._waiting = True
+        try:
+            while not await self._answers():
+                await asyncio.sleep(UPSTREAM_SECONDS)
+        finally:
+            self._waiting = False
+        log.warning("the agent's server answers again; serving its calls")
+        self._dropped = False
+
+    async def _watch(self) -> None:
+        """While the lease is held, ask the server; two silences in a row and the lease is let go."""
+        misses = 0
+        while True:
+            await asyncio.sleep(UPSTREAM_SECONDS)
+            holding = self._holding
+            if holding is None or holding.done():
+                misses = 0
+                continue
+            misses = 0 if await self._answers() else misses + 1
+            if misses >= UPSTREAM_TRIES and not holding.done():
+                log.warning(AWAY_SAID)
+                misses, self._dropped = 0, True
+                holding.cancel()
 
     async def _alive(self) -> None:
         """Tell the network this runner is alive, so it keeps the agent's lease; a dead machine stops telling it."""
         url = f"{self._network}/v1/provider/relay/alive"
         while True:
             await asyncio.sleep(self._alive_every)
+            if self._waiting:
+                continue  # the server doesn't answer: the lease lapses, and callers hear the agent is away
             try:
                 response = await self._http.post(url, json={"holder": self.holder}, headers=_auth(self._credential))
             except httpx2.HTTPError as exc:

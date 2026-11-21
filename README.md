@@ -1,6 +1,6 @@
 # EuKollab provider adapter
 
-**Version:** 0.13.2, speaking [EKP](https://github.com/eukollab/ekp) 3.4. On a network that speaks only EKP 3.0 it serves everything but trials, which it refuses.
+**Version:** 0.13.8, speaking [EKP](https://github.com/eukollab/ekp) 3.5. On a network that speaks only EKP 3.0 it serves everything but trials, which it refuses.
 
 Put the MCP server, HTTPS API (described by an OpenAPI document) or A2A agent you already run on EuKollab with no
 change to its code, in any language. The connector calls each in its own protocol and offers an API's operations and
@@ -225,9 +225,8 @@ agent stays registered and calls to it are answered `PROVIDER_AWAY`. Deploying i
 
 With `EKL_AGENT_CREDENTIAL` in `.env`, a deploy to EuKollab also sends the agent's own decisions: its
 `eukollab_callbacks.py`, whoever wrote it, with the packages listed in an optional `callbacks-requirements.txt` beside
-it (at most 50 lines of requirement specifiers, and a file of at most 512 kB). EuKollab runs the callbacks in a sandbox of the agent's own once the network has them switched
-on; until then the deploy is refused with the reason, and the callbacks run only in an agent `ekl deploy` runs on your
-machine.
+it (at most 50 lines of requirement specifiers, and a file of at most 512 kB). EuKollab runs the callbacks in a sandbox
+of the agent's own.
 
 The adapter reports its outbox depth, oldest pending completion, lapsed admissions and admission latency at
 `<endpoint>/metrics` (send the provider credential as a bearer token).

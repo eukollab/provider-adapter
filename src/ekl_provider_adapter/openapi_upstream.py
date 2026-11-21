@@ -28,9 +28,13 @@ MAX_NAME = 128
 MAX_REF_DEPTH = 32
 MAX_RESPONSE_BYTES = 1_000_000
 SPEC_CACHE_SECONDS = 60.0
+# How long the API has to answer the check that it is up.
+ANSWER_SECONDS = 10.0
 # Statuses that say the API refused the request before doing anything: the call failed without effect, so an external
 # action is settled as failed rather than unknown.
 REFUSED = frozenset({400, 401, 403, 404, 405, 406, 411, 413, 414, 415, 422, 429, 431})
+# Statuses saying the API can't answer now, rather than that the request failed.
+UNAVAILABLE = frozenset({502, 503, 504})
 CLASS_HINTS: dict[str, dict[str, bool]] = {
     "read_only": {"readOnlyHint": True},
     "transformation": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
@@ -352,7 +356,16 @@ class OpenAPIUpstream:
         return {op.name: op for op in found}
 
     async def tools(self) -> list[types.Tool]:
-        return [types.Tool.model_validate(op.tool) for op in (await self._operations()).values()]
+        found = [types.Tool.model_validate(op.tool) for op in (await self._operations()).values()]
+        await self._answering()
+        return found
+
+    async def _answering(self) -> None:
+        """Raises unless the API itself answers, with any status: a document read from a file or a minute ago says
+        nothing of whether the API is up, and an agent whose API is down is offline."""
+        base = self.api_url or base_url(await self.document(), self.spec_url)
+        if base:
+            await self._client().request("HEAD", base, headers=self.headers, timeout=ANSWER_SECONDS)
 
     async def list(self) -> list[types.Resource]:
         return []
@@ -403,7 +416,10 @@ def _result(op: Operation, response: httpx2.Response) -> types.CallToolResult:
         )
     if not 200 <= response.status_code < 300:
         detail = content.decode("utf-8", errors="replace")[:500]
-        meta = {"ekl": {"effect": "none"}} if response.status_code in REFUSED else None
+        meta: dict[str, Any] | None = {"ekl": {"effect": "none"}} if response.status_code in REFUSED else None
+        if response.status_code in UNAVAILABLE:
+            # The API's gateway or the API itself can't answer now: another of the agent's servers may (upstreams).
+            meta = {"ekl": {**(meta or {}).get("ekl", {}), "unavailable": True}}
         return types.CallToolResult(
             content=[types.TextContent(type="text", text=f"HTTP {response.status_code}: {detail}".strip())],
             is_error=True,

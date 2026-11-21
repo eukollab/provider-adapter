@@ -12,8 +12,6 @@ Both are on 127.0.0.1 behind LocalGuard: the agent's own programs only, with the
 import contextlib
 import json
 import re
-import uuid
-from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -23,9 +21,10 @@ from mcp.server.lowlevel import Server
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import Response
 from starlette.routing import BaseRoute, Route
 
+from ekl_provider_adapter import a2a_server
 from ekl_provider_adapter.errors import AgentError
 
 _NAME = re.compile(r"[^a-z0-9_]+")
@@ -113,13 +112,15 @@ def mcp_surface(uses: list[Use], service: Service, schemas: Schemas) -> Server[A
 class A2ASurface:
     """The A2A agent at /a2a: a skill per planned service, called with one message whose data part is the input, or
     whose text is (a JSON object, else the need's text), and whose `metadata.skill` names the service (the only one
-    when there is one). The answer carries the result as data and as text. A2A 1.0 and 0.3 over JSON-RPC."""
+    when there is one). The answer carries the result as data and as text. A2A 1.0 and 0.3 over JSON-RPC
+    (a2a_server)."""
 
     def __init__(self, uses: list[Use], service: Service, handle: Callable[[], str]) -> None:
         self.uses = uses
         self.service = service
         self.handle = handle
-        self.tasks: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        # The local API answers only the agent's own programs, so they all see every task.
+        self.tasks = a2a_server.Tasks(KEPT_TASKS)
 
     def card(self, base: str) -> dict[str, Any]:
         return {
@@ -128,8 +129,8 @@ class A2ASurface:
             "version": "1.0.0",
             "supportedInterfaces": [{"url": f"{base}/a2a", "protocolBinding": "JSONRPC", "protocolVersion": "1.0"}],
             "capabilities": {"streaming": False, "pushNotifications": False},
-            "defaultInputModes": ["application/json", "text/plain"],
-            "defaultOutputModes": ["application/json", "text/plain"],
+            "defaultInputModes": list(a2a_server.MEDIA_TYPES),
+            "defaultOutputModes": list(a2a_server.MEDIA_TYPES),
             "skills": [
                 {"id": u.name, "name": u.need, "description": f"Uses a service on EuKollab: {u.need}", "tags": []}
                 for u in self.uses
@@ -137,41 +138,14 @@ class A2ASurface:
         }
 
     async def card_route(self, request: Request) -> Response:
-        return JSONResponse(self.card(f"{request.url.scheme}://{request.headers.get('host', '127.0.0.1')}"))
+        base = f"{request.url.scheme}://{request.headers.get('host', '127.0.0.1')}"
+        return a2a_server.card_response(request, self.card(base))
 
     async def rpc(self, request: Request) -> Response:
-        try:
-            body = await request.json()
-        except ValueError:
-            body = None
-        if not isinstance(body, dict):
-            return _rpc_error(None, -32600, "not a JSON-RPC request")
-        method, call_id = str(body.get("method") or ""), body.get("id")
-        params: dict[str, Any] = body["params"] if isinstance(body.get("params"), dict) else {}
-        try:
-            result = await self._answer(method, params)
-        except LookupError as missing:
-            return _rpc_error(call_id, -32001, str(missing))
-        except ValueError as unsupported:
-            return _rpc_error(call_id, -32601 if "supported" in str(unsupported) else -32002, str(unsupported))
-        return JSONResponse({"jsonrpc": "2.0", "id": call_id, "result": result})
+        return await a2a_server.answer(request, "", self.tasks, self._send)
 
-    async def _answer(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
-        legacy = "/" in method
-        if method in ("SendMessage", "message/send"):
-            return await self._send(params, legacy)
-        if method in ("GetTask", "tasks/get"):
-            task = self.tasks.get(str(params.get("id")))
-            if task is None:
-                raise LookupError("task not found")
-            return task if legacy else {"task": task}
-        if method in ("CancelTask", "tasks/cancel"):
-            raise ValueError("a finished task can't be cancelled")
-        raise ValueError(f"{method or 'no method'} isn't supported")
-
-    async def _send(self, params: dict[str, Any], legacy: bool) -> dict[str, Any]:
-        message: dict[str, Any] = params["message"] if isinstance(params.get("message"), dict) else {}
-        parts = [p for p in message.get("parts") or [] if isinstance(p, dict)]
+    async def _send(self, message: dict[str, Any]) -> a2a_server.Outcome:
+        parts = [p for p in message["parts"] if isinstance(p, dict)]
         data = next((p["data"] for p in parts if isinstance(p.get("data"), dict)), None)
         text = "\n".join(str(p["text"]) for p in parts if isinstance(p.get("text"), str)).strip()
         if data is None and text.startswith("{"):
@@ -181,45 +155,13 @@ class A2ASurface:
         metadata: dict[str, Any] = message["metadata"] if isinstance(message.get("metadata"), dict) else {}
         named = str(metadata.get("skill") or "")
         use = next((u for u in self.uses if u.name == named), None) or (self.uses[0] if len(self.uses) == 1 else None)
-        task_id, context = uuid.uuid4().hex, str(message.get("contextId") or uuid.uuid4().hex)
         if use is None:
-            task = _task(task_id, context, "rejected", legacy, said="name the service in metadata.skill")
-        else:
-            try:
-                answer = await self.service(_body(use, data if data is not None else {"text": text}))
-                task = _task(task_id, context, "completed", legacy, data=_value(answer))
-            except AgentError as exc:
-                task = _task(task_id, context, "failed", legacy, said=_said(exc))
-        self.tasks[task_id] = task
-        while len(self.tasks) > KEPT_TASKS:
-            self.tasks.popitem(last=False)
-        return task if legacy else {"task": task}
-
-
-def _task(task_id: str, context: str, state: str, legacy: bool, *, data: Any = None, said: str = "") -> dict[str, Any]:
-    def part(kind: str, value: Any) -> dict[str, Any]:
-        return {"kind": kind, kind: value} if legacy else {kind: value}
-
-    status: dict[str, Any] = {"state": state.replace("_", "-") if legacy else f"TASK_STATE_{state.upper()}"}
-    if said:
-        status["message"] = {
-            "messageId": uuid.uuid4().hex,
-            "role": "agent" if legacy else "ROLE_AGENT",
-            "parts": [part("text", said)],
-        }
-    task: dict[str, Any] = {"id": task_id, "contextId": context, "status": status}
-    if data is not None:
-        # Clients that read only text get the result too: a text answer as it is, anything else as JSON.
-        said_back = data["text"] if isinstance(data, dict) and set(data) == {"text"} else None
-        text = said_back if isinstance(said_back, str) else json.dumps(data, ensure_ascii=False)
-        task["artifacts"] = [{"artifactId": uuid.uuid4().hex, "parts": [part("data", data), part("text", text)]}]
-    if legacy:
-        task["kind"] = "task"
-    return task
-
-
-def _rpc_error(call_id: Any, code: int, message: str) -> Response:
-    return JSONResponse({"jsonrpc": "2.0", "id": call_id, "error": {"code": code, "message": message}})
+            return a2a_server.Outcome("rejected", said="name the service in metadata.skill")
+        try:
+            answer = await self.service(_body(use, data if data is not None else {"text": text}))
+        except AgentError as exc:
+            return a2a_server.Outcome("failed", said=_said(exc))
+        return a2a_server.Outcome("completed", data=_value(answer))
 
 
 def surface_routes(

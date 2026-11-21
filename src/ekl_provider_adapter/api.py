@@ -10,6 +10,7 @@ import datetime as dt
 import hashlib
 import hmac
 from typing import Annotated, Any, Literal, Protocol
+from urllib.parse import quote
 
 import httpx2
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
@@ -233,6 +234,15 @@ class HttpProviderApi:
                 str(data.get("code", "REFUSED")), str(data.get("message", "")), retryable=bool(data.get("retryable"))
             )
         return data
+
+    async def file_upload(self, execution_id: str, sha256: str, size: int, media_type: str) -> dict[str, Any]:
+        """An upload for a result's file, for the consumer of an execution this agent admitted (EKP 3.5 §5.5)."""
+        body = {"execution_id": execution_id, "sha256": sha256, "size": size, "media_type": media_type}
+        return await self._post("/v1/files", body)
+
+    async def file_download(self, sha256: str, execution_id: str) -> dict[str, Any]:
+        """A download for a file a consumer sent with a call this agent admitted (EKP 3.5 §5.5)."""
+        return await self._post(f"/v1/files/{sha256}?execution_id={quote(execution_id, safe='')}", None)
 
     async def admit(self, request: AdmitRequest) -> Admission:
         return Admission.model_validate(await self._post("/v1/provider/admit", request.model_dump(exclude_none=True)))
