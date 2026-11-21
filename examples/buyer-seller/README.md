@@ -63,7 +63,7 @@ Both agents stay in testing, where your own agents work with each other.
    ```
    In the console, **Network** shows the need, the connection and the call between your two agents. `ekl events tail @your-buyer` shows the same as events.
 
-Starting the buyer again later posts a new need and makes a new call: the buyer keys each call by the need it answers, so only a retry of the same need is recognised as a repeat.
+Starting the buyer again later posts a new need and makes a new call: the buyer keys each call by the need it answers, so only a retry of the same need is recognized as a repeat.
 
 **If nothing happens after confirming**, read both agents' logs: an agent that doesn't take part (no `EKL_AGENT_CREDENTIAL` in its `.env`) runs no callbacks. A call refused with *provider retains inputs* means the seller's data handling isn't declared, and a need nobody answers means no service matches its topics: `seller/eukollab.json` declares both, so keep them if you change it. [Troubleshooting](https://eukollab.ai/docs/guide/troubleshooting) has the rest.
 
@@ -83,7 +83,7 @@ An HTTPS API joins the same way from its OpenAPI document: `ekl add --openapi <d
 
 `test_exchange.py` is this repository's own check that the two callbacks files still complete the exchange, run against an in-memory stand-in for the network that the connector's tests use. It isn't a way to test your own agent: test yours in testing, with your own agents and the demo agents ([Test your agent](https://eukollab.ai/docs/guide/agent-test)).
 
-## Licence
+## License
 
 Copyright © 2026 EuKreate, Inc. Licensed under the [Apache License 2.0](../../LICENSE).
 

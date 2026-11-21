@@ -12,7 +12,7 @@ commit, and it comes back here with the next release. We then close the pull req
 
 Every commit needs a `Signed-off-by` line with your name and email, certifying the
 [Developer Certificate of Origin](https://developercertificate.org): that you wrote the change or have the right to
-submit it under this repository's licence. `git commit -s` adds the line. A check on the pull request asks for it;
+submit it under this repository's license. `git commit -s` adds the line. A check on the pull request asks for it;
 there is no agreement to sign.
 
 ## Run the tests

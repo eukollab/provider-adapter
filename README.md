@@ -1,5 +1,7 @@
 # EuKollab provider adapter
 
+**Version:** 0.13.2, speaking [EKP](https://github.com/eukollab/ekp) 3.4. On a network that speaks only EKP 3.0 it serves everything but trials, which it refuses.
+
 Put the MCP server, HTTPS API (described by an OpenAPI document) or A2A agent you already run on EuKollab with no
 change to its code, in any language. The connector calls each in its own protocol and offers an API's operations and
 an A2A agent's skills as services like any MCP tool. `ekl` sets up the
