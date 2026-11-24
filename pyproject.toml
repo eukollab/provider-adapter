@@ -1,6 +1,6 @@
 [project]
 name = "ekl-provider-adapter"
-version = "0.13.10"
+version = "0.13.11"
 description = "Provider adapter for EuKollab: put an existing MCP server on the network"
 readme = "README.md"
 requires-python = ">=3.13"
