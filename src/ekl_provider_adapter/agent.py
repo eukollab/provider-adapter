@@ -57,7 +57,7 @@ from ekl_provider_adapter.screening import Screener
 log = logging.getLogger("ekl_provider_adapter.agent")
 ANNOUNCE_RETRY_SECONDS = 10.0
 # The EKP version this package speaks, as world_get_contract names it.
-EKP_PROTOCOL = "ekp/3.5"
+EKP_PROTOCOL = "ekp/3.6"
 # A network that speaks only the version before still serves every action but trials, which 3.1 changed: the agent
 # runs there and refuses trials itself, so the connector can be upgraded before the network.
 EKP_WITHOUT_TRIALS = "ekp/3.0"
@@ -495,8 +495,9 @@ class Candidate:
 
 @dataclass
 class Trial:
-    """One candidate as `choose` considered it: the match score the network answered against the expectation, each
-    check's score and reason, never the output (a trial never returns it)."""
+    """One candidate as `choose` considered it: the score the network answered against the expectation and `match`,
+    that score as a percentage match with the expected output, never the output (a trial never returns it). `checks`
+    stays empty from EKP 3.6, which answers only whether a trial passed and how closely it matched."""
 
     candidate: Candidate
     score: float | None = None
@@ -506,6 +507,7 @@ class Trial:
     price: str = ""
     seconds: float = 0.0
     checks: list[dict[str, Any]] = field(default_factory=list)
+    match: int | None = None
     # The candidate takes no trials: never a pass, but `choose` still ranks it after every candidate that passed.
     untried: bool = False
 
@@ -1560,22 +1562,38 @@ class _Actions:
         checks = [dict(c) for c in ran.get("checks") or [] if isinstance(c, dict)]
         score = ran.get("score")
         value = float(score) if isinstance(score, (int, float)) else None
+        given_match = ran.get("match")
+        match = int(given_match) if isinstance(given_match, (int, float)) else None
+        if match is None and value is not None:
+            match = round(value * 100)
         if ran.get("status") != "succeeded":
             reason = f"the trial did not succeed: {ran.get('error_code') or ran.get('status')}"
             return Trial(
-                candidate, value, False, reason=reason, price=candidate.price_per_call, seconds=seconds, checks=checks
+                candidate,
+                value,
+                False,
+                reason=reason,
+                price=candidate.price_per_call,
+                seconds=seconds,
+                checks=checks,
+                match=match,
             )
         passed = bool(ran.get("passed"))
         if passed:
-            reason = f"passed, scoring {value:.2f}" if value is not None else "passed"
-        elif value is None:
+            reason = f"passed, {match}% match" if match is not None else "passed"
+        elif match is None:
             reason = "no check could be scored"
         else:
-            missed = [str(c.get("id")) for c in checks if c.get("score") is not None and float(c["score"]) < 1]
-            below = f"scored {value:.2f}, below {ran.get('threshold')}"
-            reason = below + (f" (short on {', '.join(missed[:5])})" if missed else "")
+            reason = f"{match}% match, below the threshold {ran.get('threshold')}"
         return Trial(
-            candidate, value, passed, reason=reason, price=candidate.price_per_call, seconds=seconds, checks=checks
+            candidate,
+            value,
+            passed,
+            reason=reason,
+            price=candidate.price_per_call,
+            seconds=seconds,
+            checks=checks,
+            match=match,
         )
 
     def _ranked(self, trials: list[Trial]) -> list[Trial]:

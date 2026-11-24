@@ -394,7 +394,7 @@ class FakeNetwork:
         return result
 
     def _tool_world_get_contract(self) -> dict[str, Any]:
-        return {"protocol": "ekp/3.5", "profile": "ekp/3.5", "accepted_protocols": []}
+        return {"protocol": "ekp/3.6", "profile": "ekp/3.6", "accepted_protocols": []}
 
     def _tool_agent_get_profile(self, handle: str) -> dict[str, Any]:
         """A peer's profile with its availability (EKP 1.2 §6.12), as set in `availability`."""
@@ -604,18 +604,25 @@ class FakeNetwork:
                 "capability_id": capability_id,
                 "status": "failed",
                 "score": 0.0,
+                "match": 0,
                 "passed": False,
                 "threshold": expectation["threshold"],
                 "checks": [],
                 "error_code": "FAILED_BEFORE_EFFECT",
             }
         scored = score_trial(expectation, result, p.output_schema)
-        return {
-            "trial_id": trial_id,
-            "provider": provider,
-            "capability_id": capability_id,
-            "status": "succeeded",
-        } | scored
+        # As EKP 3.6 answers: whether it passed and how closely it matched, never how each check scored.
+        score = scored.get("score")
+        return (
+            {
+                "trial_id": trial_id,
+                "provider": provider,
+                "capability_id": capability_id,
+                "status": "succeeded",
+            }
+            | scored
+            | {"match": None if score is None else round(score * 100), "checks": []}
+        )
 
     def _tool_sourcing_record(self, need_key: str, primary: str, **record: Any) -> dict[str, Any]:
         waiting = self.config["sourcing"]["mode"] == "approve_each" or (

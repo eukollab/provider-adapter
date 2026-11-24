@@ -19,10 +19,10 @@ import mcp_types as types
 import pytest
 from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
 from starlette.applications import Starlette
 
-from ekl_provider_adapter import connector
+from ekl_provider_adapter import connector, trial_key
 from ekl_provider_adapter.api import HttpProviderApi
 from ekl_provider_adapter.config import strip_local
 from ekl_provider_adapter.conformance.network import FakeNetwork, ToolRules, http_app
@@ -660,3 +660,52 @@ def test_on_a_host_that_names_its_domain_the_connector_knows_its_address_in_the_
     for name, value in variables.items():
         monkeypatch.setenv(name, value)
     assert connector.hosted_endpoint() == expected
+
+
+async def test_only_a_free_trial_carries_the_trial_key_to_the_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A free trial reaches the server with the publisher's trial key in the call's _meta; a paid call never does, so
+    the key can't make paid work free (trial_key.py)."""
+    seen: list[dict[str, Any]] = []
+    server = MCPServer("homes")
+
+    @server.tool()
+    def get_listing_details(address: str, ctx: Context) -> dict[str, Any]:  # type: ignore[type-arg]
+        """Everything about one active home."""
+        seen.append(dict((ctx.request_context.meta or {}).get("eukollab") or {}))  # type: ignore[call-overload]
+        return {"match_status": "found", "address": address}
+
+    monkeypatch.setenv(trial_key.ENVIRONMENT, "s3cret-trial-key")
+    agent = AGENT | {"capabilities": [{"tool": "get_listing_details", "class": "read_only"}]}
+    network = confirmed(agent)
+    upstream_app = server.streamable_http_app(host="0.0.0.0", stateless_http=True, json_response=True)
+    async with upstream_app.router.lifespan_context(upstream_app):
+        upstream_http = httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=upstream_app), base_url="http://127.0.0.1"
+        )
+        for n, kind in enumerate(("trial", "customer")):
+            app = connector_app(
+                agent | {"upstream": {"mcp_url": "http://127.0.0.1/mcp"}},
+                credential=CREDENTIAL,
+                api=network_client(network),
+                upstream=Upstream("http://127.0.0.1/mcp", http=upstream_http),
+            )
+            async with served(app, network.token(f"agt_{kind}", kind=kind)) as http, mcp(http, "/ekl") as adapter:
+                meta = {"ekl": {"execution_id": f"e-{n}", "salt": new_salt()}}
+                result = await adapter.call_tool("get_listing_details", {"address": "1 Main St"}, meta=meta)
+                assert not result.is_error
+                await app.state.ekl_core.drain()
+        await upstream_http.aclose()
+    assert seen == [{"mode": "trial", "trial_key": "s3cret-trial-key", "dry_run": True}, {}]
+
+
+def test_the_trial_key_header_is_kept_out_of_the_headers_every_call_carries() -> None:
+    sent, key = trial_key.split({"Authorization": "Bearer x", "EuKollab-Trial-Key": "k1"})
+    assert sent == {"Authorization": "Bearer x"} and key == "k1"
+    assert trial_key.headers() == {} and trial_key.meta() is None
+    with trial_key.trial_call("k1", "trial", dry_run=False):
+        assert trial_key.headers() == {"EuKollab-Mode": "trial", "EuKollab-Trial-Key": "k1"}
+    with trial_key.trial_call("k1", "customer", dry_run=False):
+        assert trial_key.headers() == {}
+    with trial_key.trial_call(None, "trial", dry_run=False):
+        assert trial_key.meta() is None
+    assert trial_key.matches("k1", "k1") and not trial_key.matches("k2", "k1") and not trial_key.matches(None, "k1")

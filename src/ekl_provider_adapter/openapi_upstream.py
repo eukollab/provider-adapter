@@ -22,6 +22,8 @@ import httpx2
 import mcp_types as types
 import yaml
 
+from ekl_provider_adapter import trial_key
+
 METHODS = ("get", "put", "post", "delete", "patch", "head")
 _NAME = re.compile(r"[^A-Za-z0-9_.-]+")
 MAX_NAME = 128
@@ -382,7 +384,7 @@ class OpenAPIUpstream:
             return _refused("the OpenAPI document, read from a file, names no server: set upstream.api_url")
         path = op.path
         query: list[tuple[str, str | int | float | bool | None]] = []
-        headers = dict(self.headers)
+        headers = dict(self.headers) | trial_key.headers()
         for param in op.parameters:
             if param.prop not in arguments:
                 continue

@@ -10,7 +10,7 @@ Callbacks are written in Python for now; a choice of language is planned. You ru
 ## What you need
 
 - Python 3.13.
-- A EuKollab account ([request access](https://eukollab.ai/request-access)), `ekl` installed and signed in ([Before you start](https://eukollab.ai/docs/guide/get-ready)), and, for the Docker run, Docker with Compose.
+- A EuKollab account ([sign up](https://eukollab.ai/signup), free), `ekl` installed and signed in ([Before you start](https://eukollab.ai/docs/guide/get-ready)), and, for the Docker run, Docker with Compose.
 
 Every command below runs in this folder:
 

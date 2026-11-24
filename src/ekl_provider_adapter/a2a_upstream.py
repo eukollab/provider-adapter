@@ -25,6 +25,8 @@ from urllib.parse import urljoin
 import httpx2
 import mcp_types as types
 
+from ekl_provider_adapter import trial_key
+
 CARD_PATH = "/.well-known/agent-card.json"
 _NAME = re.compile(r"[^A-Za-z0-9_.-]+")
 POLL_SECONDS = 0.5
@@ -202,7 +204,7 @@ class A2AUpstream:
                 "cancel": "CancelTask",
             }
         )
-        headers = {**self.headers, "content-type": "application/json"}
+        headers = {**self.headers, **trial_key.headers(), "content-type": "application/json"}
         if not legacy:
             headers["A2A-Version"] = ".".join([*version.split("."), "0"][:2])
         body = {"jsonrpc": "2.0", "id": uuid.uuid4().hex, "method": names[method], "params": params}

@@ -707,7 +707,7 @@ def test_callbacks_find_try_and_choose_with_their_own_logic(tmp_path: Path) -> N
     assert next(c for c in found if c["handle"] == "@keeper")["excluded_by"] == ["retention"]
     # The score against the callbacks' own expectation, never the output.
     assert tried["passed"] and tried["score"] == 1.0 and "output" not in tried
-    assert [c["id"] for c in tried["checks"]] == ["schema", "converted"]
+    assert tried["checks"] == [] and tried["match"] == 100  # EKP 3.6: how closely it matched, not each check
     assert fake.trials[0]["expect"]["checks"][0]["approx"] == 10
     assert kept_out["skipped"] and "retention" in kept_out["reason"]
     assert chosen["main"]["handle"] == "@fx"
@@ -1045,8 +1045,9 @@ def test_a_trial_is_scored_against_the_expectation_and_never_returns_the_output(
         {"checks": []},
         {"checks": [{"id": "expect", "schema": {"properties": {"valid": {"const": True}}}}], "threshold": 1.0},
     ]
-    assert trials[0].passed and trials[0].score == 1.0 and not hasattr(trials[0], "output")
-    assert not trials[1].passed and "short on expect" in trials[1].reason
+    assert trials[0].passed and trials[0].score == 1.0 and trials[0].match == 100 and not hasattr(trials[0], "output")
+    # EKP 3.6: how closely it matched, never how each check scored.
+    assert not trials[1].passed and "% match, below the threshold" in trials[1].reason and trials[1].checks == []
     # Words go as they are, for the network's model to compile; without one, the network refuses them.
     with pytest.raises(AgentError) as words:
         agent._sync(agent.aio.try_service(service, {"vat_number": "DE1"}, "says the number is valid"))

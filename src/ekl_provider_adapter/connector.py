@@ -52,6 +52,7 @@ from starlette.requests import Request
 from starlette.responses import PlainTextResponse, Response
 from starlette.routing import Route
 
+from ekl_provider_adapter import trial_key
 from ekl_provider_adapter.a2a_upstream import A2AUpstream
 from ekl_provider_adapter.agent import Agent
 from ekl_provider_adapter.agent_journal import AgentJournal
@@ -213,7 +214,8 @@ class Upstream:
     async def call(self, tool: str, arguments: dict[str, Any]) -> types.CallToolResult:
         try:
             async with self._client() as client:
-                return await client.call_tool(tool, arguments)
+                # A free trial carries the publisher's trial key in the call's _meta (trial_key.py).
+                return await client.call_tool(tool, arguments, meta=trial_key.meta())  # type: ignore[arg-type]
         except MCPError as exc:
             # A protocol-level refusal (unknown tool, invalid params) means the tool never ran.
             return types.CallToolResult(
@@ -286,7 +288,9 @@ def connector_app(
             "EKL_UPSTREAM_OPENAPI_URL or EKL_UPSTREAM_A2A_URL) to your server's address"
         )
     found_credential, found_network = settings_from_environment(local, credential, network_url)
-    target = upstream or upstream_targets(found, upstream_headers(os.environ.get(UPSTREAM_HEADERS)))
+    # The trial key, from EKL_TRIAL_KEY or the reserved header, goes only with free trials, never with every call.
+    sent, in_headers = trial_key.split(upstream_headers(os.environ.get(UPSTREAM_HEADERS)))
+    target = upstream or upstream_targets(found, sent)
     core = AdapterCore(
         local,
         api or HttpProviderApi(found_network, found_credential),
@@ -296,6 +300,7 @@ def connector_app(
         storage=storage_for(local, storage),
         hooks=hooks,
         settings=settings,
+        trial_key=os.environ.get(trial_key.ENVIRONMENT) or in_headers,
     )
     if isinstance(target, Upstreams):
         target.plan = planning(core, list(target.by_kind))

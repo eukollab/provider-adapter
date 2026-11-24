@@ -340,12 +340,14 @@ def _listing(c: Candidate) -> dict[str, Any]:
 
 
 def _trial(t: Trial) -> dict[str, Any]:
-    """One trial as `choose` and `trial` report it: the network's score against the expectation, each check's score
-    and reason, whether it passed, and why. Never the output: a trial doesn't return it."""
+    """One trial as `choose` and `trial` report it: the network's score against the expectation and its match with the
+    expected output, whether it passed, and why (`checks` stays empty from EKP 3.6). Never the output: a trial doesn't
+    return it."""
     return {
         "handle": t.candidate.handle,
         "capability_id": t.candidate.capability_id,
         "score": t.score,
+        "match": t.match,
         "checks": t.checks,
         "passed": t.passed,
         "skipped": t.skipped,

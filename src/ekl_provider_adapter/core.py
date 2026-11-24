@@ -24,6 +24,7 @@ import httpx2
 import jsonschema
 import mcp_types as types
 
+from ekl_provider_adapter import trial_key
 from ekl_provider_adapter.api import (
     Admission,
     AdmitRequest,
@@ -186,8 +187,11 @@ class AdapterCore:
         tool_schemas: dict[str, dict[str, Any]] | None = None,
         settings: Settings | None = None,
         clock: Callable[[], float] = time.time,
+        trial_key: str | None = None,
     ) -> None:
         self.api = api
+        # The publisher's trial key, attached only to calls the network admitted as free trials (trial_key.py).
+        self.trial_key = trial_key or None
         self.local = local
         # The endpoint's path is a local setting: known before any configuration arrives.
         self.path = (
@@ -739,7 +743,9 @@ class AdapterCore:
         received = await self._prepared(cap, attempt_id, admission, arguments, files)
         if isinstance(received, types.CallToolResult):
             return received
-        work = asyncio.ensure_future(self.invoke(cap.tool, received))
+        # A free trial carries the trial key to the server; the task copies the mark, and no other call sees it.
+        with trial_key.trial_call(self.trial_key, str((admission.snapshot or {}).get("kind") or ""), admission.dry_run):
+            work = asyncio.ensure_future(self.invoke(cap.tool, received))
         lease = asyncio.ensure_future(self._hold_lease(cap, admission_id, admission.lease_expires_at, work))
         try:
             outcome, result = await self._outcome(cap, work)
