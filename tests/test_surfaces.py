@@ -48,12 +48,70 @@ async def _local(tmp_path: Path, fake: FakeNetwork) -> AsyncIterator[httpx2.Asyn
             yield http
 
 
+def _outside() -> FakeNetwork:
+    # Nothing on the network converts currency; one agent outside it does, and the publisher's rule allows it.
+    fake = FakeNetwork(handle="@buyer")
+    fake.external_agent("ext_fx", "FX rates", "convert", lambda a: {"converted": a["amount"] * 3}, "convert currency")
+    fake.config["external"] = {"rule": "allow", "approved": []}
+    return fake
+
+
+async def test_over_mcp_a_refusal_names_agents_outside_eukollab_and_eukollab_external_runs_one(tmp_path: Path) -> None:
+    fake = _outside()
+    async with (
+        _local(tmp_path, fake) as http,
+        Client(streamable_http_client("http://127.0.0.1/mcp", http_client=http)) as client,
+    ):
+        tools = {t.name: t for t in (await client.list_tools()).tools}
+        assert tools["eukollab_external"].input_schema["required"] == ["external_id", "tool", "input"]
+        refused = await client.call_tool("convert_currency_2", {"amount": 2})
+        assert refused.is_error and refused.structured_content is not None
+        assert refused.structured_content["error"] == "NO_PROVIDER"
+        outside = refused.structured_content["external"]
+        assert outside[0]["external_id"] == "ext_fx" and "eukollab_external" in refused.content[0].text  # type: ignore[union-attr]
+        ran = await client.call_tool(
+            "eukollab_external", {"external_id": "ext_fx", "tool": "convert", "input": {"amount": 2}}
+        )
+    assert not ran.is_error and ran.structured_content is not None
+    assert ran.structured_content["outcome"] == "succeeded" and ran.structured_content["result"] == {"converted": 6}
+    assert fake.external_runs == [{"external_id": "ext_fx", "tool": "convert", "arguments": {"amount": 2}}]
+
+
+async def test_over_a2a_eukollab_external_runs_an_agent_outside_eukollab(tmp_path: Path) -> None:
+    fake = _outside()
+
+    async def send(http: httpx2.AsyncClient, skill: str, data: dict[str, Any]) -> dict[str, Any]:
+        message = {"messageId": skill, "role": "ROLE_USER", "parts": [{"data": data}], "metadata": {"skill": skill}}
+        sent = await http.post(
+            "/a2a", json={"jsonrpc": "2.0", "id": 1, "method": "SendMessage", "params": {"message": message}}
+        )
+        task: dict[str, Any] = sent.json()["result"]["task"]
+        return task
+
+    async with _local(tmp_path, fake) as http:
+        refused = await send(http, "convert_currency_2", {"amount": 2})
+        ran = await send(
+            http, "eukollab_external", {"external_id": "ext_fx", "tool": "convert", "input": {"amount": 2}}
+        )
+        fake.config["external"] = {"rule": "never", "approved": []}
+        never = await send(
+            http, "eukollab_external", {"external_id": "ext_fx", "tool": "convert", "input": {"amount": 2}}
+        )
+    assert refused["status"]["state"] == "TASK_STATE_FAILED"
+    assert refused["artifacts"][0]["parts"][0]["data"]["external"][0]["external_id"] == "ext_fx"
+    assert ran["status"]["state"] == "TASK_STATE_COMPLETED"
+    assert ran["artifacts"][0]["parts"][0]["data"]["result"] == {"converted": 6}
+    assert never["status"]["state"] == "TASK_STATE_FAILED" and "POLICY_DENIED" in str(never["status"])
+
+
 def test_uses_are_named_after_their_need() -> None:
     assert [(u.name, u.prefer) for u in uses_of(USES)] == [
         ("convert_currency", "@fx/cap_convert"),
         ("convert_currency_2", None),
     ]
     assert uses_of(None) == [] and uses_of({"uses": "nope"}) == []
+    # The external tool's name stays free.
+    assert [u.name for u in uses_of({"uses": [{"need": "EuKollab external"}]})] == ["eukollab_external_2"]
 
 
 async def test_a_framework_calls_a_planned_service_over_mcp(tmp_path: Path) -> None:
@@ -63,7 +121,7 @@ async def test_a_framework_calls_a_planned_service_over_mcp(tmp_path: Path) -> N
         Client(streamable_http_client("http://127.0.0.1/mcp", http_client=http)) as client,
     ):
         tools = {t.name: t for t in (await client.list_tools()).tools}
-        assert set(tools) == {"convert_currency", "convert_currency_2"}
+        assert set(tools) == {"convert_currency", "convert_currency_2", "eukollab_external"}
         assert tools["convert_currency"].input_schema == SCHEMA  # the preferred provider's
         assert tools["convert_currency_2"].input_schema == {"type": "object"}
         result = await client.call_tool("convert_currency", {"amount": 4})
@@ -76,7 +134,7 @@ async def test_a_framework_calls_a_planned_service_over_a2a(tmp_path: Path) -> N
     fake = _network()
     async with _local(tmp_path, fake) as http:
         card = (await http.get("/a2a/.well-known/agent-card.json")).json()
-        assert [s["id"] for s in card["skills"]] == ["convert_currency", "convert_currency_2"]
+        assert [s["id"] for s in card["skills"]] == ["convert_currency", "convert_currency_2", "eukollab_external"]
         assert card["supportedInterfaces"][0]["url"] == "http://127.0.0.1/a2a"
         message: dict[str, Any] = {
             "messageId": "m1",

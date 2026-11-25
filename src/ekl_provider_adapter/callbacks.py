@@ -720,7 +720,7 @@ def local_api(agent: Agent, uses: list[Use] | None = None) -> Starlette:
         except (KeyError, ValueError) as exc:
             return JSONResponse({"error": "INVALID_REQUEST", "message": str(exc)}, status_code=400)
 
-    surfaces, lifespan = surface_routes(uses or [], service, _preferred_schemas(agent), lambda: agent.handle)
+    surfaces, lifespan = surface_routes(uses or [], service, _preferred_schemas(agent), lambda: agent.handle, external)
     return Starlette(
         routes=[
             Route("/agent/status", status, methods=["GET"]),
