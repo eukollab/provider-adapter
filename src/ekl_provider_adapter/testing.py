@@ -85,6 +85,10 @@ class FakeNetwork:
         # A new agent's rules share public and synthetic data only, as the network's defaults do.
         self.data_classes = {"public", "synthetic"}
         self.providers: dict[str, FakeProvider] = {}
+        # Agents outside the network (EKP 3.8): their listing as external_search answers it, and their tools' work.
+        self.external: dict[str, dict[str, Any]] = {}
+        self.external_work: dict[tuple[str, str], Callable[[dict[str, Any]], Any]] = {}
+        self.external_runs: list[dict[str, Any]] = []
         # Every trial asked for, with the expectation it was scored against (the network keeps it as a trial case).
         self.trials: list[dict[str, Any]] = []
         self.posts: dict[str, dict[str, Any]] = {}
@@ -136,6 +140,25 @@ class FakeNetwork:
             self.config["sourcing"]["rank_by"] = rank_by
         if approve_each is not None:
             self.config["sourcing"]["mode"] = "approve_each" if approve_each else "auto_within_limits"
+
+    def external_agent(
+        self, external_id: str, name: str, tool: str, work: Callable[[dict[str, Any]], Any], summary: str = ""
+    ) -> None:
+        """An agent outside the network with one tool that only reads, found by external_search under the rules ask
+        and allow (set `config["external"]`)."""
+        self.external[external_id] = {
+            "external_id": external_id,
+            "name": name,
+            "publisher": "",
+            "description": summary or name,
+            "source": "MCP Registry",
+            "listing_url": "",
+            "host": f"{external_id}.example",
+            "tested": False,
+            "approved": False,
+            "tools": [{"name": tool, "title": "", "description": summary, "input_schema": {"type": "object"}}],
+        }
+        self.external_work[(external_id, tool)] = work
 
     def provider(
         self,
@@ -394,7 +417,49 @@ class FakeNetwork:
         return result
 
     def _tool_world_get_contract(self) -> dict[str, Any]:
-        return {"protocol": "ekp/3.7", "profile": "ekp/3.7", "accepted_protocols": []}
+        return {"protocol": "ekp/3.8", "profile": "ekp/3.8", "accepted_protocols": []}
+
+    def _external_rule(self) -> dict[str, Any]:
+        return {"rule": "never", "approved": []} | dict(self.config.get("external") or {})
+
+    def _tool_external_search(self, query: str, limit: int = 3) -> dict[str, Any]:
+        rules = self._external_rule()
+        if rules["rule"] == "never":
+            return {"rule": "never", "items": []}
+        words = {w for w in query.lower().split() if len(w) > 2}
+        found = [
+            x | {"approved": x["external_id"] in rules["approved"]}
+            for x in self.external.values()
+            if not words or words & set(x["description"].lower().split())
+        ]
+        return {"rule": rules["rule"], "items": found[:limit]}
+
+    def _tool_external_run(self, external_id: str, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        rules = self._external_rule()
+        if rules["rule"] == "never":
+            raise AgentError("running external agents is set to Never for this agent", code="POLICY_DENIED")
+        if rules["rule"] == "ask" and external_id not in rules["approved"]:
+            raise AgentError(
+                "asked your publisher to approve this external agent; try again once it is approved",
+                code="POLICY_DENIED",
+                detail={"approval": "asked", "external": external_id},
+            )
+        work = self.external_work.get((external_id, tool))
+        if work is None:
+            raise AgentError("choose one of its tools that only read", code="INVALID_REQUEST")
+        self.external_runs.append({"external_id": external_id, "tool": tool, "arguments": arguments})
+        result = work(arguments)
+        return {
+            "outcome": "succeeded",
+            "result": result,
+            "text": json.dumps(result),
+            "category": "",
+            "error": "",
+            "external_id": external_id,
+            "tool": tool,
+            "host": f"{external_id}.example",
+            "tested": False,
+        }
 
     def _tool_agent_get_profile(self, handle: str) -> dict[str, Any]:
         """A peer's profile with its availability (EKP 1.2 §6.12), as set in `availability`."""

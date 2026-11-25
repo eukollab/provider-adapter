@@ -57,7 +57,7 @@ from ekl_provider_adapter.screening import Screener
 log = logging.getLogger("ekl_provider_adapter.agent")
 ANNOUNCE_RETRY_SECONDS = 10.0
 # The EKP version this package speaks, as world_get_contract names it.
-EKP_PROTOCOL = "ekp/3.7"
+EKP_PROTOCOL = "ekp/3.8"
 # A network that speaks only the version before still serves every action but trials, which 3.1 changed: the agent
 # runs there and refuses trials itself, so the connector can be upgraded before the network.
 EKP_WITHOUT_TRIALS = "ekp/3.0"
@@ -703,7 +703,8 @@ class Agent:
         # Plain callbacks run in a worker thread, so they never block the server.
         return await asyncio.to_thread(callback, *args)
 
-    async def _call(self, tool: str, **arguments: Any) -> dict[str, Any]:
+    async def _call(self, tool: str, /, **arguments: Any) -> dict[str, Any]:
+        # Positional-only, so a network operation may take an argument named tool (external_run).
         if self.network is None:
             raise AgentNotEnabled
         if not self._ready and tool not in ("agent_get_self", "world_get_contract"):
@@ -1075,6 +1076,14 @@ class Agent:
     def find(self, query: str, limit: int = 5) -> list[Candidate]:
         return self._sync(self.aio.find(query, limit))
 
+    def external_search(self, query: str, limit: int = 3) -> list[dict[str, Any]]:
+        """Agents outside the network for a need no agent on it meets (EKP 3.8); none under the rule never."""
+        return self._sync(self.aio.external_search(query, limit))
+
+    def external_run(self, external_id: str, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Run one tool that only reads of an agent outside the network, through it (EKP 3.8)."""
+        return self._sync(self.aio.external_run(external_id, tool, arguments))
+
     def choose(
         self,
         need_or_query: Need | str,
@@ -1258,7 +1267,7 @@ class _Actions:
     def __init__(self, agent: Agent):
         self.agent = agent
 
-    async def _call(self, tool: str, **arguments: Any) -> dict[str, Any]:
+    async def _call(self, tool: str, /, **arguments: Any) -> dict[str, Any]:
         return await self.agent._call(tool, **arguments)
 
     # posting
@@ -1378,6 +1387,20 @@ class _Actions:
     async def find(self, query: str, limit: int = 5) -> list[Candidate]:
         return (await self.find_with_history(query, limit))[0]
 
+    async def external_search(self, query: str, limit: int = 3) -> list[dict[str, Any]]:
+        """Agents outside the network for a need no agent on it meets: open ones, with only their tools that only
+        read; none under the publisher's rule never, or from a network that doesn't offer them (before EKP 3.8)."""
+        try:
+            found = await self._call("external_search", query=query, limit=limit)
+        except AgentError:
+            return []
+        return list(found.get("items") or [])
+
+    async def external_run(self, external_id: str, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Run one tool that only reads of an agent outside the network, through it. Under the publisher's rule
+        ask, the first run of each is refused (POLICY_DENIED, detail.approval) until the publisher approves it."""
+        return await self._call("external_run", external_id=external_id, tool=tool, arguments=arguments)
+
     async def find_with_history(
         self, query: str, limit: int = 5, need_key: str = ""
     ) -> tuple[list[Candidate], list[Candidate]]:
@@ -1483,7 +1506,8 @@ class _Actions:
             self._ranked(trials) if chosen is None else [chosen, *[t for t in self._ranked(trials) if t is not chosen]]
         )
         if not ranked:
-            raise NoProvider("No candidate passed.", trials)
+            # Agents outside the network, when the publisher's rule lets the agent run them (EKP 3.8).
+            raise NoProvider("No candidate passed.", trials, await self.external_search(str(query)))
         kept = None
         if keep is not None and chosen is None:
             kept = next((t for t in ranked if _same(t.candidate, keep)), None)

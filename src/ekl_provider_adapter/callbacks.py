@@ -678,6 +678,11 @@ def local_api(agent: Agent, uses: list[Use] | None = None) -> Starlette:
             "calls_left": declared.calls_left,
         }
 
+    async def external(body: dict[str, Any]) -> dict[str, Any]:
+        """Run one tool that only reads of an agent outside the network, from a NO_PROVIDER answer's `external`, through
+        the network: within the publisher's rule, the result screened, nothing of it kept (EKP 3.8)."""
+        return await agent.aio.external_run(str(body["external_id"]), str(body["tool"]), dict(body.get("input") or {}))
+
     actions = {
         "post_need": post_need,
         "find": find,
@@ -689,6 +694,7 @@ def local_api(agent: Agent, uses: list[Use] | None = None) -> Starlette:
         "connect": connect,
         "close_agreement": close_agreement,
         "service": service,
+        "external": external,
     }
 
     async def status(_: Request) -> Response:
@@ -702,8 +708,9 @@ def local_api(agent: Agent, uses: list[Use] | None = None) -> Starlette:
         try:
             return JSONResponse(await action(await request.json()))
         except NoProvider as exc:
-            # Every candidate considered and why none passed, so the callbacks can post a need instead.
-            detail = exc.detail | {"trials": [_trial(t) for t in exc.trials]}
+            # Every candidate considered and why none passed, so the callbacks can post a need instead, and the agents
+            # outside the network it may run instead when its publisher's rule lets it.
+            detail = exc.detail | {"trials": [_trial(t) for t in exc.trials], "external": exc.external}
             return JSONResponse({"error": exc.code, "message": str(exc), "detail": detail}, status_code=409)
         except BalanceLow as exc:
             # `detail` carries what the next pack needs (`needed`, `currency`), so the callbacks can tell their person.

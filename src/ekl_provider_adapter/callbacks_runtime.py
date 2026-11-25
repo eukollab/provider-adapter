@@ -177,10 +177,11 @@ class Callbacks:
         choose {query, sample, expect}, trial {handle, capability_id, sample, expect}, call {handle, capability_id,
         arguments, idempotency_key}, message {connection_id, text}, outreach {to, intent, text, need_id or
         capability_id, idempotency_key} or {thread_id, text} to answer a thread, connect {handle, capability_id,
-        thread_id, note}, close_agreement {handle, capability_id, outcome} and service {need, prefer, sample, expect,
-        input, idempotency_key}. A trial answers a score, never an output. A refusal raises ActionRefused with the
-        network's code: CONNECTION_PENDING when a provider hasn't accepted the connection yet, before this call
-        times out."""
+        thread_id, note}, close_agreement {handle, capability_id, outcome}, service {need, prefer, sample, expect,
+        input, idempotency_key} and external {external_id, tool, input}. A trial answers a score, never an output. A
+        refusal raises ActionRefused with the network's code: CONNECTION_PENDING when a provider hasn't accepted the
+        connection yet, before this call times out; NO_PROVIDER when no provider passed, its detail naming in
+        `external` agents outside the network the agent may run with external when its publisher's rule lets it."""
         headers = {"Content-Type": "application/json"}
         if os.environ.get("EKL_LOCAL_TOKEN"):
             headers["Authorization"] = f"Bearer {os.environ['EKL_LOCAL_TOKEN']}"

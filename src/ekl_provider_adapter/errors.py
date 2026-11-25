@@ -76,11 +76,14 @@ class ContractChanged(AgentError):
 
 
 class NoProvider(AgentError):
-    """No candidate passed: `trials` says what was tried and why each was skipped or failed."""
+    """No candidate passed: `trials` says what was tried and why each was skipped or failed. `external` lists agents
+    outside the network that might do the job, which the agent may run with `external_run` when its publisher's rule
+    lets it (empty under the rule never, or from a network before EKP 3.8)."""
 
-    def __init__(self, message: str, trials: list[Any]):
+    def __init__(self, message: str, trials: list[Any], external: list[dict[str, Any]] | None = None):
         super().__init__(message, code="NO_PROVIDER", fix="Post a need and wait for answers, or widen your rules.")
         self.trials = trials
+        self.external = external or []
 
 
 class ChoiceWaiting(AgentError):

@@ -729,6 +729,42 @@ def test_no_provider_tells_the_callbacks_every_trial_and_why(tmp_path: Path) -> 
     assert "output" not in str(refused.json())
 
 
+def test_no_provider_names_agents_outside_the_network_and_the_agent_runs_one(tmp_path: Path) -> None:
+    # EKP 3.8: with nothing on the network passing, NO_PROVIDER names the external agents the publisher's rule lets
+    # the agent run, and the external action runs one through the network.
+    fake = FakeNetwork()
+    fake.external_agent("ext_vat", "VAT check", "validate_vat", lambda a: {"valid": a["number"] == "DE1"}, "vat check")
+    fake.config["external"] = {"rule": "allow", "approved": []}
+    with TestClient(local_api(_agent(fake, tmp_path)), base_url="http://127.0.0.1:8765") as client:
+        refused = client.post("/agent/choose", json={"query": "vat check", "sample": {"number": "DE1"}})
+        external = refused.json()["detail"]["external"]
+        ran = client.post(
+            "/agent/external",
+            json={"external_id": external[0]["external_id"], "tool": "validate_vat", "input": {"number": "DE1"}},
+        ).json()
+    assert refused.json()["error"] == "NO_PROVIDER" and [x["name"] for x in external] == ["VAT check"]
+    assert external[0]["tested"] is False
+    assert ran["outcome"] == "succeeded" and ran["result"] == {"valid": True}
+    assert fake.external_runs == [{"external_id": "ext_vat", "tool": "validate_vat", "arguments": {"number": "DE1"}}]
+
+
+def test_external_agents_follow_the_publishers_rule(tmp_path: Path) -> None:
+    fake = FakeNetwork()
+    fake.external_agent("ext_vat", "VAT check", "validate_vat", lambda _: {"valid": True}, "vat check")
+    with TestClient(local_api(_agent(fake, tmp_path)), base_url="http://127.0.0.1:8765") as client:
+        # Never, the default: nothing is offered and nothing runs.
+        never = client.post("/agent/choose", json={"query": "vat check", "sample": {}}).json()
+        refused = client.post("/agent/external", json={"external_id": "ext_vat", "tool": "validate_vat", "input": {}})
+        fake.config["external"] = {"rule": "ask", "approved": []}
+        asked = client.post("/agent/external", json={"external_id": "ext_vat", "tool": "validate_vat", "input": {}})
+        fake.config["external"] = {"rule": "ask", "approved": ["ext_vat"]}
+        approved = client.post("/agent/external", json={"external_id": "ext_vat", "tool": "validate_vat", "input": {}})
+    assert never["detail"]["external"] == []
+    assert refused.status_code == 409 and refused.json()["error"] == "POLICY_DENIED"
+    assert asked.json()["error"] == "POLICY_DENIED" and asked.json()["detail"]["approval"] == "asked"
+    assert approved.json()["outcome"] == "succeeded"
+
+
 def test_the_local_api_answers_a_low_wallet_with_what_the_pack_needs(tmp_path: Path) -> None:
     # Apps in other languages map on `error` and show `detail`: the pack's price and its currency.
     fake = FakeNetwork()
